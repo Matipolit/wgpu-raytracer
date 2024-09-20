@@ -583,13 +583,13 @@ fn rngNextVec3InUnitSphere(state: ptr<function, u32>) -> vec3<f32> {
 }
 
 fn rngNextUintInRange(state: ptr<function, u32>, min: u32, max: u32) -> u32 {
-    rngNextInt(state);
-    return min + (*state) % (max - min);
+    let x = rngNextInt(state);
+    return min + (x) % (max - min);
 }
 
 fn rngNextFloat(state: ptr<function, u32>) -> f32 {
-    rngNextInt(state);
-    return f32(*state) / f32(0xffffffffu);
+    let x = rngNextInt(state);
+    return f32(x) / f32(0xffffffffu);
 }
 
 fn initRng(pixel: vec2<u32>, resolution: vec2<u32>, frame: u32) -> u32 {
@@ -598,13 +598,13 @@ fn initRng(pixel: vec2<u32>, resolution: vec2<u32>, frame: u32) -> u32 {
     return jenkinsHash(seed);
 }
 
-fn rngNextInt(state: ptr<function, u32>) {
+fn rngNextInt(state: ptr<function, u32>) -> u32 {
     // PCG random number generator
     // Based on https://www.shadertoy.com/view/XlGcRh
-
-    let oldState = *state + 747796405u + 2891336453u;
-    let word = ((oldState >> ((oldState >> 28u) + 4u)) ^ oldState) * 277803737u;
-    *state = (word >> 22u) ^ word;
+    let newState = *state * 747796405u + 2891336453u;
+    *state = newState;
+    let word = ((newState >> ((newState >> 28u) + 4u)) ^ newState) * 277803737u;
+    return (word >> 22u) ^ word;
 }
 
 fn jenkinsHash(input: u32) -> u32 {
