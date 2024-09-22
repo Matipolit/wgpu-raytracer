@@ -570,14 +570,14 @@ fn rngNextVec3InUnitDisk(state: ptr<function, u32>) -> vec3<f32> {
 }
 
 fn rngNextVec3InUnitSphere(state: ptr<function, u32>) -> vec3<f32> {
-    // probability density is uniformly distributed over r^3
     let r = pow(rngNextFloat(state), 0.33333f);
-    let theta = PI * rngNextFloat(state);
+    let cosTheta = 1f - 2f * rngNextFloat(state);
+    let sinTheta = sqrt(1f - cosTheta * cosTheta);
     let phi = 2f * PI * rngNextFloat(state);
 
-    let x = r * sin(theta) * cos(phi);
-    let y = r * sin(theta) * sin(phi);
-    let z = r * cos(theta);
+    let x = r * sinTheta * cos(phi);
+    let y = r * sinTheta * sin(phi);
+    let z = cosTheta;
 
     return vec3(x, y, z);
 }
