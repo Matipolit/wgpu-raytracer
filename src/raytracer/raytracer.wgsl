@@ -74,9 +74,66 @@ fn fsMain(in: VertexOutput) -> @location(0) vec4<f32> {
     imageBuffer[idx] = array<f32, 3>(pixel.r, pixel.g, pixel.b);
 
     let invN = 1f / f32(samplingParams.accumulatedSamplesPerPixel);
+    let current_pixel_average_color = invN * pixel; // 'pixel' is the sum from imageBuffer
+
+    // --- Rudimentary Denoiser (e.g., simplified Bilateral Filter) ---
+    var denoised_color_sum = vec3(0.0);
+    var total_weight = 0.0;
+
+    let denoising_radius = 1; // For a 3x3 kernel (can be parameterized)
+    let sigma_color_sq = 0.1 * 0.1; // Variance for color similarity (tune this)
+    // let sigma_spatial_sq = 2.0 * 2.0; // Variance for spatial distance (tune this)
+
+
+    if (samplingParams.accumulatedSamplesPerPixel > 1u) { // Only denoise if we have some accumulation
+        for (var dy = -denoising_radius; dy <= denoising_radius; dy = dy + 1) {
+            for (var dx = -denoising_radius; dx <= denoising_radius; dx = dx + 1) {
+                let neighbor_x = i32(x) + dx;
+                let neighbor_y = i32(y) + dy;
+
+                // Clamp coordinates to be within image bounds
+                if (neighbor_x >= 0 && neighbor_x < i32(imageWidth) &&
+                    neighbor_y >= 0 && neighbor_y < i32(imageHeight)) {
+
+                    let neighbor_idx = u32(imageWidth * u32(neighbor_y) + u32(neighbor_x));
+                    // Read the SUM from the image buffer for the neighbor
+                    let neighbor_pixel_sum = vec3(imageBuffer[neighbor_idx][0u],
+                                                  imageBuffer[neighbor_idx][1u],
+                                                  imageBuffer[neighbor_idx][2u]);
+                    // Calculate neighbor's average color
+                    let neighbor_average_color = invN * neighbor_pixel_sum;
+
+                    // Color difference weight (Gaussian)
+                    let color_difference = current_pixel_average_color - neighbor_average_color;
+                    let color_dist_sq = dot(color_difference, color_difference);
+                    let weight_color = exp(-color_dist_sq / (2.0 * sigma_color_sq));
+
+                    // Spatial distance weight (Gaussian - optional, can be simpler)
+                    // let spatial_dist_sq = f32(dx*dx + dy*dy);
+                    // let weight_spatial = exp(-spatial_dist_sq / (2.0 * sigma_spatial_sq));
+                    let weight_spatial = 1.0; // Simplest: uniform spatial weight within kernel
+
+                    let current_weight = weight_color * weight_spatial;
+
+                    denoised_color_sum += neighbor_average_color * current_weight;
+                    total_weight += current_weight;
+                }
+            }
+        }
+    }
+
+
+    var final_display_color: vec3<f32>;
+    if (total_weight > 0.01) { // Check total_weight to avoid division by zero if all weights were tiny
+        final_display_color = denoised_color_sum / total_weight;
+    } else {
+        final_display_color = current_pixel_average_color; // Fallback to non-denoised if something went wrong
+    }
+    // --- End Denoiser ---
+
 
     return vec4(
-        uncharted2(invN * pixel),
+        uncharted2(final_display_color), // Tonemap the (potentially) denoised color
         1f
     );
 }

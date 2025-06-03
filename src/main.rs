@@ -175,15 +175,15 @@ fn main() {
                                 );
                                 ui.same_line();
                                 ui.radio_button(
-                                    "4",
-                                    &mut render_params.sampling.num_samples_per_pixel,
-                                    4_u32,
-                                );
-                                ui.same_line();
-                                ui.radio_button(
                                     "8",
                                     &mut render_params.sampling.num_samples_per_pixel,
                                     8_u32,
+                                );
+                                ui.same_line();
+                                ui.radio_button(
+                                    "16",
+                                    &mut render_params.sampling.num_samples_per_pixel,
+                                    16_u32,
                                 );
 
                                 ui.text("total samples per pixel");
@@ -208,10 +208,37 @@ fn main() {
 
                                 ui.slider(
                                     "num bounces",
-                                    4,
+                                    1,
                                     10,
                                     &mut render_params.sampling.num_bounces,
                                 );
+
+                                ui.separator();
+
+                                ui.text("Denoiser Parameters");
+
+                                ui.checkbox(
+                                    "Enable Denoiser",
+                                    &mut render_params.sampling.denoising_enabled,
+                                );
+
+                                if render_params.sampling.denoising_enabled {
+                                    ui.slider(
+                                        "Denoising Radius", // 0 for none, 1 for 3x3, 2 for 5x5
+                                        0,
+                                        5, // Max radius, adjust as needed
+                                        &mut render_params.sampling.denoising_radius,
+                                    );
+                                    ui.slider(
+                                        "Denoising Sigma Color",
+                                        0.01_f32,
+                                        1.0_f32,
+                                        &mut render_params
+                                            .sampling
+                                            .denoising_sigma_color,
+                                    );
+                                }
+
 
                                 ui.separator();
 

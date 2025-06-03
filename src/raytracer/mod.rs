@@ -100,7 +100,7 @@ impl Raytracer {
 
         let sampling_parameter_buffer = UniformBuffer::new(
             device,
-            std::mem::size_of::<GpuSamplingParams>() as wgpu::BufferAddress,
+            std::mem::size_of::<GpuSamplingParams>() as wgpu::BufferAddress, // Updated size
             1_u32,
             Some("sampling parameter buffer"),
         );
@@ -559,6 +559,9 @@ pub struct SamplingParams {
     pub max_samples_per_pixel: u32,
     pub num_samples_per_pixel: u32,
     pub num_bounces: u32,
+    pub denoising_enabled: bool,
+    pub denoising_radius: u32, // 0 means effectively disabled, 1 for 3x3, 2 for 5x5 etc.
+    pub denoising_sigma_color: f32,
 }
 
 impl Default for SamplingParams {
@@ -567,10 +570,12 @@ impl Default for SamplingParams {
             max_samples_per_pixel: 256_u32,
             num_samples_per_pixel: 1_u32,
             num_bounces: 8_u32,
+            denoising_enabled: true,
+            denoising_radius: 1, // 3x3 kernel
+            denoising_sigma_color: 0.15,
         }
     }
 }
-
 struct RenderProgress {
     accumulated_samples_per_pixel: u32,
 }
@@ -582,14 +587,18 @@ impl RenderProgress {
         }
     }
 
-    pub fn next_frame(&mut self, sampling_params: &SamplingParams) -> GpuSamplingParams {
+    pub fn next_frame(
+        &mut self,
+        sampling_params: &SamplingParams,
+    ) -> GpuSamplingParams {
         let current_accumulated_samples = self.accumulated_samples_per_pixel;
         let next_accumulated_samples =
             sampling_params.num_samples_per_pixel + current_accumulated_samples;
 
-        // Initial state: no samples have been accumulated yet. This is the first frame
-        // after a reset. The image buffer's previous samples should be cleared by
-        // setting clear_accumulated_samples to 1_u32.
+        let denoising_enabled_gpu =
+            if sampling_params.denoising_enabled { 1_u32 } else { 0_u32 };
+
+        // Initial state or reset
         if current_accumulated_samples == 0_u32 {
             self.accumulated_samples_per_pixel = next_accumulated_samples;
             GpuSamplingParams {
@@ -597,27 +606,39 @@ impl RenderProgress {
                 num_bounces: sampling_params.num_bounces,
                 accumulated_samples_per_pixel: next_accumulated_samples,
                 clear_accumulated_samples: 1_u32,
+                denoising_enabled: denoising_enabled_gpu,
+                denoising_radius: sampling_params.denoising_radius,
+                denoising_sigma_color: sampling_params.denoising_sigma_color,
+                _padding_denoiser: 0,
             }
         }
-        // Progressive render: accumulating samples in the image buffer over multiple
-        // frames.
-        else if next_accumulated_samples <= sampling_params.max_samples_per_pixel {
+        // Progressive render
+        else if next_accumulated_samples <=
+            sampling_params.max_samples_per_pixel
+        {
             self.accumulated_samples_per_pixel = next_accumulated_samples;
             GpuSamplingParams {
                 num_samples_per_pixel: sampling_params.num_samples_per_pixel,
                 num_bounces: sampling_params.num_bounces,
                 accumulated_samples_per_pixel: next_accumulated_samples,
                 clear_accumulated_samples: 0_u32,
+                denoising_enabled: denoising_enabled_gpu,
+                denoising_radius: sampling_params.denoising_radius,
+                denoising_sigma_color: sampling_params.denoising_sigma_color,
+                _padding_denoiser: 0,
             }
         }
-        // Completed render: we have accumulated max_samples_per_pixel samples. Stop rendering
-        // by setting num_samples_per_pixel to zero.
+        // Completed render
         else {
             GpuSamplingParams {
-                num_samples_per_pixel: 0_u32,
+                num_samples_per_pixel: 0_u32, // Stop rendering new samples
                 num_bounces: sampling_params.num_bounces,
                 accumulated_samples_per_pixel: current_accumulated_samples,
                 clear_accumulated_samples: 0_u32,
+                denoising_enabled: denoising_enabled_gpu,
+                denoising_radius: sampling_params.denoising_radius,
+                denoising_sigma_color: sampling_params.denoising_sigma_color,
+                _padding_denoiser: 0,
             }
         }
     }
@@ -630,6 +651,7 @@ impl RenderProgress {
         self.accumulated_samples_per_pixel
     }
 }
+
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -790,6 +812,10 @@ struct GpuSamplingParams {
     num_bounces: u32,
     accumulated_samples_per_pixel: u32,
     clear_accumulated_samples: u32,
+    denoising_enabled: u32, // 0 for false, 1 for true
+    denoising_radius: u32,
+    denoising_sigma_color: f32,
+    _padding_denoiser: u32, // To make struct size 32 bytes (8 * 4 bytes)
 }
 
 #[repr(C)]
