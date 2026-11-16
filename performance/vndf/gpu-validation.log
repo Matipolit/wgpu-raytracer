@@ -1,0 +1,28 @@
+   Compiling weekend-raytracer-wgpu v0.1.0 (/home/matip/Projects/wgpu-raytracer)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.75s
+     Running unittests src/main.rs (target/debug/deps/weekend_raytracer_wgpu-951e54c7d4f1bb0f)
+
+running 1 test
+glTF: 2 triangles, 6 vertices, 1 materials, 0 textures; import 0.00s, BVH 0.000s (1 nodes, depth 0); geometry 0.0 MiB, textures 0.0 MiB
+VNDF nv=1 rough=0.2 metal=0: energy 0.810174/0.810081, variance 0.103043/0.103117, rejected 0.00044/0.00047
+VNDF nv=1 rough=0.2 metal=1: energy 0.798078/0.798710, variance 0.116226/0.115883, rejected 0.00140/0.00121
+VNDF nv=1 rough=0.5 metal=0: energy 0.805070/0.804589, variance 0.023945/0.024377, rejected 0.01429/0.01501
+VNDF nv=1 rough=0.5 metal=1: energy 0.731246/0.731756, variance 0.049412/0.049511, rejected 0.04793/0.04745
+VNDF nv=1 rough=1 metal=0: energy 0.777896/0.779707, variance 0.097579/0.096469, rejected 0.12709/0.12524
+VNDF nv=1 rough=1 metal=1: energy 0.245216/0.245374, variance 0.048822/0.048674, rejected 0.40105/0.39904
+VNDF nv=0.2 rough=0.2 metal=0: energy 1.080616/1.079939, variance 0.033835/0.040578, rejected 0.00871/0.00243
+VNDF nv=0.2 rough=0.2 metal=1: energy 0.839114/0.838400, variance 0.209084/0.168389, rejected 0.02852/0.00839
+VNDF nv=0.2 rough=0.5 metal=0: energy 0.880381/0.879825, variance 0.082675/0.025378, rejected 0.08044/0.01390
+VNDF nv=0.2 rough=0.5 metal=1: energy 0.685821/0.685025, variance 0.304452/0.070746, rejected 0.25877/0.04399
+VNDF nv=0.2 rough=1 metal=0: energy 0.786075/0.785827, variance 0.107880/0.043306, rejected 0.12485/0.04149
+VNDF nv=0.2 rough=1 metal=1: energy 0.410292/0.410608, variance 0.186494/0.048224, rejected 0.40019/0.13356
+VNDF nv=0.05 rough=0.2 metal=0: energy 1.292306/1.291182, variance 0.822061/0.397225, rejected 0.05933/0.00833
+VNDF nv=0.05 rough=0.2 metal=1: energy 0.815058/0.813292, variance 0.681585/0.179237, rejected 0.18715/0.02564
+VNDF nv=0.05 rough=0.5 metal=0: energy 0.921525/0.920970, variance 0.135378/0.027938, rejected 0.11262/0.00361
+VNDF nv=0.05 rough=0.5 metal=1: energy 0.731011/0.728435, variance 0.572997/0.048345, rejected 0.36031/0.01149
+VNDF nv=0.05 rough=1 metal=0: energy 0.789307/0.788583, variance 0.112793/0.026321, rejected 0.12373/0.01171
+VNDF nv=0.05 rough=1 metal=1: energy 0.469952/0.471175, variance 0.277595/0.036585, rejected 0.40154/0.03812
+test raytracer::tests::mesh_cases::vndf_preserves_energy_and_reduces_grazing_rejections ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.57s
+

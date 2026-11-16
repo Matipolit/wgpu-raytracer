@@ -1,0 +1,2 @@
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.82s, BVH 0.356s (157907 nodes, depth 27); geometry 20.6 MiB, textures 256.0 MiB
+Rendered 640x400, 256 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.06s, render 85.59s; warmed median GPU Some(331.6130127373123) ms/sample; saved performance/gltf/sponza.png

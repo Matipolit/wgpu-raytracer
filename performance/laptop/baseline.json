@@ -1,0 +1,14 @@
+[
+  {
+    "case": "sponza",
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.92s, BVH 0.378s (157907 nodes, depth 27); geometry 20.6 MiB, textures 256.0 MiB\nRendered 640x400, 24 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.06s, render 10.76s; warmed median GPU Some(448.45587446803665) ms/sample; saved /tmp/sponza-before.png\n"
+  },
+  {
+    "case": "sponza-reverse",
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.93s, BVH 0.373s (157907 nodes, depth 27); geometry 20.6 MiB, textures 256.0 MiB\nRendered 640x400, 24 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.06s, render 11.36s; warmed median GPU Some(468.778478138546) ms/sample; saved /tmp/sponza-reverse-before.png\n"
+  },
+  {
+    "case": "spheres",
+    "log": "Rendered 640x400, 24 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.07s, render 0.12s; warmed median GPU Some(2.9510936779518127) ms/sample; saved /tmp/spheres-before.png\n"
+  }
+]

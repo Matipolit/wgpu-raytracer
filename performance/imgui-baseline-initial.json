@@ -1,0 +1,9 @@
+{"ui":"imgui","adapter":"Intel(R) Iris(R) Xe Graphics (TGL GT2)","backend":"Vulkan","driver":"Mesa 26.2.7-arch1.1","warmup_frames":24,"measured_frames":96,"cases":[
+{"width":800,"height":600,"state":"accumulating","gpu_ms":{"median":4.833437,"p95":4.854531},"cpu_ms":{"median":0.529178,"p95":0.593375},"ui_cpu_ms":{"median":0.119007,"p95":0.142647},"wall_ms":{"median":5.678676,"p95":5.774174}}
+,
+{"width":800,"height":600,"state":"converged","gpu_ms":{"median":1.226979,"p95":2.084062},"cpu_ms":{"median":0.256773,"p95":0.375290},"ui_cpu_ms":{"median":0.062031,"p95":0.091739},"wall_ms":{"median":2.156810,"p95":4.224560}}
+,
+{"width":2560,"height":1600,"state":"accumulating","gpu_ms":{"median":40.351978,"p95":40.502968},"cpu_ms":{"median":0.559029,"p95":0.622841},"ui_cpu_ms":{"median":0.123344,"p95":0.162732},"wall_ms":{"median":41.246656,"p95":41.465315}}
+,
+{"width":2560,"height":1600,"state":"converged","gpu_ms":{"median":6.364896,"p95":6.396406},"cpu_ms":{"median":0.500257,"p95":0.663086},"ui_cpu_ms":{"median":0.122704,"p95":0.172726},"wall_ms":{"median":7.173636,"p95":7.360117}}
+]}

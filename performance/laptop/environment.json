@@ -1,0 +1,9 @@
+{
+  "platform": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44",
+  "baseline_binary_sha256": "a96089de3a0b75ffbe4ddaf0317dd880311a3363bcd7ac0fdede95de65ec155a",
+  "candidate_binary_sha256": "4bd3469a8312c6e0ddff135c72564d1fb1803d87970e5662e4c5dc6d0025e9c3",
+  "gpu": "Intel Iris Xe TGL GT2",
+  "backend": "Vulkan",
+  "sampling": "1 sample/frame, 8 bounces, default bilateral enabled, 24 samples total; first timing discarded",
+  "notes": "GPU median includes trace, filter and presentation; excludes image readback, loading and shader setup."
+}

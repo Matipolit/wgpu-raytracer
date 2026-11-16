@@ -1,0 +1,52 @@
+[
+  {
+    "case": "sponza",
+    "size": "640x400",
+    "workgroup": "8x8",
+    "samples": 12,
+    "median_ms": 211.38416150592042,
+    "runs_ms": [
+      211.38416150592042
+    ]
+  },
+  {
+    "case": "sponza",
+    "size": "640x400",
+    "workgroup": "8x4",
+    "samples": 12,
+    "median_ms": 208.78660948600387,
+    "runs_ms": [
+      208.78660948600387
+    ]
+  },
+  {
+    "case": "sponza",
+    "size": "640x400",
+    "workgroup": "8x2",
+    "samples": 12,
+    "median_ms": 226.63223405031968,
+    "runs_ms": [
+      226.63223405031968
+    ]
+  },
+  {
+    "case": "sponza",
+    "size": "640x400",
+    "workgroup": "16x2",
+    "samples": 12,
+    "median_ms": 319.6710859455299,
+    "runs_ms": [
+      319.6710859455299
+    ]
+  },
+  {
+    "case": "sponza",
+    "size": "640x400",
+    "workgroup": "4x8",
+    "samples": 12,
+    "median_ms": 231.10926519101716,
+    "runs_ms": [
+      231.10926519101716
+    ]
+  }
+]

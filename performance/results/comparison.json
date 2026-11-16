@@ -1,0 +1,113 @@
+{
+  "adapter": "Intel(R) Iris(R) Xe Graphics (TGL GT2)",
+  "backend": "Vulkan",
+  "driver": "Mesa 26.2.7-arch1.1",
+  "rounds": 3,
+  "warmup_frames": 24,
+  "measured_frames": 96,
+  "method": "median of per-run medians; per-frame GPU completion; no vsync",
+  "before_ui": "imgui",
+  "after_ui": "egui",
+  "cases": [
+    {
+      "width": 800,
+      "height": 600,
+      "state": "accumulating",
+      "gpu_ms": {
+        "before": 4.831979,
+        "after": 4.846927,
+        "change_percent": 0.30935564910361535
+      },
+      "cpu_ms": {
+        "before": 0.562823,
+        "after": 0.457666,
+        "change_percent": -18.68384909642995
+      },
+      "ui_cpu_ms": {
+        "before": 0.118648,
+        "after": 0.010111,
+        "change_percent": -91.47815386690041
+      },
+      "wall_ms": {
+        "before": 5.80213,
+        "after": 5.705507,
+        "change_percent": -1.665302225217291
+      }
+    },
+    {
+      "width": 800,
+      "height": 600,
+      "state": "converged",
+      "gpu_ms": {
+        "before": 2.26875,
+        "after": 2.352083,
+        "change_percent": 3.6730798898071626
+      },
+      "cpu_ms": {
+        "before": 0.457161,
+        "after": 0.369523,
+        "change_percent": -19.170051688573608
+      },
+      "ui_cpu_ms": {
+        "before": 0.114551,
+        "after": 0.00987,
+        "change_percent": -91.38375046922332
+      },
+      "wall_ms": {
+        "before": 3.141733,
+        "after": 3.206748,
+        "change_percent": 2.069399277405193
+      }
+    },
+    {
+      "width": 2560,
+      "height": 1600,
+      "state": "accumulating",
+      "gpu_ms": {
+        "before": 40.446405,
+        "after": 40.370624,
+        "change_percent": -0.18736152199435585
+      },
+      "cpu_ms": {
+        "before": 0.538337,
+        "after": 0.466697,
+        "change_percent": -13.307649297744717
+      },
+      "ui_cpu_ms": {
+        "before": 0.117954,
+        "after": 0.010258,
+        "change_percent": -91.30338945690693
+      },
+      "wall_ms": {
+        "before": 41.627401,
+        "after": 41.236792,
+        "change_percent": -0.9383458746319517
+      }
+    },
+    {
+      "width": 2560,
+      "height": 1600,
+      "state": "converged",
+      "gpu_ms": {
+        "before": 6.347656,
+        "after": 6.367969,
+        "change_percent": 0.32000788952648573
+      },
+      "cpu_ms": {
+        "before": 0.548105,
+        "after": 0.428909,
+        "change_percent": -21.746928052106796
+      },
+      "ui_cpu_ms": {
+        "before": 0.127305,
+        "after": 0.010914,
+        "change_percent": -91.4268881819253
+      },
+      "wall_ms": {
+        "before": 7.280361,
+        "after": 7.212873,
+        "change_percent": -0.9269869996831215
+      }
+    }
+  ]
+}

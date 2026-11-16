@@ -74,15 +74,39 @@ pub struct StorageBuffer {
 }
 
 impl StorageBuffer {
+    pub fn new(
+        device: &wgpu::Device,
+        buffer_size: wgpu::BufferAddress,
+        binding_idx: u32,
+        label: Option<&str>,
+    ) -> Self {
+        Self {
+            handle: device.create_buffer(&wgpu::BufferDescriptor {
+                size: buffer_size,
+                usage: wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+                label,
+            }),
+            binding_idx,
+        }
+    }
+
     pub fn new_from_bytes(
         device: &wgpu::Device,
         bytes: &[u8],
         binding_idx: u32,
         label: Option<&str>,
     ) -> Self {
+        // Runtime arrays still require a nonzero binding when a scene has none.
+        // Their logical counts live in the mesh header, rather than arrayLength.
+        let bytes = if bytes.is_empty() { &[0; 32] } else { bytes };
         let handle = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             contents: bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
             label,
         });
 

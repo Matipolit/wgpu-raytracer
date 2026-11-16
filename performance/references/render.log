@@ -1,0 +1,23 @@
+Rendering reference 1 2048 spp / 8 bounces / RR
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.87s, BVH 0.370s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Progress: 256 / 2048 spp; 18.3s elapsed
+Progress: 512 / 2048 spp; 36.6s elapsed
+Progress: 768 / 2048 spp; 55.5s elapsed
+Progress: 1024 / 2048 spp; 75.3s elapsed
+Progress: 1280 / 2048 spp; 96.2s elapsed
+Progress: 1536 / 2048 spp; 116.1s elapsed
+Progress: 1792 / 2048 spp; 137.1s elapsed
+Progress: 2048 / 2048 spp; 158.0s elapsed
+Rendered 640x400, 2048 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.08s, render 157.98s; warmed median GPU Some(76.14182105773544) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/references/2048-rr/001.png
+Rendering reference 19 2048 spp / 8 bounces / RR
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.09s, BVH 0.457s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Progress: 256 / 2048 spp; 19.0s elapsed
+Progress: 512 / 2048 spp; 39.0s elapsed
+Progress: 768 / 2048 spp; 58.6s elapsed
+Progress: 1024 / 2048 spp; 78.0s elapsed
+Progress: 1280 / 2048 spp; 98.0s elapsed
+Progress: 1536 / 2048 spp; 117.9s elapsed
+Progress: 1792 / 2048 spp; 138.0s elapsed
+Progress: 2048 / 2048 spp; 158.0s elapsed
+Rendered 640x400, 2048 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.09s, render 158.01s; warmed median GPU Some(75.58275857138443) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/references/2048-rr/019.png
+Both references complete.

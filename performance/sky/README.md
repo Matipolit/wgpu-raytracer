@@ -1,0 +1,96 @@
+Current application defaults: three bounces, roulette enabled. Roulette begins
+before bounce four, so it has no effect at the default three-bounce cap.
+Historical experiments and training below use an explicit eight-bounce budget.
+
+# Sky importance sampling experiment
+
+Run the experimental path explicitly:
+
+```sh
+cargo run --release --locked -- --sponza --bounces 8 --russian-roulette --sky-importance
+```
+
+Sky sampling is off by default. It is currently applied to glTF PBR surfaces;
+legacy sphere materials retain their existing sampling. The sky remains the
+existing analytic model, including its mirrored lower-hemisphere behavior.
+
+## Implementation
+
+- A CPU-built 64×32 equal-solid-angle distribution samples analytic sky luminance.
+  Five percent uniform probability supplies full support. Stored PDFs are derived
+  from the rounded CDF increments so sampling and evaluated probabilities agree.
+- At each eligible mesh vertex, one sky direction is sampled, the diffuse/GGX
+  BSDF is evaluated, and an any-hit visibility query tests for blockers.
+- Power-heuristic multiple importance sampling combines these sky samples with
+  existing BSDF continuation samples. Camera-visible sky is unweighted; escaped
+  mesh continuation rays get the complementary MIS weight. Mesh emission and
+  legacy sphere continuations retain their original treatment.
+- No NEE sample is taken at the last allowed surface bounce: it would add an
+  environment connection beyond the original eight-bounce integration budget.
+- Shadow traversal returns at the first accepted surface. It preserves alpha
+  cutouts, single/double-sided flags, parallel-ray handling and the same range
+  limits as ordinary traversal, and avoids resolving normals or shading.
+- The distribution adds 16 KiB to the existing sky storage buffer, without a new
+  binding. It updates when sky parameters change, not on every camera change.
+
+The sky-enabled path shares a loaded PBR surface between its light evaluation
+and continuation sampling. The original BSDF implementation remains the disabled
+path; a GPU regression checks that continuation weights match.
+
+## Measured outcome: not a clear win
+
+Intel Iris Xe TGL GT2 / Vulkan, 640×400. Both variants use roulette; both denoisers
+are disabled. The same two courtyard views and seed offsets 10,000 / 20,000 are
+compared against existing independent-seed 512-spp references. Reference images
+still contain noise. Two views are not a universal performance evaluation.
+
+| View | Additional cost per sample | Display MSE change at similar time | PSNR change by seed | Compressed-radiance MSE change |
+|---|---:|---:|---|---:|
+| 1 | +42% | −2.4% (better) | +0.106 / +0.107 dB | +5.5% (worse) |
+| 19 | +46% | +10.2% (worse) | −0.356 / −0.486 dB | +15.1% (worse) |
+
+Baseline: 128 spp with roulette. Sky-enabled: 91 spp in view 1 and 88 spp in
+view 19. Final warmed GPU budgets differ by 0.3–2.8%. These are roughly 9–10
+seconds per image. First-frame setup/JIT time, scene loading, readback and disk
+I/O are excluded. Images include the first sample. Runs are sequential, baseline
+then candidate, so clock/temperature drift remains a measurement limitation.
+A pilot estimates candidate spp and one correction is allowed when >5% off.
+Display metrics use float sRGB after tone mapping, before 8-bit quantization;
+compressed radiance uses x/(1+x). Changes average two seeds per view.
+
+The small gain in one display metric is not enough to recommend enabling this
+by default, particularly since radiance error worsened in both views. Sky
+brightness does not account for visibility through Sponza's openings. Portal- or
+visibility-guided sampling would address that mismatch more directly, but is
+not implemented here. The results do not show that all environment importance
+sampling is unhelpful; they assess this implementation and these views.
+
+## Reproduce
+
+```sh
+cargo build --release --locked
+training/.venv/bin/python performance/sky/experiment.py
+python3 performance/sky/report.py
+cargo test --locked -- --include-ignored
+```
+
+NumPy and the existing overnight manifest plus reference arrays are required.
+Generated PNGs, raw float arrays, per-render timing reports, `summary.json` and
+`sky-results.html` are in `results/` (gitignored). The console log is preserved
+in `experiment.log`. Tests cover PDF normalization/full support, GPU sampling
+consistency, unoccluded MIS energy preservation, BSDF continuation equivalence,
+and any-hit versus closest-hit visibility (including cutouts and Sponza).
+
+Final validation: all 23 tests passed with GPU tests enabled. Formatting and
+whitespace checks passed. A deterministic sky-disabled render with roulette
+matched the pre-change executable's raw radiance byte-for-byte.
+
+## Updated 2048-spp RR reference metrics
+
+The current reports use the eight-bounce 2048-spp references. Original 512-spp
+metrics above remain historical; their JSON is archived in the results directory.
+
+| View | Display MSE change | PSNR gain by seed |
+|---|---:|---|
+| 1 | -3.1% | +0.100 dB / +0.170 dB |
+| 19 | +11.2% | -0.387 dB / -0.532 dB |

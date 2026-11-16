@@ -1,0 +1,82 @@
+Rendering 001_reference 2048 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.93s, BVH 0.363s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Progress: 256 / 2048 spp; 17.5s elapsed
+Progress: 512 / 2048 spp; 35.0s elapsed
+Progress: 768 / 2048 spp; 52.4s elapsed
+Progress: 1024 / 2048 spp; 70.5s elapsed
+Progress: 1280 / 2048 spp; 89.3s elapsed
+Progress: 1536 / 2048 spp; 108.5s elapsed
+Progress: 1792 / 2048 spp; 128.0s elapsed
+Progress: 2048 / 2048 spp; 148.0s elapsed
+Rendered 640x400, 2048 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.38s, render 148.02s; warmed median GPU Some(70.67447744121552) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/001_reference.png
+Rendering 001_pilot 24 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.12s, BVH 0.430s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 24 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.45s, render 1.92s; warmed median GPU Some(76.29505022066117) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/001_pilot.png
+Rendering 001_10000_baseline 128 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.26s, BVH 0.480s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 128 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.10s, render 9.70s; warmed median GPU Some(74.58968567896271) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/001_10000_baseline.png
+Rendering 001_10000_vndf 126 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.15s, BVH 0.419s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 126 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.10s, render 10.21s; warmed median GPU Some(79.05005015340042) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/001_10000_vndf.png
+Rendering 001_10000_vndf 120 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.20s, BVH 0.450s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 120 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.10s, render 9.41s; warmed median GPU Some(76.64588354542923) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/001_10000_vndf.png
+{"baseline": {"label": "001_10000_baseline", "spp": 128, "seed": 10000, "vndf": false, "samples": 128, "warmed_samples": 127, "gpu_total_ms": 9466.480810551406, "gpu_median_ms": 74.58968567896271, "gpu_p95_ms": 78.15510225858307, "display_mse": 0.0017782622264090385, "display_psnr_db": 27.50004196636171, "compressed_radiance_mse": 0.0007440096457371758}, "vndf": {"label": "001_10000_vndf", "spp": 120, "seed": 10000, "vndf": true, "samples": 120, "warmed_samples": 119, "gpu_total_ms": 9134.266912412095, "gpu_median_ms": 76.64588354542923, "gpu_p95_ms": 81.41114384575653, "display_mse": 0.0019172233332762731, "display_psnr_db": 27.173272941328545, "compressed_radiance_mse": 0.0008362216803202187}, "budget_ratio": 0.9649062936071213, "psnr_gain_db": -0.3267690250331654, "per_sample_speedup": 0.9710869130233565}
+Rendering 001_20000_baseline 128 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.27s, BVH 0.489s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 128 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.10s, render 9.86s; warmed median GPU Some(75.38359190958023) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/001_20000_baseline.png
+Rendering 001_20000_vndf 127 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.21s, BVH 0.453s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 127 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.10s, render 10.37s; warmed median GPU Some(80.23593554111481) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/001_20000_vndf.png
+Rendering 001_20000_vndf 120 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.31s, BVH 0.502s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 120 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.10s, render 9.75s; warmed median GPU Some(79.37635222876739) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/001_20000_vndf.png
+{"baseline": {"label": "001_20000_baseline", "spp": 128, "seed": 20000, "vndf": false, "samples": 128, "warmed_samples": 127, "gpu_total_ms": 9581.832682735196, "gpu_median_ms": 75.38359190958023, "gpu_p95_ms": 79.37572722878265, "display_mse": 0.0017907635776029886, "display_psnr_db": 27.469617473279605, "compressed_radiance_mse": 0.0007474647284859393}, "vndf": {"label": "001_20000_vndf", "spp": 120, "seed": 20000, "vndf": true, "samples": 120, "warmed_samples": 119, "gpu_total_ms": 9497.025861889017, "gpu_median_ms": 79.37635222876739, "gpu_p95_ms": 84.20067502765274, "display_mse": 0.0019158728818136864, "display_psnr_db": 27.176333097451092, "compressed_radiance_mse": 0.0008341181144960048}, "budget_ratio": 0.9911492066649227, "psnr_gain_db": -0.2932843758285131, "per_sample_speedup": 0.9453751944862543}
+Rendering 001_30000_baseline 128 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.31s, BVH 0.500s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 128 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.11s, render 9.99s; warmed median GPU Some(76.67692521133804) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/001_30000_baseline.png
+Rendering 001_30000_vndf 129 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.30s, BVH 0.495s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 129 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.10s, render 10.49s; warmed median GPU Some(79.69557097097398) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/001_30000_vndf.png
+{"baseline": {"label": "001_30000_baseline", "spp": 128, "seed": 30000, "vndf": false, "samples": 128, "warmed_samples": 127, "gpu_total_ms": 9750.654918196897, "gpu_median_ms": 76.67692521133804, "gpu_p95_ms": 81.58025842496109, "display_mse": 0.0017837884836774639, "display_psnr_db": 27.486566442523618, "compressed_radiance_mse": 0.0007494584443376888}, "vndf": {"label": "001_30000_vndf", "spp": 129, "seed": 30000, "vndf": true, "samples": 129, "warmed_samples": 128, "gpu_total_ms": 10219.789698410073, "gpu_median_ms": 79.69557097097398, "gpu_p95_ms": 84.11124794650269, "display_mse": 0.0017943798268929825, "display_psnr_db": 27.460856219029687, "compressed_radiance_mse": 0.0007765815795838214}, "budget_ratio": 1.0481131559007044, "psnr_gain_db": -0.02571022349393104, "per_sample_speedup": 0.9616080192046697}
+Rendering 019_reference 2048 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.32s, BVH 0.497s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Progress: 256 / 2048 spp; 18.7s elapsed
+Progress: 512 / 2048 spp; 38.3s elapsed
+Progress: 768 / 2048 spp; 59.6s elapsed
+Progress: 1024 / 2048 spp; 79.2s elapsed
+Progress: 1280 / 2048 spp; 98.6s elapsed
+Progress: 1536 / 2048 spp; 117.9s elapsed
+Progress: 1792 / 2048 spp; 137.4s elapsed
+Progress: 2048 / 2048 spp; 157.1s elapsed
+Rendered 640x400, 2048 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.10s, render 157.16s; warmed median GPU Some(74.76301900806428) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/019_reference.png
+Rendering 019_pilot 24 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.25s, BVH 0.474s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 24 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.10s, render 1.83s; warmed median GPU Some(72.63176906009674) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/019_pilot.png
+Rendering 019_10000_baseline 128 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.22s, BVH 0.466s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 128 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.10s, render 9.18s; warmed median GPU Some(70.55614411077119) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/019_10000_baseline.png
+Rendering 019_10000_vndf 124 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.33s, BVH 0.541s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 124 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.12s, render 9.34s; warmed median GPU Some(73.54093570456696) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/019_10000_vndf.png
+{"baseline": {"label": "019_10000_baseline", "spp": 128, "seed": 10000, "vndf": false, "samples": 128, "warmed_samples": 127, "gpu_total_ms": 8933.570875645233, "gpu_median_ms": 70.55614411077119, "gpu_p95_ms": 73.5068211220665, "display_mse": 0.0010458802276678153, "display_psnr_db": 29.80518047248147, "compressed_radiance_mse": 0.0004963001801720513}, "vndf": {"label": "019_10000_vndf", "spp": 124, "seed": 10000, "vndf": true, "samples": 124, "warmed_samples": 123, "gpu_total_ms": 9069.984934814816, "gpu_median_ms": 73.54093570456696, "gpu_p95_ms": 78.18739392446136, "display_mse": 0.0010421001284170188, "display_psnr_db": 29.82090550585607, "compressed_radiance_mse": 0.0005040953047175162}, "budget_ratio": 1.0152698244709153, "psnr_gain_db": 0.015725033374600628, "per_sample_speedup": 0.9539374791451011}
+Rendering 019_20000_baseline 128 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.13s, BVH 0.414s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 128 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.10s, render 9.37s; warmed median GPU Some(71.40088367348099) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/019_20000_baseline.png
+Rendering 019_20000_vndf 127 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.32s, BVH 0.503s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 127 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.11s, render 10.38s; warmed median GPU Some(75.73572731764985) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/019_20000_vndf.png
+Rendering 019_20000_vndf 115 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.26s, BVH 0.467s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 115 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.10s, render 8.96s; warmed median GPU Some(76.12208147488403) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/019_20000_vndf.png
+{"baseline": {"label": "019_20000_baseline", "spp": 128, "seed": 20000, "vndf": false, "samples": 128, "warmed_samples": 127, "gpu_total_ms": 9116.63425659258, "gpu_median_ms": 71.40088367348099, "gpu_p95_ms": 76.42859188406753, "display_mse": 0.0010470026544545476, "display_psnr_db": 29.800522172576418, "compressed_radiance_mse": 0.0004967562396339392}, "vndf": {"label": "019_20000_vndf", "spp": 115, "seed": 20000, "vndf": true, "samples": 115, "warmed_samples": 114, "gpu_total_ms": 8698.187912641892, "gpu_median_ms": 76.12208147488403, "gpu_p95_ms": 79.90739388246918, "display_mse": 0.0011226431417573953, "display_psnr_db": 29.497582724074856, "compressed_radiance_mse": 0.0005421281491800077}, "budget_ratio": 0.954100786301908, "psnr_gain_db": -0.3029394485015615, "per_sample_speedup": 0.9408207268697808}
+Rendering 019_30000_baseline 128 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.27s, BVH 0.469s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 128 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.11s, render 9.48s; warmed median GPU Some(72.4695815640564) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/019_30000_baseline.png
+Rendering 019_30000_vndf 128 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.24s, BVH 0.465s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 128 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.10s, render 9.98s; warmed median GPU Some(76.48702938264084) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/019_30000_vndf.png
+Rendering 019_30000_vndf 121 spp
+glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 1.33s, BVH 0.508s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB
+Rendered 640x400, 121 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.11s, render 9.27s; warmed median GPU Some(75.28531066197968) ms/sample; saved /home/matip/Projects/wgpu-raytracer/performance/vndf/results/019_30000_vndf.png
+{"baseline": {"label": "019_30000_baseline", "spp": 128, "seed": 30000, "vndf": false, "samples": 128, "warmed_samples": 127, "gpu_total_ms": 9211.393889695784, "gpu_median_ms": 72.4695815640564, "gpu_p95_ms": 75.22718566339874, "display_mse": 0.0010474405634866217, "display_psnr_db": 29.798706114949766, "compressed_radiance_mse": 0.0004936351713922382}, "vndf": {"label": "019_30000_vndf", "spp": 121, "seed": 30000, "vndf": true, "samples": 121, "warmed_samples": 120, "gpu_total_ms": 9014.077436179743, "gpu_median_ms": 75.28531066197968, "gpu_p95_ms": 78.68161266239548, "display_mse": 0.0010658555022774248, "display_psnr_db": 29.723016684962932, "compressed_radiance_mse": 0.0005102431861026503}, "budget_ratio": 0.9785790884768518, "psnr_gain_db": -0.07568942998683426, "per_sample_speedup": 0.9655651759680235}

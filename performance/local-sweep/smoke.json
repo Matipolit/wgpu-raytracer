@@ -1,0 +1,82 @@
+[
+  {
+    "name": "baseline",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.93s, BVH 0.359s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.54s, render 0.10s; warmed median GPU Some(2.7637499325256347) ms/sample; saved /tmp/local-baseline.png\n"
+  },
+  {
+    "name": "bvh4",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.92s, BVH 0.354s (157907 nodes, depth 27); geometry 32.4 MiB, textures 256.0 MiB\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.93s, render 0.11s; warmed median GPU Some(4.476614474040985) ms/sample; saved /tmp/local-bvh4.png\n"
+  },
+  {
+    "name": "bvh8",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.90s, BVH 0.355s (157907 nodes, depth 27); geometry 33.6 MiB, textures 256.0 MiB\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.92s, render 0.11s; warmed median GPU Some(4.6515103031044) ms/sample; saved /tmp/local-bvh8.png\n"
+  },
+  {
+    "name": "quantized-bvh",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.90s, BVH 0.356s (157907 nodes, depth 27); geometry 30.7 MiB, textures 256.0 MiB\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.95s, render 0.11s; warmed median GPU Some(4.010781152080536) ms/sample; saved /tmp/local-quantized-bvh.png\n"
+  },
+  {
+    "name": "packed-shading",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.90s, BVH 0.356s (157907 nodes, depth 27); geometry 26.7 MiB, textures 256.0 MiB\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.53s, render 0.08s; warmed median GPU Some(2.7483332662353517) ms/sample; saved /tmp/local-packed-shading.png\n"
+  },
+  {
+    "name": "stochastic-color",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.90s, BVH 0.357s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.49s, render 0.09s; warmed median GPU Some(3.038697842479706) ms/sample; saved /tmp/local-stochastic-color.png\n"
+  },
+  {
+    "name": "stochastic-all",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.90s, BVH 0.361s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.46s, render 0.09s; warmed median GPU Some(3.1097915907440186) ms/sample; saved /tmp/local-stochastic-all.png\n"
+  },
+  {
+    "name": "fp16-state",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.93s, BVH 0.364s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.53s, render 0.10s; warmed median GPU Some(2.927552011859894) ms/sample; saved /tmp/local-fp16-state.png\n"
+  },
+  {
+    "name": "packed-directions",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.90s, BVH 0.371s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.55s, render 0.10s; warmed median GPU Some(2.957604094459534) ms/sample; saved /tmp/local-packed-directions.png\n"
+  },
+  {
+    "name": "skip-final-scatter",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.95s, BVH 0.369s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.53s, render 0.10s; warmed median GPU Some(3.077031174877167) ms/sample; saved /tmp/local-skip-final-scatter.png\n"
+  },
+  {
+    "name": "classify-opacity",
+    "returncode": 0,
+    "log": "Opacity classification: 0 fully opaque MASK materials\nglTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.90s, BVH 0.365s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB\nOpacity classification: 0 fully opaque MASK materials\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.09s, render 0.09s; warmed median GPU Some(2.727135350086212) ms/sample; saved /tmp/local-classify-opacity.png\n"
+  },
+  {
+    "name": "approximate-alpha",
+    "returncode": 0,
+    "log": "Opacity classification: 0 fully opaque MASK materials\nglTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.96s, BVH 0.371s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB\nOpacity classification: 0 fully opaque MASK materials\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.56s, render 0.09s; warmed median GPU Some(2.770208265701294) ms/sample; saved /tmp/local-approximate-alpha.png\n"
+  },
+  {
+    "name": "blue-noise-jitter",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.95s, BVH 0.373s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.53s, render 0.09s; warmed median GPU Some(2.6545832685241697) ms/sample; saved /tmp/local-blue-noise-jitter.png\n"
+  },
+  {
+    "name": "bounded-vndf",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.90s, BVH 0.353s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.54s, render 0.10s; warmed median GPU Some(3.354166584777832) ms/sample; saved /tmp/local-bounded-vndf.png\n"
+  },
+  {
+    "name": "ray-cones",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.90s, BVH 0.354s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB\nMip chains built: 772 descriptors, 341 MiB pixels\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.56s, render 0.14s; warmed median GPU Some(4.098281149944305) ms/sample; saved /tmp/local-ray-cones.png\n"
+  },
+  {
+    "name": "scene-cache",
+    "returncode": 0,
+    "log": "glTF: 262266 triangles, 192496 vertices, 25 materials, 65 textures; import 0.90s, BVH 0.356s (157907 nodes, depth 27); geometry 32.6 MiB, textures 256.0 MiB\nRendered 96x64, 8 spp on Intel(R) Iris(R) Xe Graphics (TGL GT2) (Vulkan); setup 0.09s, render 0.10s; warmed median GPU Some(2.8810936796607973) ms/sample; saved /tmp/local-scene-cache.png\n"
+  }
+]

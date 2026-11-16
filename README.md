@@ -4,9 +4,47 @@ A WebGPU implementation of Peter Shirley's ray tracing books. An interactive ren
 
 ## Run
 
+Requires Rust 1.95 or newer.
+
 ```sh
-$ cargo run --release
+$ cargo run --release --locked
 ```
+
+The renderer uses wgpu 30, winit 0.30, and egui 0.37. `Cargo.lock` records the
+complete dependency set.
+
+Path tracing and bilateral denoising run in separate compute passes. The filter
+shares pixel neighborhoods within workgroups and caches the completed image.
+A small render pass tone-maps that image and draws egui. Accumulation and filtered
+radiance use separate full-precision RGB buffers, resized with the viewport.
+
+GPU regression tests cover resizing, accumulation, denoiser controls, and rendering
+the textured scene together with egui. They also compare compute output against
+the frozen fragment renderer across viewport sizes and filter settings:
+
+```sh
+cargo test --release --locked -- --include-ignored
+```
+
+The UI bundles its fonts and does not require system font installation. A native
+shutdown regression test (requires a graphical session) opens the app, sends its
+normal close event after two rendered frames, and checks for a clean exit:
+
+```sh
+cargo build --release --locked
+python3 tests/native_close.py
+```
+
+A repeatable offscreen performance benchmark uses GPU timestamp queries, a fixed
+scene/camera, and warmed pipelines at window and fullscreen resolutions:
+
+```sh
+cargo run --release --locked -- --benchmark
+```
+
+See [performance/compute/README.md](performance/compute/README.md) for the compute
+migration comparison, or [performance/README.md](performance/README.md) for the
+earlier UI migration measurements.
 
 ### Camera and render controls
 
@@ -41,3 +79,61 @@ assets/earthmap.jpeg
 
 assets/sun.jpeg
 * https://www.solarsystemscope.com/textures/
+
+## glTF / GLB scenes and Sponza
+
+Download the 2026 PBR/PNG cleanup of classic Sponza (118 MB, pinned checksum):
+
+```sh
+python3 scripts/download_sponza.py
+cargo run --release --locked -- --sponza
+```
+
+Load another static scene, inspect its import statistics, or save an offscreen PNG:
+
+```sh
+cargo run --release --locked -- --model path/to/scene.glb
+cargo run --release --locked -- --model path/to/scene.gltf --inspect-model
+cargo run --release --locked -- --sponza --render-output /tmp/sponza.png --size 640x400 --samples 256
+```
+
+`--sponza` selects an interior camera and daylight. Imported scenes support
+metallic/roughness PBR maps, normal maps, emission and alpha cutouts. Adjust
+exposure in the UI or pass `--exposure 2` when rendering offscreen. Exposure changes
+retain accumulated samples. Geometry uses a CPU-built binary SAH BVH traversed
+in compute; the original sphere scene remains available without arguments.
+
+This is a static core-glTF loader: compressed mesh/texture extensions, skins,
+morphs, blended transparency and vertex colors are not supported. Unsupported
+required features report an error. There are no texture mipmaps or explicit
+mesh-light/environment importance sampling yet, so Sponza interiors remain noisy
+at low sample counts. See [the implementation and validation notes](performance/gltf-loading.md)
+and [asset provenance/license](assets/sponza/README.md) for details. Download the
+asset before running the complete GPU test suite.
+
+## Overnight neural denoiser
+
+See [training/README.md](training/README.md) for resumable 1/512 spp Sponza capture,
+CPU training, WGSL inference and the measured 5 ms acceptance gate.
+
+Measured Iris Xe traversal optimizations and reproduction commands are in
+[performance/laptop/README.md](performance/laptop/README.md).
+
+Russian roulette is enabled by default. The default bounce limit is three;
+roulette starts before bounce four, so it takes effect when that limit is raised.
+Use `--bounces 8` for the historical comparison setting or
+`--no-russian-roulette` to disable roulette.
+See [performance/roulette/README.md](performance/roulette/README.md) for equal-time
+quality comparisons and reproduction commands.
+
+Experimental mesh sky sampling: add `--sky-importance`. Equal-time tests did not
+show a consistent gain, so it remains off by default. See
+[performance/sky/README.md](performance/sky/README.md).
+
+Experimental GGX visible-normal sampling for mesh PBR materials is available
+with `--ggx-vndf`; see [performance/vndf/README.md](performance/vndf/README.md).
+
+The [combined local optimization report](performance/local-sweep/README.md)
+compares 20 rendering variants, scene caching, a spatial filter, and two
+combinations on Iris Xe. The strongest tested combination is available with
+`--sah-stop --skip-final-scatter`; all new experiments remain opt-in.

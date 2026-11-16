@@ -1,4 +1,7 @@
-use winit::event::{ElementState, KeyboardInput, MouseButton, VirtualKeyCode, WindowEvent};
+use winit::{
+    event::{ElementState, MouseButton, WindowEvent},
+    keyboard::{KeyCode, PhysicalKey},
+};
 
 use crate::raytracer::{Angle, Camera};
 
@@ -60,35 +63,42 @@ impl FlyCameraController {
         }
     }
 
-    pub fn handle_event(&mut self, event: &WindowEvent<'_>) {
+    pub fn release_input(&mut self) {
+        self.forward_pressed = false;
+        self.backward_pressed = false;
+        self.left_pressed = false;
+        self.right_pressed = false;
+        self.up_pressed = false;
+        self.down_pressed = false;
+        self.look_pressed = false;
+        self.previous_mouse_pos = None;
+    }
+
+    pub fn handle_event(&mut self, event: &WindowEvent) {
         match event {
-            WindowEvent::KeyboardInput {
-                input:
-                    KeyboardInput {
-                        state,
-                        virtual_keycode: Some(keycode),
-                        ..
-                    },
-                ..
-            } => {
-                let is_pressed = *state == ElementState::Pressed;
+            WindowEvent::KeyboardInput { event, .. } => {
+                let PhysicalKey::Code(keycode) = event.physical_key else {
+                    return;
+                };
+                let state = event.state;
+                let is_pressed = state == ElementState::Pressed;
                 match keycode {
-                    VirtualKeyCode::W => {
+                    KeyCode::KeyW => {
                         self.forward_pressed = is_pressed;
                     }
-                    VirtualKeyCode::S => {
+                    KeyCode::KeyS => {
                         self.backward_pressed = is_pressed;
                     }
-                    VirtualKeyCode::A => {
+                    KeyCode::KeyA => {
                         self.left_pressed = is_pressed;
                     }
-                    VirtualKeyCode::D => {
+                    KeyCode::KeyD => {
                         self.right_pressed = is_pressed;
                     }
-                    VirtualKeyCode::Q => {
+                    KeyCode::KeyQ => {
                         self.down_pressed = is_pressed;
                     }
-                    VirtualKeyCode::E => {
+                    KeyCode::KeyE => {
                         self.up_pressed = is_pressed;
                     }
                     _ => {}

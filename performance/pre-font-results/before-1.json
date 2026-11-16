@@ -1,0 +1,94 @@
+{
+  "ui": "imgui",
+  "adapter": "Intel(R) Iris(R) Xe Graphics (TGL GT2)",
+  "backend": "Vulkan",
+  "driver": "Mesa 26.2.7-arch1.1",
+  "warmup_frames": 24,
+  "measured_frames": 96,
+  "cases": [
+    {
+      "width": 800,
+      "height": 600,
+      "state": "accumulating",
+      "gpu_ms": {
+        "median": 4.8325,
+        "p95": 4.862656
+      },
+      "cpu_ms": {
+        "median": 0.582225,
+        "p95": 0.793296
+      },
+      "ui_cpu_ms": {
+        "median": 0.123833,
+        "p95": 0.174839
+      },
+      "wall_ms": {
+        "median": 5.822529,
+        "p95": 5.978532
+      }
+    },
+    {
+      "width": 800,
+      "height": 600,
+      "state": "converged",
+      "gpu_ms": {
+        "median": 1.226094,
+        "p95": 1.248542
+      },
+      "cpu_ms": {
+        "median": 0.251951,
+        "p95": 0.378162
+      },
+      "ui_cpu_ms": {
+        "median": 0.061098,
+        "p95": 0.092596
+      },
+      "wall_ms": {
+        "median": 1.713333,
+        "p95": 2.451573
+      }
+    },
+    {
+      "width": 2560,
+      "height": 1600,
+      "state": "accumulating",
+      "gpu_ms": {
+        "median": 40.325624,
+        "p95": 40.766978
+      },
+      "cpu_ms": {
+        "median": 0.586799,
+        "p95": 0.686316
+      },
+      "ui_cpu_ms": {
+        "median": 0.122033,
+        "p95": 0.155354
+      },
+      "wall_ms": {
+        "median": 41.341418,
+        "p95": 42.542629
+      }
+    },
+    {
+      "width": 2560,
+      "height": 1600,
+      "state": "converged",
+      "gpu_ms": {
+        "median": 6.347917,
+        "p95": 6.383437
+      },
+      "cpu_ms": {
+        "median": 0.543993,
+        "p95": 0.647457
+      },
+      "ui_cpu_ms": {
+        "median": 0.126722,
+        "p95": 0.172059
+      },
+      "wall_ms": {
+        "median": 7.320517,
+        "p95": 7.425966
+      }
+    }
+  ]
+}

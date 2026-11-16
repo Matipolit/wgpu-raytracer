@@ -1,0 +1,7 @@
+{
+  "before_binary_sha256": "0413068e2c041a07771e6df647d229f1899503b30518777aeb0d7e5e281164bd",
+  "after_binary_sha256": "b36dfcbefd37d0367816ad0af71348ff4de556110f5832552de9c56d45832e1e",
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "comparison_command": "python performance/compare.py /tmp/pre-gltf-compute-baseline target/release/weekend-raytracer-wgpu --rounds 3 --output performance/gltf",
+  "sponza_command": "target/release/weekend-raytracer-wgpu --sponza --render-output performance/gltf/sponza.png --samples 256 --size 640x400"
+}

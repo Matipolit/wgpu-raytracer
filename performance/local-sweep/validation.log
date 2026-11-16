@@ -1,0 +1,35 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src/main.rs (target/debug/deps/weekend_raytracer_wgpu-3d30ea2a641112d2)
+
+running 27 tests
+test raytracer::angle::tests::test_angle_clamp_min ... ok
+test raytracer::angle::tests::test_angle_clamp_max ... ok
+test raytracer::angle::tests::test_angle_to_degrees ... ok
+test raytracer::angle::tests::test_angle_add ... ok
+test raytracer::angle::tests::test_angle_to_radians ... ok
+test raytracer::mesh::local_tests::mipmaps_include_odd_edges_and_decode_srgb_before_averaging ... ok
+test raytracer::tests::mesh_cases::gltf_applies_transforms_and_preserves_mirrored_winding ... ok
+test raytracer::mesh::local_tests::cooked_scene_roundtrip_and_truncation_rejection ... ok
+test raytracer::tests::mesh_cases::gltf_reports_unsupported_required_extensions_and_blended_materials ... ok
+test raytracer::mesh::local_tests::quantized_bounds_are_outward_rounded ... ok
+test raytracer::tests::mesh_cases::bvh_bounds_enclose_all_leaves_and_every_triangle_once ... ok
+test gui::tests::parameter_controls_have_real_font_glyphs_without_system_fonts ... ok
+test raytracer::tests::denoiser_enable_radius_and_sigma_control_the_display ... ok
+test raytracer::tests::mesh_cases::imported_emissive_triangle_renders_with_zero_sphere_lights ... ok
+test raytracer::tests::mesh_cases::roulette_preserves_expected_throughput_including_probability_clamps ... ok
+test raytracer::tests::mesh_cases::sky_sampler_matches_pdf_and_integrates_constant_environment ... ok
+test raytracer::tests::mesh_cases::sky_mis_preserves_unoccluded_pbr_energy_and_continuation_weights ... ok
+test raytracer::tests::mesh_cases::gltf_alpha_mask_and_top_left_uvs_reveal_geometry_behind_cutouts ... ok
+test raytracer::tests::sky_distribution_has_full_support_and_normalized_solid_angle_pdf ... ok
+test raytracer::tests::mesh_cases::vndf_preserves_energy_and_reduces_grazing_rejections ... ok
+test raytracer::tests::mesh_cases::gltf_texture_filtering_decodes_srgb_before_interpolation_and_wraps ... ok
+test raytracer::tests::mesh_cases::gpu_bvh_matches_brute_force_including_parallel_and_inside_rays ... ok
+test raytracer::tests::mesh_cases::sphere_light_sampling_matches_analytic_solid_angle_and_handles_zero_one_and_last_light ... ok
+test raytracer::tests::textured_scene_and_egui_share_the_display_pass ... ok
+test raytracer::tests::compute_matches_fragment_reference_through_accumulation_and_resize ... ok
+test raytracer::tests::resizing_and_accumulation_keep_every_pixel_at_the_same_brightness ... ok
+test raytracer::tests::mesh_cases::sponza_bvh_matches_brute_force has been running for over 60 seconds
+test raytracer::tests::mesh_cases::sponza_bvh_matches_brute_force ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 79.85s
+

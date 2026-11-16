@@ -1,0 +1,233 @@
+--- a/src/raytracer/mesh.wgsl
++++ b/src/raytracer/mesh.wgsl
+@@ -50,35 +50,27 @@
+                mix(meshTexel(desc,point+vec2(0,1),srgb),meshTexel(desc,point+vec2(1,1),srgb),f.x),f.y);
+ }
+ 
+-// Explicit parallel-axis handling avoids 0*infinity NaNs at box boundaries.
+-fn meshBox(ray: Ray, index: u32, tmax: f32) -> f32 {
++// Reciprocal directions are invariant throughout traversal. Parallel slabs use
++// finite arithmetic and explicit rejection, including origins on box boundaries.
++fn meshBox(ray: Ray, inverse: vec3<f32>, parallel: vec3<bool>, index: u32, tmax: f32) -> f32 {
+     let node=16u+index*8u;
+     let lo=meshVec3(node); let hi=meshVec3(node+4u);
+-    var near=MIN_T;var far=tmax;
+-    for(var axis=0u;axis<3u;axis+=1u) {
+-        let d=ray.direction[axis]; let p=ray.origin[axis];
+-        if abs(d)<1e-20 {
+-            if p<lo[axis] || p>hi[axis] { return MAX_T; }
+-        } else {
+-            let a=(lo[axis]-p)/d; let b=(hi[axis]-p)/d;
+-            near=max(near,min(a,b)); far=min(far,max(a,b));
+-            if near>far { return MAX_T; }
+-        }
+-    }
+-    return near;
+-}
+-fn meshTriangle(ray: Ray, index: u32, tmax: f32, outHit: ptr<function, Intersection>) -> bool {
+-    let tri=meshData[2u]+index*4u;
+-    let va=meshData[3u]+meshData[tri]*16u;
+-    let vb=meshData[3u]+meshData[tri+1u]*16u;
+-    let vc=meshData[3u]+meshData[tri+2u]*16u;
+-    let a=meshVec3(va); let b=meshVec3(vb);let c=meshVec3(vc);
+-    let e1=b-a;let e2=c-a;
++    if any(parallel & ((ray.origin < lo) | (ray.origin > hi))) {return MAX_T;}
++    let a=(lo-ray.origin)*inverse; let b=(hi-ray.origin)*inverse;
++    let lower=select(min(a,b),vec3(-MAX_T),parallel);
++    let upper=select(max(a,b),vec3(MAX_T),parallel);
++    let near=max(MIN_T,max(lower.x,max(lower.y,lower.z)));
++    let far=min(tmax,min(upper.x,min(upper.y,upper.z)));
++    return select(MAX_T,near,near<=far);
++}
++struct MeshCandidate { t: f32, u: f32, v: f32, index: u32 }
++fn meshCandidate(ray: Ray, index: u32, tmax: f32, outHit: ptr<function, MeshCandidate>) -> bool {
++    let accel=meshData[8u]+index*12u;
++    let a=meshVec3(accel); let e1=meshVec3(accel+4u); let e2=meshVec3(accel+8u);
+     let crossD=cross(ray.direction,e2); let determinant=dot(e1,crossD);
+-    // Relative tolerance supports small meshes and non-unit camera rays.
+-    if abs(determinant)<=1e-8*length(e1)*length(e2)*length(ray.direction) { return false; }
+-    let materialIdx=meshData[tri+3u];let material=meshMaterialOffset(materialIdx);
+-    if (meshData[material+11u]&1u)==0u && determinant<0. {return false;}
++    if abs(determinant)<=meshFloat(accel+3u)*length(ray.direction) {return false;}
++    let flags=meshData[accel+11u];
++    if (flags&1u)==0u && determinant<0. {return false;}
+     let inv=1./determinant;let delta=ray.origin-a;
+     let u=dot(delta,crossD)*inv;
+     if u<0. || u>1. {return false;}
+@@ -86,13 +78,33 @@
+     if v<0. || u+v>1. {return false;}
+     let t=dot(e2,q)*inv;
+     if t<=MIN_T || t>=tmax {return false;}
+-    let weights=vec3(1.-u-v,u,v);
++    if (flags&2u)!=0u {
++        let tri=meshData[2u]+index*4u;
++        let va=meshData[3u]+meshData[tri]*16u;
++        let vb=meshData[3u]+meshData[tri+1u]*16u;
++        let vc=meshData[3u]+meshData[tri+2u]*16u;
++        let material=meshMaterialOffset(meshData[accel+7u]);
++        let weights=vec3(1.-u-v,u,v);
++        let uv0=weights.x*meshVec2(va+8u)+weights.y*meshVec2(vb+8u)+weights.z*meshVec2(vc+8u);
++        let uv1=weights.x*meshVec2(va+10u)+weights.y*meshVec2(vb+10u)+weights.z*meshVec2(vc+10u);
++        let alpha=meshFloat(material+3u)*meshTexture(material+16u,uv0,uv1,false).a;
++        if alpha<meshFloat(material+10u) {return false;}
++    }
++    *outHit=MeshCandidate(t,u,v,index);
++    return true;
++}
++
++// Resolve attributes and sample the normal map once, after closest-hit traversal.
++fn meshResolve(ray: Ray, candidate: MeshCandidate) -> Intersection {
++    let tri=meshData[2u]+candidate.index*4u;
++    let va=meshData[3u]+meshData[tri]*16u;
++    let vb=meshData[3u]+meshData[tri+1u]*16u;
++    let vc=meshData[3u]+meshData[tri+2u]*16u;
++    let a=meshVec3(va); let e1=meshVec3(vb)-a; let e2=meshVec3(vc)-a;
++    let materialIdx=meshData[tri+3u];let material=meshMaterialOffset(materialIdx);
++    let weights=vec3(1.-candidate.u-candidate.v,candidate.u,candidate.v);
+     let uv0=weights.x*meshVec2(va+8u)+weights.y*meshVec2(vb+8u)+weights.z*meshVec2(vc+8u);
+     let uv1=weights.x*meshVec2(va+10u)+weights.y*meshVec2(vb+10u)+weights.z*meshVec2(vc+10u);
+-    if (meshData[material+11u]&2u)!=0u {
+-        let alpha=meshFloat(material+3u)*meshTexture(material+16u,uv0,uv1,false).a;
+-        if alpha<meshFloat(material+10u) {return false;}
+-    }
+     var geo=normalize(cross(e1,e2));
+     var n=weights.x*meshVec3(va+4u)+weights.y*meshVec3(vb+4u)+weights.z*meshVec3(vc+4u);
+     if dot(n,n)<1e-12 {n=geo;} else {n=normalize(n);}
+@@ -127,33 +139,43 @@
+         if dot(mapped,mapped)>1e-12 && dot(mapped,geo)>0. {n=normalize(mapped);}
+     }
+     if dot(geo,ray.direction)>0. {geo=-geo;n=-n;}
+-    *outHit=Intersection(ray.origin+t*ray.direction,n,uv0.x,uv0.y,t,materialIdx,0xffffffffu,uv1,geo);
++    return Intersection(ray.origin+candidate.t*ray.direction,n,uv0.x,uv0.y,candidate.t,materialIdx,0xffffffffu,uv1,geo);
++}
++
++// Reference/diagnostic callers retain the full intersection interface.
++fn meshTriangle(ray: Ray, index: u32, tmax: f32, outHit: ptr<function, Intersection>) -> bool {
++    var candidate=MeshCandidate();
++    if !meshCandidate(ray,index,tmax,&candidate) {return false;}
++    *outHit=meshResolve(ray,candidate);
+     return true;
+ }
+ fn meshIntersection(ray: Ray, outHit: ptr<function, Intersection>, tmax: f32) -> bool {
+     if meshData[0u]==0u {return false;}
+-    var closest=tmax;var found=false;
+-    var stack:array<u32,64>;var size=0u;var index=0u;
++    var closest=tmax;var found=false;var best=MeshCandidate();
++    let parallel=abs(ray.direction)<vec3(1e-20);
++    let inverse=vec3(1.)/select(ray.direction,vec3(1.),parallel);
++    var stack:array<u32,64>;var size=0u;var index=0u;var needsBox=true;
+     loop {
+-        if meshBox(ray,index,closest)<closest {
++        if !needsBox || meshBox(ray,inverse,parallel,index,closest)<closest {
+             let node=16u+index*8u;let first=meshData[node+3u];let count=meshData[node+7u];
+             if count!=0u {
+                 for(var i=0u;i<count;i+=1u) {
+-                    var hit=Intersection();
+-                    if meshTriangle(ray,first+i,closest,&hit) {closest=hit.t;*outHit=hit;found=true;}
++                    var hit=MeshCandidate();
++                    if meshCandidate(ray,first+i,closest,&hit) {closest=hit.t;best=hit;found=true;}
+                 }
+             } else {
+                 let left=index+1u;let right=first;
+-                let a=meshBox(ray,left,closest);let b=meshBox(ray,right,closest);
++                let a=meshBox(ray,inverse,parallel,left,closest);let b=meshBox(ray,inverse,parallel,right,closest);
+                 if min(a,b)<closest {
+                     if max(a,b)<closest {stack[size]=select(left,right,a<=b);size+=1u;}
+-                    index=select(right,left,a<=b);continue;
++                    index=select(right,left,a<=b);needsBox=false;continue;
+                 }
+             }
+         }
+         if size==0u {break;}
+-        size-=1u;index=stack[size];
+-    }
++        size-=1u;index=stack[size];needsBox=true;
++    }
++    if found {*outHit=meshResolve(ray,best);}
+     return found;
+ }
+ 
+--- a/src/raytracer/mesh.rs
++++ b/src/raytracer/mesh.rs
+@@ -347,6 +347,29 @@
+         }
+         words[5] = words.len() as u32;
+         words.extend_from_slice(bytemuck::cast_slice(&self.textures));
++        // Traversal-only triangle records avoid dependent vertex/material reads.
++        words[8] = words.len() as u32;
++        for tri in &self.triangles {
++            let a = glm::make_vec3(&self.vertices[tri.vertices[0] as usize].position);
++            let e1 = glm::make_vec3(&self.vertices[tri.vertices[1] as usize].position) - a;
++            let e2 = glm::make_vec3(&self.vertices[tri.vertices[2] as usize].position) - a;
++            for value in [
++                a.x,
++                a.y,
++                a.z,
++                1e-8 * glm::length(&e1) * glm::length(&e2),
++                e1.x,
++                e1.y,
++                e1.z,
++            ] {
++                words.push(value.to_bits());
++            }
++            words.push(tri.material);
++            for value in [e2.x, e2.y, e2.z] {
++                words.push(value.to_bits());
++            }
++            words.push(self.materials[tri.material as usize][11]);
++        }
+         words
+     }
+ 
+--- a/src/raytracer/mod.rs
++++ b/src/raytracer/mod.rs
+@@ -16,6 +16,27 @@
+ use std::f32::consts::*;
+ 
+ pub(crate) const TRACE_WORKGROUP_SIZE: [u32; 2] = [8, 8];
++
++/// Explicit tuning override for reproducible GPU experiments; cached per process.
++pub(crate) fn trace_workgroup_size() -> [u32; 2] {
++    static SIZE: std::sync::OnceLock<[u32; 2]> = std::sync::OnceLock::new();
++    *SIZE.get_or_init(|| {
++        std::env::var("RAYTRACER_WORKGROUP").map_or(TRACE_WORKGROUP_SIZE, |value| {
++            let (x, y) = value
++                .split_once('x')
++                .expect("RAYTRACER_WORKGROUP must be WIDTHxHEIGHT");
++            let size = [x.parse::<u32>().unwrap(), y.parse::<u32>().unwrap()];
++            assert!(
++                size[0] > 0
++                    && size[1] > 0
++                    && size[0] <= 256
++                    && size[1] <= 256
++                    && size[0] * size[1] <= 256
++            );
++            size
++        })
++    })
++}
+ 
+ pub struct Raytracer {
+     vertex_uniform_bind_group: wgpu::BindGroup,
+@@ -357,8 +378,8 @@
+                 ("LIGHT_COUNT", light_count),
+                 ("TRACE_MESHES", f64::from(!scene.mesh.triangles.is_empty())),
+                 ("TRACE_SPHERES", f64::from(!scene.spheres.is_empty())),
+-                ("TRACE_WIDTH", f64::from(TRACE_WORKGROUP_SIZE[0])),
+-                ("TRACE_HEIGHT", f64::from(TRACE_WORKGROUP_SIZE[1])),
++                ("TRACE_WIDTH", f64::from(trace_workgroup_size()[0])),
++                ("TRACE_HEIGHT", f64::from(trace_workgroup_size()[1])),
+             ],
+         );
+         let denoising_pipeline = create_compute(
+@@ -433,8 +454,8 @@
+             pass.set_bind_group(2, &self.parameter_bind_group, &[]);
+             pass.set_bind_group(3, &self.scene_bind_group, &[]);
+             pass.dispatch_workgroups(
+-                width.div_ceil(TRACE_WORKGROUP_SIZE[0]),
+-                height.div_ceil(TRACE_WORKGROUP_SIZE[1]),
++                width.div_ceil(trace_workgroup_size()[0]),
++                height.div_ceil(trace_workgroup_size()[1]),
+                 1,
+             );
+             self.filter_dirty = true;

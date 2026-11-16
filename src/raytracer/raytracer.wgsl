@@ -38,6 +38,9 @@ struct VertexOutput {
 
 @group(1) @binding(0) var<uniform> frameData: vec4<u32>;
 @group(1) @binding(1) var<storage, read_write> imageBuffer: array<array<f32, 3>>;
+@group(1) @binding(2) var<storage, read> accumulatedImage: array<array<f32, 3>>;
+@group(1) @binding(3) var<storage, read_write> filteredImage: array<array<f32, 3>>;
+@group(1) @binding(4) var<storage, read> displayImage: array<array<f32, 3>>;
 
 @group(2) @binding(0) var<uniform> camera: Camera;
 @group(2) @binding(1) var<uniform> samplingParams: SamplingParams;
@@ -48,100 +51,172 @@ struct VertexOutput {
 @group(3) @binding(2) var<storage, read> textures: array<array<f32, 3>>;
 @group(3) @binding(3) var<storage, read> lights: array<u32>;
 
-@fragment
-fn fsMain(in: VertexOutput) -> @location(0) vec4<f32> {
-    let u = in.texCoords.x;
-    let v = in.texCoords.y;
+// Specialized by the host; dispatch dimensions use the same constants.
+override SPHERE_COUNT: u32 = 0u;
+override LIGHT_COUNT: u32 = 0u;
+override TRACE_MESHES: bool = false;
+override TRACE_SPHERES: bool = true;
+override TRACE_WIDTH: u32 = 8u;
+override TRACE_HEIGHT: u32 = 8u;
+// Opt-in unbiased path termination, retaining the existing hard bounce limit.
+override RUSSIAN_ROULETTE: bool = true;
+override SKY_IMPORTANCE: bool = false;
+override GGX_VNDF: bool = false;
+override GGX_BOUNDED:bool=false;
 
-    let imageWidth = frameData.x;
-    let imageHeight = frameData.y;
-    let frameNumber = frameData.z;
-
-    let x = u32(u * f32(imageWidth));
-    let y = u32(v * f32(imageHeight));
-    let idx = imageWidth * y + x;
-
-    var rngState = initRng(vec2(x, y), vec2(imageWidth, imageHeight), frameNumber);
-    var pixel = vec3(imageBuffer[idx][0u], imageBuffer[idx][1u], imageBuffer[idx][2u]);
-    {
-        if samplingParams.clearAccumulatedSamples == 1u {
-            pixel = vec3(0f);
-        }
-
-        let rgb = samplePixel(x, y, &rngState);
-        pixel += rgb;
+override SPARSE_DENOISE:bool=false;
+override WIDE_BVH:u32=2u;
+override QUANTIZED_BVH:bool=false;
+override OPACITY_APPROX:bool=false;
+override SOFTWARE_OPACITY:bool=false;
+override ALPHA_CAP:bool=false;
+var<private> alphaQueries:u32;
+var<private> pathDiffuse:bool;
+var<private> pathBounce:u32;
+override PACKED_SHADING:bool=false;
+override STOCHASTIC_TEXTURE:u32=0u;
+override PACKED_DIRECTIONS:bool=false;
+override SKIP_FINAL_SCATTER:bool=false;
+override BLUE_NOISE_JITTER:bool=false;
+override RAY_CONES:bool=false;
+var<private> coneWidth:f32;
+var<private> coneSpread:f32;
+var<private> footprintUV0:vec2<f32>;
+var<private> footprintUV1:vec2<f32>;
+var<private> textureRng:u32;
+// Every invocation owns one pixel; the next pass only sees completed sums.
+@compute @workgroup_size(TRACE_WIDTH, TRACE_HEIGHT)
+fn csAccumulate(@builtin(global_invocation_id) id: vec3<u32>) {
+    let x = id.x;
+    let y = id.y;
+    if x >= frameData.x || y >= frameData.y {
+        return;
     }
+    let idx = frameData.x * y + x;
+    var pixel = vec3(0f);
+    if samplingParams.clearAccumulatedSamples == 0u {
+        pixel = vec3(imageBuffer[idx][0], imageBuffer[idx][1], imageBuffer[idx][2]);
+    }
+    var rngState = initRng(vec2(x, y), frameData.xy, frameData.z);
+    pixel += samplePixel(x, y, &rngState);
     imageBuffer[idx] = array<f32, 3>(pixel.r, pixel.g, pixel.b);
+}
 
-    let invN = 1f / f32(samplingParams.accumulatedSamplesPerPixel);
-    let current_pixel_average_color = invN * pixel; // 'pixel' is the sum from imageBuffer
+fn averagePixel(x: u32, y: u32) -> vec3<f32> {
+    let pixel = accumulatedImage[frameData.x * y + x];
+    let invN = 1f / f32(max(1u, samplingParams.accumulatedSamplesPerPixel));
+    return invN * vec3(pixel[0], pixel[1], pixel[2]);
+}
 
-    // --- Rudimentary Denoiser (e.g., simplified Bilateral Filter) ---
-    var denoised_color_sum = vec3(0.0);
-    var total_weight = 0.0;
-
-    let denoising_radius = 1; // For a 3x3 kernel (can be parameterized)
-    let sigma_color_sq = 0.1 * 0.1; // Variance for color similarity (tune this)
-    // let sigma_spatial_sq = 2.0 * 2.0; // Variance for spatial distance (tune this)
-
-
-    if (samplingParams.accumulatedSamplesPerPixel > 1u) { // Only denoise if we have some accumulation
-        for (var dy = -denoising_radius; dy <= denoising_radius; dy = dy + 1) {
-            for (var dx = -denoising_radius; dx <= denoising_radius; dx = dx + 1) {
-                let neighbor_x = i32(x) + dx;
-                let neighbor_y = i32(y) + dy;
-
-                // Clamp coordinates to be within image bounds
-                if (neighbor_x >= 0 && neighbor_x < i32(imageWidth) &&
-                    neighbor_y >= 0 && neighbor_y < i32(imageHeight)) {
-
-                    let neighbor_idx = u32(imageWidth * u32(neighbor_y) + u32(neighbor_x));
-                    // Read the SUM from the image buffer for the neighbor
-                    let neighbor_pixel_sum = vec3(imageBuffer[neighbor_idx][0u],
-                                                  imageBuffer[neighbor_idx][1u],
-                                                  imageBuffer[neighbor_idx][2u]);
-                    // Calculate neighbor's average color
-                    let neighbor_average_color = invN * neighbor_pixel_sum;
-
-                    // Color difference weight (Gaussian)
-                    let color_difference = current_pixel_average_color - neighbor_average_color;
-                    let color_dist_sq = dot(color_difference, color_difference);
-                    let weight_color = exp(-color_dist_sq / (2.0 * sigma_color_sq));
-
-                    // Spatial distance weight (Gaussian - optional, can be simpler)
-                    // let spatial_dist_sq = f32(dx*dx + dy*dy);
-                    // let weight_spatial = exp(-spatial_dist_sq / (2.0 * sigma_spatial_sq));
-                    let weight_spatial = 1.0; // Simplest: uniform spatial weight within kernel
-
-                    let current_weight = weight_color * weight_spatial;
-
-                    denoised_color_sum += neighbor_average_color * current_weight;
-                    total_weight += current_weight;
-                }
+// Fallback for API callers requesting a kernel larger than the UI's radius 5.
+fn filterGlobal(x: u32, y: u32) -> vec3<f32> {
+    let average = averagePixel(x, y);
+    let radius = i32(samplingParams.denoisingRadius);
+    let sigma = max(0.0001f, samplingParams.denoisingSigmaColor);
+    var colorSum = vec3(0f);
+    var weightSum = 0f;
+    for (var dy = -radius; dy <= radius; dy += 1) {
+        for (var dx = -radius; dx <= radius; dx += 1) {
+            let nx = i32(x) + dx;
+            let ny = i32(y) + dy;
+            if nx >= 0 && nx < i32(frameData.x) && ny >= 0 && ny < i32(frameData.y) {
+                let neighbor = averagePixel(u32(nx), u32(ny));
+                let difference = average - neighbor;
+                let weight = exp(-dot(difference, difference) / (2f * sigma * sigma));
+                colorSum += neighbor * weight;
+                weightSum += weight;
             }
         }
     }
+    return colorSum / max(weightSum, 0.0001f);
+}
 
+// 8x8 pixels plus a radius-5 halo. Only the requested halo is loaded.
+var<workgroup> filterTile: array<vec3<f32>, 324>;
 
-    var final_display_color: vec3<f32>;
-    if (total_weight > 0.01) { // Check total_weight to avoid division by zero if all weights were tiny
-        final_display_color = denoised_color_sum / total_weight;
-    } else {
-        final_display_color = current_pixel_average_color; // Fallback to non-denoised if something went wrong
+@compute @workgroup_size(8, 8)
+fn csDenoise(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(local_invocation_id) local: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    let inBounds = id.x < frameData.x && id.y < frameData.y;
+    let radius = samplingParams.denoisingRadius;
+    let enabled = samplingParams.denoisingEnabled != 0u && radius != 0u &&
+        samplingParams.accumulatedSamplesPerPixel > 1u;
+    if !enabled {
+        if inBounds {
+            let color = averagePixel(id.x, id.y);
+            filteredImage[frameData.x * id.y + id.x] = array<f32, 3>(color.r, color.g, color.b);
+        }
+        return;
     }
-    // --- End Denoiser ---
+    if SPARSE_DENOISE && radius==1u {
+        if inBounds {let color=sparseBilateral(id.x,id.y);filteredImage[frameData.x*id.y+id.x]=array<f32,3>(color.r,color.g,color.b);}
+        return;
+    }
+    if radius > 5u {
+        if inBounds {
+            let color = filterGlobal(id.x, id.y);
+            filteredImage[frameData.x * id.y + id.x] = array<f32, 3>(color.r, color.g, color.b);
+        }
+        return;
+    }
 
+    let stride = 8u + 2u * radius;
+    let origin = vec2<i32>(group.xy * 8u) - vec2(i32(radius));
+    for (var index = lane; index < stride * stride; index += 64u) {
+        let point = origin + vec2<i32>(i32(index % stride), i32(index / stride));
+        var color = vec3(0f);
+        if point.x >= 0 && point.y >= 0 && point.x < i32(frameData.x) && point.y < i32(frameData.y) {
+            color = averagePixel(u32(point.x), u32(point.y));
+        }
+        filterTile[index] = color;
+    }
+    // Edge invocations must participate in loading and in the barrier too.
+    workgroupBarrier();
+    if !inBounds {
+        return;
+    }
+    let center = local.xy + vec2(radius);
+    let average = filterTile[center.y * stride + center.x];
+    let sigma = max(0.0001f, samplingParams.denoisingSigmaColor);
+    var colorSum = vec3(0f);
+    var weightSum = 0f;
+    for (var dy = -i32(radius); dy <= i32(radius); dy += 1) {
+        for (var dx = -i32(radius); dx <= i32(radius); dx += 1) {
+            let point = vec2<i32>(id.xy) + vec2(dx, dy);
+            if point.x >= 0 && point.y >= 0 && point.x < i32(frameData.x) && point.y < i32(frameData.y) {
+                let offset = vec2<i32>(center) + vec2(dx, dy);
+                let neighbor = filterTile[u32(offset.y) * stride + u32(offset.x)];
+                let difference = average - neighbor;
+                let weight = exp(-dot(difference, difference) / (2f * sigma * sigma));
+                colorSum += neighbor * weight;
+                weightSum += weight;
+            }
+        }
+    }
+    let color = colorSum / max(weightSum, 0.0001f);
+    filteredImage[frameData.x * id.y + id.x] = array<f32, 3>(color.r, color.g, color.b);
+}
 
-    return vec4(
-        uncharted2(final_display_color), // Tonemap the (potentially) denoised color
-        1f
-    );
+// The remaining raster pass only tone-maps the computed image and draws the UI.
+@fragment
+fn fsMain(in: VertexOutput) -> @location(0) vec4<f32> {
+    let x = u32(in.clipPosition.x);
+    let y = u32(in.clipPosition.y);
+    if x >= frameData.x || y >= frameData.y {
+        return vec4(0f, 0f, 0f, 1f);
+    }
+    let color = displayImage[frameData.x * y + x];
+    return vec4(uncharted2(vec3(color[0], color[1], color[2])), 1f);
 }
 
 fn uncharted2(x: vec3<f32>) -> vec3<f32> {
     // Based on uncharted2 tonemapping function
     // https://dmnsgn.github.io/glsl-tone-map/
-    let exposureBias = 0.246;   // determined experimentally for the scene
+    let exposureBias = bitcast<f32>(frameData.w);
     let curr = uncharted2Tonemap(exposureBias * x);
 
     let w = 11.2;
@@ -169,9 +244,19 @@ fn samplePixel(x: u32, y: u32, rngState: ptr<function, u32>) -> vec3<f32> {
     let numSamples = samplingParams.numSamplesPerPixel;
     var color = vec3(0f);
     for (var i = 0u; i < numSamples; i += 1u) {
-        let u = (f32(x) + rngNextFloat(rngState)) * invWidth;
-        let v = (f32(y) + rngNextFloat(rngState)) * invHeight;
+        var jitter=vec2(rngNextFloat(rngState),rngNextFloat(rngState));
+        if BLUE_NOISE_JITTER {
+            let mask=unpack2x16unorm(meshData[meshData[14u]+(y%64u)*64u+(x%64u)]);
+            let sequence=fract(vec2(0.7548776662,0.569840291)*f32(frameData.z%65536u));
+            jitter=fract(mask+sequence);
+        }
+        let u = (f32(x) + jitter.x) * invWidth;
+        let v = (f32(y) + jitter.y) * invHeight;
 
+        if STOCHASTIC_TEXTURE!=0u {textureRng=jenkinsHash(*rngState^0xa7391u);}
+        if RAY_CONES {
+            coneWidth=0.;coneSpread=length(camera.vertical)/(f32(imageHeight)*max(length(camera.lowerLeftCorner+0.5*camera.horizontal+0.5*camera.vertical-camera.eye),1e-5));
+        }
         let primaryRay = cameraMakeRay(camera, rngState, u, 1f - v);
         color += rayColor(primaryRay, rngState);
     }
@@ -179,41 +264,80 @@ fn samplePixel(x: u32, y: u32, rngState: ptr<function, u32>) -> vec3<f32> {
     return color;
 }
 
+// A surviving path is reweighted so the expected contribution is unchanged.
+fn rouletteThroughput(throughput: vec3<f32>, rngState: ptr<function, u32>) -> vec3<f32> {
+    let survival = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
+    if rngNextFloat(rngState) >= survival { return vec3(0.); }
+    return throughput / survival;
+}
+
 fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
     var ray = primaryRay;
 
     var color = vec3(0f);
     var throughput = vec3(1f);
+    var skyMisWeight = 1.;
+    if OPACITY_APPROX {pathDiffuse=false;}
+    var packedDirection=0u;var packedValid=false;
 
     for (var bounce = 0u; bounce < samplingParams.numBounces; bounce += 1u) {
-        var intersection = Intersection();
+        if SKIP_FINAL_SCATTER {pathBounce=bounce;}
+        if RUSSIAN_ROULETTE && bounce >= 3u {
+            throughput = rouletteThroughput(throughput, rngState);
+            if max(throughput.r, max(throughput.g, throughput.b)) <= 0. { break; }
+        }
+        if PACKED_DIRECTIONS && packedValid {ray.direction=decodeOct(packedDirection);}
+        var hit = Intersection();
 
-        if intersection(ray, &intersection) {
-            let material = materials[intersection.materialIdx];
-
-            if material.id == 4u {
-                let emissionTexture = material.desc1;
-                let emissionColor = textureLookup(emissionTexture, intersection.u, intersection.v);
-                color += throughput * emissionColor;
-                break;
+        if intersection(ray, &hit) {
+            if TRACE_MESHES && hit.sphereIdx == 0xffffffffu {
+                let m = meshMaterialOffset(hit.materialIdx);
+                color += throughput * meshVec3(m+4u) * meshTexture(m+32u,vec2(hit.u,hit.v),hit.uv1,true).rgb;
+                if SKIP_FINAL_SCATTER && bounce+1u==samplingParams.numBounces {
+                    // All mesh BSDFs consume exactly three path random draws.
+                    for(var unused=0u;unused<3u;unused+=1u){_ = rngNextInt(rngState);}
+                    break;
+                }
+                var scatter = Scatter();
+                if SKY_IMPORTANCE {
+                    let surface = pbrSurface(ray,hit);
+                    if bounce + 1u < samplingParams.numBounces {
+                        let direction = sampleSky(rngState);
+                        let eval = evaluatePbr(surface,hit,direction);
+                        let pdf = skyPdf(direction);
+                        if any(eval.rgb > vec3(0.)) && !skyOccluded(Ray(hit.p+hit.geometricNormal*0.0001,direction)) {
+                            color += throughput * skyRadiance(direction) * eval.rgb * misWeight(pdf,eval.a)/pdf;
+                        }
+                    }
+                    let sampled = samplePbr(surface,hit,rngState);
+                    scatter = sampled.scatter;
+                    skyMisWeight = misWeight(sampled.pdf,skyPdf(scatter.ray.direction));
+                } else {scatter = scatterPbr(ray,hit,rngState);}
+                ray = scatter.ray;
+                if RAY_CONES {coneSpread=min(1.,coneSpread+0.25*meshFloat(m+8u));}
+                if PACKED_DIRECTIONS {packedDirection=pack2x16snorm(encodeOct(normalize(ray.direction)));ray.direction=vec3(0.);packedValid=true;}
+                throughput *= scatter.throughput;
+                if max(throughput.r,max(throughput.g,throughput.b)) <= 0. {break;}
+                continue;
             }
+            if TRACE_SPHERES {
+                let material = materials[hit.materialIdx];
 
-            var scatter = scatterRay(ray, intersection, material, rngState);
-            ray = scatter.ray;
-            throughput *= scatter.throughput;
+                if material.id == 4u {
+                    let emissionTexture = material.desc1;
+                    let emissionColor = textureLookup(emissionTexture, hit.u, hit.v);
+                    color += throughput * emissionColor;
+                    break;
+                }
+
+                skyMisWeight = 1.;packedValid=false;if OPACITY_APPROX {pathDiffuse=false;}
+                var scatter = scatterRay(ray, hit, material, rngState);
+                ray = scatter.ray;
+                throughput *= scatter.throughput;
+                if max(throughput.r,max(throughput.g,throughput.b)) <= 0. {break;}
+            }
         } else {
-            // The ray missed. Output background color.
-            let v = normalize(ray.direction);
-            let s = skyState.sunDirection;
-
-            let theta = acos(v.y);
-            let gamma = acos(clamp(dot(v, s), -1f, 1f));
-
-            color += throughput * vec3(
-                radiance(theta, gamma, CHANNEL_R),
-                radiance(theta, gamma, CHANNEL_G),
-                radiance(theta, gamma, CHANNEL_B)
-            );
+            color += throughput * skyRadiance(normalize(ray.direction)) * skyMisWeight;
 
             break;
         }
@@ -223,10 +347,11 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
 }
 
 fn intersection(ray: Ray, intersection: ptr<function, Intersection>) -> bool {
+    if ALPHA_CAP {alphaQueries=0u;}
     var closestT = MAX_T;
     var closestIntersection = Intersection();
 
-    for (var idx = 0u; idx < arrayLength(&spheres); idx = idx + 1u) {
+    for (var idx = 0u; idx < SPHERE_COUNT; idx = idx + 1u) {
         var testIntersect = Intersection();
         if rayIntersectSphere(ray, idx, MIN_T, closestT, &testIntersect) {
             closestT = testIntersect.t;
@@ -234,6 +359,11 @@ fn intersection(ray: Ray, intersection: ptr<function, Intersection>) -> bool {
         }
     }
 
+    var meshHit=Intersection();
+    if TRACE_MESHES && meshIntersection(ray,&meshHit,closestT) {
+        closestIntersection=meshHit;
+        closestT=meshHit.t;
+    }
     if closestT < MAX_T {
         *intersection = closestIntersection;
         return true;
@@ -273,6 +403,9 @@ fn scatterRay(wo: Ray, hit: Intersection, material: Material, rngState: ptr<func
 }
 
 fn scatterMixtureDensity(hit: Intersection, albedo: TextureDescriptor, rngState: ptr<function, u32>) -> Scatter {
+    if LIGHT_COUNT==0u {
+        return Scatter(Ray(hit.p,sampleLambertian(hit,rngState)),textureLookup(albedo,hit.u,hit.v));
+    }
     let scatterDirection = sampleMixtureDensity(hit, rngState);
     let materialValue = evalLambertian(hit, albedo, scatterDirection);
     let materialPdf = pdfLambertian(hit, scatterDirection);
@@ -290,7 +423,7 @@ fn sampleMixtureDensity(hit: Intersection, rngState: ptr<function, u32>) -> vec3
 }
 
 fn evalLambertian(hit: Intersection, texture: TextureDescriptor, wi: vec3<f32>) -> vec3<f32> {
-    return textureLookup(texture, hit.u, hit.v) * FRAC_1_PI * max(EPSILON, dot(hit.n, wi));
+    return textureLookup(texture, hit.u, hit.v) * FRAC_1_PI * max(0., dot(hit.n, wi));
 }
 
 fn sampleLambertian(hit: Intersection, rngState: ptr<function, u32>) -> vec3<f32> {
@@ -300,52 +433,59 @@ fn sampleLambertian(hit: Intersection, rngState: ptr<function, u32>) -> vec3<f32
 }
 
 fn pdfLambertian(hit: Intersection, wi: vec3<f32>) -> f32 {
-    return max(EPSILON, dot(hit.n, wi) * FRAC_1_PI);
+    return max(0., dot(hit.n, wi) * FRAC_1_PI);
 }
 
 fn sampleLight(hit: Intersection, rngState: ptr<function, u32>) -> vec3<f32> {
     // Select a random light using a uniform distribution.
-    let numLights = arrayLength(&lights);   // TODO: what about when there are no lights?
-    let lightIdx = rngNextUintInRange(rngState, 0u, numLights - 1u);
+    let numLights = LIGHT_COUNT;
+    let lightIdx = rngNextUintInRange(rngState, 0u, numLights);
     let sphereIdx = lights[lightIdx];
     let sphere = spheres[sphereIdx];
 
     return sampleHemisphere(hit, sphere, rngState);
 }
 
+// Uniform solid-angle sampling of a sphere, including the inside case.
 fn sampleHemisphere(hit: Intersection, sphere: Sphere, rngState: ptr<function, u32>) -> vec3<f32> {
-    let v = rngNextInUnitHemisphere(rngState);
-
-    // Sample the hemisphere facing the intersection point.
-    let dir = normalize(hit.p - sphere.centerAndPad.xyz);
-    let onb = pixarOnb(dir);
-
-    let pointOnSphere = sphere.centerAndPad.xyz + onb * sphere.radius * v;
-    let toPointOnSphere = pointOnSphere - hit.p;
-
-    return normalize(toPointOnSphere);
+    let toCenter = sphere.centerAndPad.xyz - hit.p;
+    let distanceSqr = dot(toCenter,toCenter);
+    let radiusSqr = sphere.radius*sphere.radius;
+    let r1 = rngNextFloat(rngState);
+    let r2 = rngNextFloat(rngState);
+    if distanceSqr <= radiusSqr {
+        let z = 1.-2.*r1;
+        let radial = sqrt(max(0.,1.-z*z));
+        return vec3(radial*cos(2.*PI*r2),radial*sin(2.*PI*r2),z);
+    }
+    let cosMax = sqrt(max(0.,1.-radiusSqr/distanceSqr));
+    // Stable form of 1-cosMax for small/distant lights.
+    let coneWidth = radiusSqr / (distanceSqr*(1.+cosMax));
+    let z = 1.-r1*coneWidth;
+    let radial = sqrt(max(0.,1.-z*z));
+    return pixarOnb(normalize(toCenter))*vec3(radial*cos(2.*PI*r2),radial*sin(2.*PI*r2),z);
 }
 
 fn pdfLight(hit: Intersection, wi: vec3<f32>) -> f32 {
-    let ray = Ray(hit.p, wi);
-    var lightHit = Intersection();
-    var pdf = 0f;
-
-    if intersection(ray, &lightHit) {
-        let sphereIdx = lightHit.sphereIdx;
-        let sphere = spheres[sphereIdx];
-        let numSpheres = arrayLength(&spheres);
-        let toLight = lightHit.p - hit.p;
-        let lengthSqr = dot(toLight, toLight);
-        let cosine = abs(dot(wi, lightHit.n));
-        let areaHalfSphere = 2f * PI * sphere.radius * sphere.radius;
-
-        // lengthSqr / cosine is the inverse of the geometric factor, as defined in
-        // "MULTIPLE IMPORTANCE SAMPLING 101".
-        pdf = lengthSqr / max(EPSILON, cosine * areaHalfSphere * f32(numSpheres));
+    var pdf = 0.;
+    let numLights = LIGHT_COUNT;
+    if numLights==0u { return 0.; }
+    // Sum the mixture of actual light PDFs, without an unnecessary scene ray.
+    for(var i=0u;i<numLights;i+=1u) {
+        let sphere=spheres[lights[i]];
+        let toCenter=sphere.centerAndPad.xyz-hit.p;
+        let distanceSqr=dot(toCenter,toCenter);
+        let radiusSqr=sphere.radius*sphere.radius;
+        if distanceSqr<=radiusSqr { pdf+=1./(4.*PI); }
+        else {
+            let cosMax=sqrt(max(0.,1.-radiusSqr/distanceSqr));
+            if dot(normalize(toCenter),wi)>=cosMax {
+                let coneWidth=radiusSqr/(distanceSqr*(1.+cosMax));
+                pdf+=1./(2.*PI*coneWidth);
+            }
+        }
     }
-
-    return pdf;
+    return pdf/f32(numLights);
 }
 
 fn pixarOnb(n: vec3<f32>) -> mat3x3<f32> {
@@ -385,7 +525,7 @@ fn scatterDielectric(rayIn: Ray, hit: Intersection, refractionIndex: f32, rngSta
         let reflectionProb = schlick(cosine, refractionIndex);
         var wi = refractedDirection;
         if rngNextFloat(rngState) < reflectionProb {
-            reflect(wo, hit.n);
+            wi = reflect(wo, hit.n);
         }
 
         return Scatter(Ray(hit.p, wi), vec3(1f));
@@ -464,6 +604,7 @@ struct SkyState {
     params: array<f32, 27>,
     radiances: array<f32, 3>,
     sunDirection: vec3<f32>,
+    sampling: array<vec2<f32>,2048>,
 };
 
 struct SamplingParams {
@@ -471,6 +612,10 @@ struct SamplingParams {
     numBounces: u32,
     accumulatedSamplesPerPixel: u32,
     clearAccumulatedSamples: u32,
+    denoisingEnabled: u32,
+    denoisingRadius: u32,
+    denoisingSigmaColor: f32,
+    padding: u32,
 }
 
 struct Sphere {
@@ -493,11 +638,11 @@ struct TextureDescriptor {
 }
 
 fn textureLookup(desc: TextureDescriptor, u: f32, v: f32) -> vec3<f32> {
-    let u = clamp(u, 0f, 1f);
-    let v = 1f - clamp(v, 0f, 1f);
+    let textureU = clamp(u, 0f, 1f);
+    let textureV = 1f - clamp(v, 0f, 1f);
 
-    let j = u32(u * f32(desc.width));
-    let i = u32(v * f32(desc.height));
+    let j = min(u32(textureU * f32(desc.width)), desc.width - 1u);
+    let i = min(u32(textureV * f32(desc.height)), desc.height - 1u);
     let idx = i * desc.width + j;
 
     let elem = textures[desc.offset + idx];
@@ -522,6 +667,8 @@ struct Intersection {
     t: f32,
     materialIdx: u32,
     sphereIdx: u32,
+    uv1: vec2<f32>,
+    geometricNormal: vec3<f32>,
 }
 
 fn rayIntersectSphere(ray: Ray, sphereIdx: u32, tmin: f32, tmax: f32, hit: ptr<function, Intersection>) -> bool {
@@ -558,7 +705,7 @@ fn sphereIntersection(ray: Ray, sphere: Sphere, sphereIdx: u32, t: f32) -> Inter
     let v = FRAC_1_PI * theta;
 
     // TODO: passing sphereIdx in here just to pass it to Intersection
-    return Intersection(p, n, u, v, t, sphere.materialIdx, sphereIdx);
+    return Intersection(p, n, u, v, t, sphere.materialIdx, sphereIdx, vec2(0.), n);
 }
 
 fn rayPointAtParameter(ray: Ray, t: f32) -> vec3<f32> {
@@ -672,4 +819,73 @@ fn jenkinsHash(input: u32) -> u32 {
     x ^= x >> 11u;
     x += x << 15u;
     return x;
+}
+
+fn skyRadiance(v: vec3<f32>) -> vec3<f32> {
+    let theta=acos(clamp(v.y,-1.,1.));
+    let gamma=acos(clamp(dot(v,skyState.sunDirection),-1.,1.));
+    return vec3(radiance(theta,gamma,0u),radiance(theta,gamma,1u),radiance(theta,gamma,2u));
+}
+fn misWeight(a: f32,b: f32) -> f32 {return a*a/max(a*a+b*b,1e-30);}
+fn skyPdf(direction: vec3<f32>) -> f32 {
+    let row=min(u32((1.-clamp(direction.y,-1.,1.))*16.),31u);
+    let phi=atan2(direction.z,direction.x);
+    let column=min(u32(fract(phi/(2.*PI)+1.)*64.),63u);
+    return skyState.sampling[row*64u+column].y;
+}
+fn sampleSky(rng: ptr<function,u32>) -> vec3<f32> {
+    let quantile=min(rngNextFloat(rng),0.99999994);
+    var lo=0u;var hi=2047u;
+    while lo<hi {
+        let middle=(lo+hi)/2u;
+        if quantile<skyState.sampling[middle].x {hi=middle;} else {lo=middle+1u;}
+    }
+    let y=1.-2.*(f32(lo/64u)+rngNextFloat(rng))/32.;
+    let phi=2.*PI*(f32(lo%64u)+rngNextFloat(rng))/64.;
+    let r=sqrt(max(0.,1.-y*y));
+    return vec3(r*cos(phi),y,r*sin(phi));
+}
+fn skyOccluded(ray: Ray) -> bool {
+    let diffuse=pathDiffuse;if OPACITY_APPROX {pathDiffuse=false;}
+    let blocked=skyOccludedExact(ray);
+    if OPACITY_APPROX {pathDiffuse=diffuse;}
+    return blocked;
+}
+fn skyOccludedExact(ray: Ray) -> bool {
+    if ALPHA_CAP {alphaQueries=0u;}
+    for(var i=0u;i<SPHERE_COUNT;i+=1u) {
+        var hit=Intersection();
+        if rayIntersectSphere(ray,i,MIN_T,MAX_T,&hit) {return true;}
+    }
+    return TRACE_MESHES && meshOccluded(ray);
+}
+
+fn encodeOct(direction:vec3<f32>)->vec2<f32>{
+    let v=direction/(abs(direction.x)+abs(direction.y)+abs(direction.z));
+    if v.z>=0.{return v.xy;}
+    return (vec2(1.)-abs(v.yx))*select(vec2(-1.),vec2(1.),v.xy>=vec2(0.));
+}
+fn decodeOct(packed:u32)->vec3<f32>{
+    let p=unpack2x16snorm(packed);var n=vec3(p,1.-abs(p.x)-abs(p.y));
+    if n.z<0.{n=vec3((vec2(1.)-abs(n.yx))*select(vec2(-1.),vec2(1.),n.xy>=vec2(0.)),n.z);}
+    return normalize(n);
+}
+
+fn textureRandom()->f32 {var state=textureRng;let value=rngNextFloat(&state);textureRng=state;return value;}
+
+// Non-temporal sparse bilateral experiment: four alternating ring neighbors + center.
+fn sparseBilateral(x:u32,y:u32)->vec3<f32>{
+    let center=averagePixel(x,y);let sigma=max(samplingParams.denoisingSigmaColor,0.0001);
+    let diagonal=(jenkinsHash(x+y*frameData.x)&1u)!=0u;
+    var sum=center;var weights=1.;
+    for(var i=0u;i<4u;i+=1u){
+        var offset=vec2<i32>(0);
+        if diagonal {offset=vec2(select(-1,1,(i&1u)!=0u),select(-1,1,(i&2u)!=0u));}
+        else {let sign=select(-1,1,(i&1u)!=0u);offset=select(vec2(sign,0),vec2(0,sign),i>=2u);}
+        let p=vec2<i32>(i32(x),i32(y))+offset;
+        if any(p<vec2(0)) || any(p>=vec2<i32>(frameData.xy)){continue;}
+        let color=averagePixel(u32(p.x),u32(p.y));let delta=color-center;
+        let weight=exp(-dot(delta,delta)/(2.*sigma*sigma));sum+=weight*color;weights+=weight;
+    }
+    return sum/weights;
 }

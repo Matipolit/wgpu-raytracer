@@ -1,0 +1,222 @@
+RENDER s_control_0_1 32 spp []
+RENDER s_control_0_19 32 spp []
+RENDER s_bvh4_1 32 spp ['--bvh4']
+RENDER s_bvh4_19 32 spp ['--bvh4']
+RENDER s_bvh8_19 32 spp ['--bvh8']
+RENDER s_bvh8_1 32 spp ['--bvh8']
+RENDER s_quantized_bvh8_1 32 spp ['--quantized-bvh']
+RENDER s_quantized_bvh8_19 32 spp ['--quantized-bvh']
+RENDER s_leaf8_19 32 spp ['--bvh-leaf', '8']
+RENDER s_leaf8_1 32 spp ['--bvh-leaf', '8']
+RENDER s_control_1_1 32 spp []
+RENDER s_control_1_19 32 spp []
+RENDER s_leaf16_1 32 spp ['--bvh-leaf', '16']
+RENDER s_leaf16_19 32 spp ['--bvh-leaf', '16']
+RENDER s_sah32_19 32 spp ['--sah32']
+RENDER s_sah32_1 32 spp ['--sah32']
+RENDER s_sah_stop_1 32 spp ['--sah-stop']
+RENDER s_sah_stop_19 32 spp ['--sah-stop']
+RENDER s_packed_shading_19 32 spp ['--packed-shading']
+RENDER s_packed_shading_1 32 spp ['--packed-shading']
+RENDER s_control_2_1 32 spp []
+RENDER s_control_2_19 32 spp []
+RENDER s_stochastic_color_1 32 spp ['--stochastic-color']
+RENDER s_stochastic_color_19 32 spp ['--stochastic-color']
+RENDER s_stochastic_all_19 32 spp ['--stochastic-all']
+RENDER s_stochastic_all_1 32 spp ['--stochastic-all']
+RENDER s_fp16_state_1 32 spp ['--fp16-state']
+RENDER s_fp16_state_19 32 spp ['--fp16-state']
+RENDER s_packed_directions_19 32 spp ['--packed-directions']
+RENDER s_packed_directions_1 32 spp ['--packed-directions']
+RENDER s_control_3_1 32 spp []
+RENDER s_control_3_19 32 spp []
+RENDER s_skip_final_shading_1 32 spp ['--skip-final-scatter']
+RENDER s_skip_final_shading_19 32 spp ['--skip-final-scatter']
+RENDER s_classify_opacity_19 32 spp ['--classify-opacity']
+RENDER s_classify_opacity_1 32 spp ['--classify-opacity']
+RENDER s_opacity_micromap_1 32 spp ['--opacity-micromap', '--scene-cache']
+RENDER s_opacity_micromap_19 32 spp ['--opacity-micromap', '--scene-cache']
+RENDER s_alpha_shrink_19 32 spp ['--approximate-alpha']
+RENDER s_alpha_shrink_1 32 spp ['--approximate-alpha']
+RENDER s_control_4_1 32 spp []
+RENDER s_control_4_19 32 spp []
+RENDER s_alpha_cap4_1 32 spp ['--alpha-cap4']
+RENDER s_alpha_cap4_19 32 spp ['--alpha-cap4']
+RENDER s_blue_noise_jitter_19 32 spp ['--blue-noise-jitter']
+RENDER s_blue_noise_jitter_1 32 spp ['--blue-noise-jitter']
+RENDER s_bounded_vndf_1 32 spp ['--bounded-vndf']
+RENDER s_bounded_vndf_19 32 spp ['--bounded-vndf']
+RENDER s_ray_cones_19 32 spp ['--ray-cones', '--scene-cache']
+RENDER s_ray_cones_1 32 spp ['--ray-cones', '--scene-cache']
+RENDER s_control_5_1 32 spp []
+RENDER s_control_5_19 32 spp []
+RENDER original_control 32 spp []
+RENDER q_base_1_20000 64 spp []
+RENDER q_sah32_1_20000_try0 72 spp ['--sah32']
+RENDER q_sah32_1_20000_try1 66 spp ['--sah32']
+RENDER q_sah32_1_20000_try2 64 spp ['--sah32']
+QUALITY sah32 1 20000 error ratio 1.0000000012742638 budget 1.0091926735090433
+RENDER q_packed_shading_1_20000_try0 71 spp ['--packed-shading']
+RENDER q_packed_shading_1_20000_try1 63 spp ['--packed-shading']
+QUALITY packed_shading 1 20000 error ratio 1.0156582275454766 budget 1.0165150114226718
+RENDER q_stochastic_color_1_20000_try0 68 spp ['--stochastic-color']
+RENDER q_stochastic_color_1_20000_try1 62 spp ['--stochastic-color']
+QUALITY stochastic_color 1 20000 error ratio 1.035416453417555 budget 1.017412901092633
+RENDER q_stochastic_all_1_20000_try0 71 spp ['--stochastic-all']
+RENDER q_stochastic_all_1_20000_try1 63 spp ['--stochastic-all']
+QUALITY stochastic_all 1 20000 error ratio 1.0360582185061578 budget 0.9891350105054383
+RENDER q_fp16_state_1_20000_try0 67 spp ['--fp16-state']
+RENDER q_fp16_state_1_20000_try1 62 spp ['--fp16-state']
+QUALITY fp16_state 1 20000 error ratio 1.0282222699154373 budget 1.0208713864438406
+RENDER q_packed_directions_1_20000_try0 67 spp ['--packed-directions']
+RENDER q_packed_directions_1_20000_try1 60 spp ['--packed-directions']
+QUALITY packed_directions 1 20000 error ratio 1.0563957170836238 budget 1.0035301541027042
+RENDER q_alpha_shrink_1_20000_try0 64 spp ['--approximate-alpha']
+RENDER q_alpha_shrink_1_20000_try1 61 spp ['--approximate-alpha']
+QUALITY alpha_shrink 1 20000 error ratio 1.0424446268574339 budget 0.9906598043630318
+RENDER q_alpha_cap4_1_20000_try0 64 spp ['--alpha-cap4']
+RENDER q_alpha_cap4_1_20000_try1 60 spp ['--alpha-cap4']
+QUALITY alpha_cap4 1 20000 error ratio 1.0566008778273552 budget 1.0197287808103157
+RENDER q_blue_noise_jitter_1_20000_try0 65 spp ['--blue-noise-jitter']
+RENDER q_blue_noise_jitter_1_20000_try1 60 spp ['--blue-noise-jitter']
+QUALITY blue_noise_jitter 1 20000 error ratio 1.04941519729207 budget 0.9945854901164684
+RENDER q_bounded_vndf_1_20000_try0 59 spp ['--bounded-vndf']
+RENDER q_bounded_vndf_1_20000_try1 55 spp ['--bounded-vndf']
+QUALITY bounded_vndf 1 20000 error ratio 1.0982120717510748 budget 0.9764319893664054
+RENDER q_ray_cones_1_20000_try0 62 spp ['--ray-cones', '--scene-cache']
+RENDER q_ray_cones_1_20000_try1 53 spp ['--ray-cones', '--scene-cache']
+QUALITY ray_cones 1 20000 error ratio 1.1276027130525386 budget 1.0069534479989737
+RENDER q_base_1_30000 64 spp []
+RENDER q_sah32_1_30000_try0 79 spp ['--sah32']
+RENDER q_sah32_1_30000_try1 68 spp ['--sah32']
+QUALITY sah32 1 30000 error ratio 0.9479418268752204 budget 0.9945404615472002
+RENDER q_packed_shading_1_30000_try0 78 spp ['--packed-shading']
+RENDER q_packed_shading_1_30000_try1 68 spp ['--packed-shading']
+QUALITY packed_shading 1 30000 error ratio 0.9478487703918153 budget 1.004395366970819
+RENDER q_stochastic_color_1_30000_try0 74 spp ['--stochastic-color']
+RENDER q_stochastic_color_1_30000_try1 63 spp ['--stochastic-color']
+QUALITY stochastic_color 1 30000 error ratio 1.0219259878037348 budget 0.9929039157668614
+RENDER q_stochastic_all_1_30000_try0 77 spp ['--stochastic-all']
+RENDER q_stochastic_all_1_30000_try1 67 spp ['--stochastic-all']
+QUALITY stochastic_all 1 30000 error ratio 0.9843046018258563 budget 0.9800110403660157
+RENDER q_fp16_state_1_30000_try0 73 spp ['--fp16-state']
+RENDER q_fp16_state_1_30000_try1 64 spp ['--fp16-state']
+RENDER q_fp16_state_1_30000_try2 66 spp ['--fp16-state']
+QUALITY fp16_state 1 30000 error ratio 0.973787332964685 budget 1.0109690942045826
+RENDER q_packed_directions_1_30000_try0 73 spp ['--packed-directions']
+RENDER q_packed_directions_1_30000_try1 65 spp ['--packed-directions']
+QUALITY packed_directions 1 30000 error ratio 0.9873667277479381 budget 0.9978135634356293
+RENDER q_alpha_shrink_1_30000_try0 70 spp ['--approximate-alpha']
+RENDER q_alpha_shrink_1_30000_try1 67 spp ['--approximate-alpha']
+QUALITY alpha_shrink 1 30000 error ratio 0.9616559957908426 budget 0.988346475396714
+RENDER q_alpha_cap4_1_30000_try0 70 spp ['--alpha-cap4']
+RENDER q_alpha_cap4_1_30000_try1 67 spp ['--alpha-cap4']
+QUALITY alpha_cap4 1 30000 error ratio 0.96121777191039 budget 1.010058486054954
+RENDER q_blue_noise_jitter_1_30000_try0 71 spp ['--blue-noise-jitter']
+RENDER q_blue_noise_jitter_1_30000_try1 68 spp ['--blue-noise-jitter']
+QUALITY blue_noise_jitter 1 30000 error ratio 0.9379655601120546 budget 1.0130400768384686
+RENDER q_bounded_vndf_1_30000_try0 65 spp ['--bounded-vndf']
+RENDER q_bounded_vndf_1_30000_try1 63 spp ['--bounded-vndf']
+QUALITY bounded_vndf 1 30000 error ratio 0.9744859802039502 budget 1.0017217393998548
+RENDER q_ray_cones_1_30000_try0 68 spp ['--ray-cones', '--scene-cache']
+RENDER q_ray_cones_1_30000_try1 64 spp ['--ray-cones', '--scene-cache']
+QUALITY ray_cones 1 30000 error ratio 0.9654131323250316 budget 0.9837851931031278
+RENDER q_base_19_20000 64 spp []
+RENDER q_sah32_19_20000_try0 74 spp ['--sah32']
+RENDER q_sah32_19_20000_try1 64 spp ['--sah32']
+QUALITY sah32 19 20000 error ratio 1.0 budget 0.9707266207790345
+RENDER q_packed_shading_19_20000_try0 75 spp ['--packed-shading']
+RENDER q_packed_shading_19_20000_try1 66 spp ['--packed-shading']
+QUALITY packed_shading 19 20000 error ratio 0.9722970358117764 budget 0.9846617434357064
+RENDER q_stochastic_color_19_20000_try0 70 spp ['--stochastic-color']
+RENDER q_stochastic_color_19_20000_try1 66 spp ['--stochastic-color']
+QUALITY stochastic_color 19 20000 error ratio 0.978214399266663 budget 1.0036688113082857
+RENDER q_stochastic_all_19_20000_try0 72 spp ['--stochastic-all']
+RENDER q_stochastic_all_19_20000_try1 67 spp ['--stochastic-all']
+QUALITY stochastic_all 19 20000 error ratio 0.9730128788427822 budget 1.0192125847878422
+RENDER q_fp16_state_19_20000_try0 68 spp ['--fp16-state']
+RENDER q_fp16_state_19_20000_try1 64 spp ['--fp16-state']
+QUALITY fp16_state 19 20000 error ratio 1.0000012003964378 budget 0.9939836873553206
+RENDER q_packed_directions_19_20000_try0 69 spp ['--packed-directions']
+RENDER q_packed_directions_19_20000_try1 64 spp ['--packed-directions']
+QUALITY packed_directions 19 20000 error ratio 0.9994936285550969 budget 1.029149964883793
+RENDER q_alpha_shrink_19_20000_try0 67 spp ['--approximate-alpha']
+RENDER q_alpha_shrink_19_20000_try1 62 spp ['--approximate-alpha']
+QUALITY alpha_shrink 19 20000 error ratio 1.0312704754195485 budget 0.9901435836829159
+RENDER q_alpha_cap4_19_20000_try0 65 spp ['--alpha-cap4']
+RENDER q_alpha_cap4_19_20000_try1 62 spp ['--alpha-cap4']
+QUALITY alpha_cap4 19 20000 error ratio 1.0312214539755324 budget 0.9745348017285126
+RENDER q_blue_noise_jitter_19_20000_try0 67 spp ['--blue-noise-jitter']
+RENDER q_blue_noise_jitter_19_20000_try1 64 spp ['--blue-noise-jitter']
+QUALITY blue_noise_jitter 19 20000 error ratio 0.9907278655335476 budget 0.9979499796736451
+RENDER q_bounded_vndf_19_20000_try0 61 spp ['--bounded-vndf']
+QUALITY bounded_vndf 19 20000 error ratio 0.9662797879389432 budget 0.9988837829223824
+RENDER q_ray_cones_19_20000_try0 66 spp ['--ray-cones', '--scene-cache']
+RENDER q_ray_cones_19_20000_try1 63 spp ['--ray-cones', '--scene-cache']
+QUALITY ray_cones 19 20000 error ratio 0.9923409824225449 budget 1.0189201920296551
+RENDER q_base_19_30000 64 spp []
+RENDER q_sah32_19_30000_try0 77 spp ['--sah32']
+RENDER q_sah32_19_30000_try1 67 spp ['--sah32']
+QUALITY sah32 19 30000 error ratio 0.9561108337759406 budget 1.0013349839198316
+RENDER q_packed_shading_19_30000_try0 79 spp ['--packed-shading']
+RENDER q_packed_shading_19_30000_try1 69 spp ['--packed-shading']
+QUALITY packed_shading 19 30000 error ratio 0.9295266268101603 budget 1.0204809511229553
+RENDER q_stochastic_color_19_30000_try0 73 spp ['--stochastic-color']
+RENDER q_stochastic_color_19_30000_try1 66 spp ['--stochastic-color']
+QUALITY stochastic_color 19 30000 error ratio 0.9768207822853248 budget 1.0114734237420782
+RENDER q_stochastic_all_19_30000_try0 76 spp ['--stochastic-all']
+RENDER q_stochastic_all_19_30000_try1 69 spp ['--stochastic-all']
+QUALITY stochastic_all 19 30000 error ratio 0.9441433293501891 budget 0.9851118547337554
+RENDER q_fp16_state_19_30000_try0 72 spp ['--fp16-state']
+RENDER q_fp16_state_19_30000_try1 67 spp ['--fp16-state']
+QUALITY fp16_state 19 30000 error ratio 0.9561120521027451 budget 1.0263670102995806
+RENDER q_packed_directions_19_30000_try0 72 spp ['--packed-directions']
+RENDER q_packed_directions_19_30000_try1 64 spp ['--packed-directions']
+QUALITY packed_directions 19 30000 error ratio 1.0001199105162617 budget 0.9864922941862705
+RENDER q_alpha_shrink_19_30000_try0 70 spp ['--approximate-alpha']
+RENDER q_alpha_shrink_19_30000_try1 66 spp ['--approximate-alpha']
+QUALITY alpha_shrink 19 30000 error ratio 0.9697703023035054 budget 0.9973683978749637
+RENDER q_alpha_cap4_19_30000_try0 68 spp ['--alpha-cap4']
+RENDER q_alpha_cap4_19_30000_try1 65 spp ['--alpha-cap4']
+QUALITY alpha_cap4 19 30000 error ratio 0.9849955061099013 budget 0.978218453456832
+RENDER q_blue_noise_jitter_19_30000_try0 70 spp ['--blue-noise-jitter']
+RENDER q_blue_noise_jitter_19_30000_try1 66 spp ['--blue-noise-jitter']
+QUALITY blue_noise_jitter 19 30000 error ratio 0.960435511510731 budget 1.0036484549568758
+RENDER q_bounded_vndf_19_30000_try0 64 spp ['--bounded-vndf']
+RENDER q_bounded_vndf_19_30000_try1 61 spp ['--bounded-vndf']
+QUALITY bounded_vndf 19 30000 error ratio 0.9619170884713528 budget 1.0117891108602686
+RENDER q_ray_cones_19_30000_try0 70 spp ['--ray-cones', '--scene-cache']
+RENDER q_ray_cones_19_30000_try1 63 spp ['--ray-cones', '--scene-cache']
+QUALITY ray_cones 19 30000 error ratio 0.9994188761112288 budget 0.9988088183410619
+RENDER c_base_1_40000 64 spp []
+RENDER c_pilot_best_exact_combo_1_40000 24 spp ['--sah-stop', '--skip-final-scatter']
+RENDER c_best_exact_combo_1_40000_try0 70 spp ['--sah-stop', '--skip-final-scatter']
+RENDER c_base_1_50000 64 spp []
+RENDER c_pilot_best_exact_combo_1_50000 24 spp ['--sah-stop', '--skip-final-scatter']
+RENDER c_best_exact_combo_1_50000_try0 72 spp ['--sah-stop', '--skip-final-scatter']
+RENDER c_base_19_40000 64 spp []
+RENDER c_pilot_best_exact_combo_19_40000 24 spp ['--sah-stop', '--skip-final-scatter']
+RENDER c_best_exact_combo_19_40000_try0 69 spp ['--sah-stop', '--skip-final-scatter']
+RENDER c_base_19_50000 64 spp []
+RENDER c_pilot_best_exact_combo_19_50000 24 spp ['--sah-stop', '--skip-final-scatter']
+RENDER c_best_exact_combo_19_50000_try0 72 spp ['--sah-stop', '--skip-final-scatter']
+RENDER c_pilot_quality_combo_1_40000 24 spp ['--sah-stop', '--skip-final-scatter', '--packed-shading']
+RENDER c_quality_combo_1_40000_try0 69 spp ['--sah-stop', '--skip-final-scatter', '--packed-shading']
+RENDER c_pilot_quality_combo_1_50000 24 spp ['--sah-stop', '--skip-final-scatter', '--packed-shading']
+RENDER c_quality_combo_1_50000_try0 68 spp ['--sah-stop', '--skip-final-scatter', '--packed-shading']
+RENDER c_pilot_quality_combo_19_40000 24 spp ['--sah-stop', '--skip-final-scatter', '--packed-shading']
+RENDER c_quality_combo_19_40000_try0 67 spp ['--sah-stop', '--skip-final-scatter', '--packed-shading']
+RENDER c_pilot_quality_combo_19_50000 24 spp ['--sah-stop', '--skip-final-scatter', '--packed-shading']
+RENDER c_quality_combo_19_50000_try0 68 spp ['--sah-stop', '--skip-final-scatter', '--packed-shading']
+RENDER cache_prime 8 spp ['--scene-cache']
+RENDER startup_0_False 8 spp []
+RENDER startup_0_True 8 spp ['--scene-cache']
+RENDER startup_1_True 8 spp ['--scene-cache']
+RENDER startup_1_False 8 spp []
+RENDER startup_2_False 8 spp []
+RENDER startup_2_True 8 spp ['--scene-cache']
+RENDER filter_1_False 64 spp []
+RENDER filter_1_True 64 spp ['--sparse-denoise']
+RENDER filter_19_False 64 spp []
+RENDER filter_19_True 64 spp ['--sparse-denoise']
+SWEEP COMPLETE

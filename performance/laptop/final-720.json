@@ -1,0 +1,36 @@
+[
+  {
+    "case": "sponza",
+    "size": "1280x720",
+    "samples": 16,
+    "baseline_ms": 1558.1186598766594,
+    "candidate_ms": 647.8305571004905,
+    "speedup": 2.4051330132532884,
+    "raw_identical": true,
+    "runs": {
+      "baseline": [
+        1558.1186598766594
+      ],
+      "candidate": [
+        647.8305571004905
+      ]
+    }
+  },
+  {
+    "case": "sponza-reverse",
+    "size": "1280x720",
+    "samples": 16,
+    "baseline_ms": 1648.960428492176,
+    "candidate_ms": 746.3985755273781,
+    "speedup": 2.209222367991633,
+    "raw_identical": true,
+    "runs": {
+      "baseline": [
+        1648.960428492176
+      ],
+      "candidate": [
+        746.3985755273781
+      ]
+    }
+  }
+]
