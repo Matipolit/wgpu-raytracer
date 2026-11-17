@@ -318,6 +318,218 @@ fn leaf_reference(node: &BvhNode) -> u32 {
 pub fn hw_rt() -> bool {
     option("--hw-rt")
 }
+/// Compressed 8-wide BVH (`--cwbvh` or RT_CWBVH; see `cw_records`, mesh.wgsl
+/// meshCwCandidate).
+pub fn cw_bvh() -> bool {
+    option("--cwbvh") || std::env::var_os("RT_CWBVH").is_some()
+}
+
+/// One child of a compressed 8-wide node while collapsing the binary tree.
+#[derive(Clone)]
+enum CwChild {
+    /// An interior node of the binary tree (becomes an internal 8-wide child).
+    Node(usize),
+    /// Up to 3 triangles (by index into `Mesh::triangles`) in a leaf child.
+    Tris(Vec<u32>, [f32; 3], [f32; 3]),
+    /// More triangles than one leaf child holds: an internal child built from chunks.
+    Many(Vec<u32>, [f32; 3], [f32; 3]),
+}
+
+/// Compressed wide BVH in the style of Ylitie, Karras and Laine (HPG 2017): 8-wide
+/// nodes of 20 words (80 bytes) with byte-quantized child boxes, internal children
+/// stored contiguously, a node's leaf triangles contiguous in an index list (at most
+/// 3 per child, 24 per node). Children sit in slots by direction from the node centre
+/// (slot bit i set: the positive side of axis i), so visiting slots in the order
+/// `slot ^ octant(ray)` is roughly near-to-far without storing distances.
+/// Words: lo xyz (f32), exponents x|y<<8|z<<16 | internal mask<<24, first internal
+/// child, first triangle (in the index list), leaf meta per slot (bytes: count<<5 |
+/// offset), then qlo x,y,z and qhi x,y,z (8 bytes each). Returns the node words and the
+/// triangle index list.
+pub fn cw_records(mesh: &Mesh) -> (Vec<u32>, Vec<u32>) {
+    let nodes = &mesh.nodes;
+    let bounds = |tris: &[u32]| {
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for &t in tris {
+            for v in mesh.triangles[t as usize].vertices {
+                let p = mesh.vertices[v as usize].position;
+                for a in 0..3 {
+                    lo[a] = lo[a].min(p[a]);
+                    hi[a] = hi[a].max(p[a]);
+                }
+            }
+        }
+        (lo, hi)
+    };
+    let leaf = |first: u32, count: u32| -> CwChild {
+        let tris: Vec<u32> = (first..first + count).collect();
+        let (lo, hi) = bounds(&tris);
+        if tris.len() <= 3 {
+            CwChild::Tris(tris, lo, hi)
+        } else {
+            CwChild::Many(tris, lo, hi)
+        }
+    };
+    let child_of = |i: usize| -> CwChild {
+        if nodes[i].count == 0 {
+            CwChild::Node(i)
+        } else {
+            leaf(nodes[i].first, nodes[i].count)
+        }
+    };
+    let extent = |c: &CwChild| -> ([f32; 3], [f32; 3]) {
+        match c {
+            CwChild::Node(i) => (nodes[*i].min, nodes[*i].max),
+            CwChild::Tris(_, lo, hi) | CwChild::Many(_, lo, hi) => (*lo, *hi),
+        }
+    };
+    let area = |c: &CwChild| {
+        let (lo, hi) = extent(c);
+        let e = [0, 1, 2].map(|a| hi[a] - lo[a]);
+        e[0] * e[1] + e[1] * e[2] + e[2] * e[0]
+    };
+    // A node's children: expand the largest interior child until there are 8.
+    let children_of = |source: &CwChild| -> Vec<CwChild> {
+        let mut children = match source {
+            CwChild::Node(i) => vec![child_of(i + 1), child_of(nodes[*i].first as usize)],
+            CwChild::Tris(..) => vec![source.clone()],
+            CwChild::Many(tris, ..) => {
+                // Up to 8 chunks: leaf chunks of 3, or bigger chunks become internal.
+                let per = tris.len().div_ceil(8).max(3);
+                tris.chunks(per)
+                    .map(|c| {
+                        let (lo, hi) = bounds(c);
+                        if c.len() <= 3 {
+                            CwChild::Tris(c.to_vec(), lo, hi)
+                        } else {
+                            CwChild::Many(c.to_vec(), lo, hi)
+                        }
+                    })
+                    .collect()
+            }
+        };
+        while children.len() < 8 {
+            let Some(slot) = (0..children.len())
+                .filter(|&i| matches!(children[i], CwChild::Node(_)))
+                .max_by(|&a, &b| area(&children[a]).total_cmp(&area(&children[b])))
+            else {
+                break;
+            };
+            let CwChild::Node(parent) = children.remove(slot) else {
+                unreachable!()
+            };
+            children.insert(slot, child_of(nodes[parent].first as usize));
+            children.insert(slot, child_of(parent + 1));
+        }
+        children
+    };
+    let root = if nodes[0].count == 0 {
+        CwChild::Node(0)
+    } else {
+        leaf(nodes[0].first, nodes[0].count)
+    };
+    let mut out: Vec<[u32; 20]> = vec![[0; 20]];
+    let mut list: Vec<u32> = Vec::new();
+    let mut queue = std::collections::VecDeque::from([(root, 0usize)]);
+    while let Some((source, index)) = queue.pop_front() {
+        let children = children_of(&source);
+        // Node box and the per-child direction from its centre.
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for c in &children {
+            let (l, h) = extent(c);
+            for a in 0..3 {
+                lo[a] = lo[a].min(l[a]);
+                hi[a] = hi[a].max(h[a]);
+            }
+        }
+        let centre = [0, 1, 2].map(|a| 0.5 * (lo[a] + hi[a]));
+        // Greedy slot assignment by direction (best child-slot pair first).
+        let mut pairs = Vec::new();
+        for (ci, c) in children.iter().enumerate() {
+            let (l, h) = extent(c);
+            let v = [0, 1, 2].map(|a| 0.5 * (l[a] + h[a]) - centre[a]);
+            for slot in 0..8 {
+                let score: f32 = (0..3)
+                    .map(|a| if slot >> a & 1 == 1 { v[a] } else { -v[a] })
+                    .sum();
+                pairs.push((score, ci, slot));
+            }
+        }
+        pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut slot_of = vec![usize::MAX; children.len()];
+        let mut used = [false; 8];
+        for (_, ci, slot) in pairs {
+            if slot_of[ci] == usize::MAX && !used[slot] {
+                slot_of[ci] = slot;
+                used[slot] = true;
+            }
+        }
+        let mut by_slot: [Option<usize>; 8] = [None; 8];
+        for (ci, &slot) in slot_of.iter().enumerate() {
+            by_slot[slot] = Some(ci);
+        }
+        // Quantization: power-of-two scale per axis so 255 steps cover the node box.
+        let mut exponent = [0i32; 3];
+        for a in 0..3 {
+            let range = (hi[a] - lo[a]).max(1e-30);
+            let mut e = (range / 255.).log2().ceil() as i32;
+            while 2f32.powi(e) * 255. < range {
+                e += 1;
+            }
+            exponent[a] = e.clamp(-126, 127);
+        }
+        let mut words = [0u32; 20];
+        words[..3].copy_from_slice(&lo.map(f32::to_bits));
+        let child_base = out.len();
+        let tri_base = list.len();
+        let mut imask = 0u32;
+        let mut internal = 0;
+        for slot in 0..8 {
+            let byte = |w: &mut [u32; 20], word: usize, value: u32| {
+                w[word + slot / 4] |= (value & 0xff) << (8 * (slot % 4));
+            };
+            let Some(ci) = by_slot[slot] else {
+                // Empty slot: an inverted box, never valid (no meta, not internal).
+                byte(&mut words, 8, 255);
+                byte(&mut words, 10, 255);
+                byte(&mut words, 12, 255);
+                continue;
+            };
+            let (l, h) = extent(&children[ci]);
+            for a in 0..3 {
+                let scale = 2f32.powi(exponent[a]);
+                let qlo = ((l[a] - lo[a]) / scale).floor().clamp(0., 255.) as u32;
+                let qhi = ((h[a] - lo[a]) / scale).ceil().clamp(0., 255.) as u32;
+                byte(&mut words, 8 + 2 * a, qlo);
+                byte(&mut words, 14 + 2 * a, qhi);
+            }
+            match &children[ci] {
+                CwChild::Tris(tris, ..) => {
+                    let offset = (list.len() - tri_base) as u32;
+                    assert!(offset + tris.len() as u32 <= 24);
+                    byte(&mut words, 6, (tris.len() as u32) << 5 | offset);
+                    list.extend(tris);
+                }
+                child => {
+                    imask |= 1 << slot;
+                    queue.push_back((child.clone(), child_base + internal));
+                    internal += 1;
+                }
+            }
+        }
+        out.resize(child_base + internal, [0; 20]);
+        words[3] = exponent
+            .iter()
+            .enumerate()
+            .map(|(a, &e)| ((e + 127) as u32) << (8 * a))
+            .sum::<u32>()
+            | imask << 24;
+        words[4] = child_base as u32;
+        words[5] = tri_base as u32;
+        out[index] = words;
+    }
+    (out.concat(), list)
+}
+
 pub fn oct_bvh() -> bool {
     option("--oct-bvh")
 }
@@ -1112,7 +1324,18 @@ impl Mesh {
         words[1] = self.triangles.len() as u32;
         words[6] = sphere_count;
         words[7] = light_count;
-        if oct_bvh() && !self.nodes.is_empty() {
+        if cw_bvh() && !self.nodes.is_empty() {
+            assert!(
+                self.objects.is_empty(),
+                "moving objects need the 4-wide BVH (not --cwbvh)"
+            );
+            // Compressed 8-wide nodes from word 16, then their triangle index list;
+            // header word 9 holds the node count.
+            let (records, list) = cw_records(self);
+            words[9] = (records.len() / 20) as u32;
+            words.extend(records);
+            words.extend(list);
+        } else if oct_bvh() && !self.nodes.is_empty() {
             words.extend(wide_soa_records::<8>(&self.nodes));
         } else if quad_bvh() && !self.nodes.is_empty() {
             let records = quad_records(&self.nodes);

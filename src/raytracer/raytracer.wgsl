@@ -150,6 +150,8 @@ var<private> statRays:u32;
 override WIDE_BVH:u32=2u;
 override PAIR_BVH:bool=false;
 override QUAD_BVH:bool=false;
+// Compressed 8-wide BVH (--cwbvh; mesh.wgsl meshCwCandidate).
+override CW_BVH:bool=false;
 override OCT_BVH:bool=false;
 // Hardware ray queries (--hw-rt); see hwrt.wgsl.
 override HW_RT:bool=false;

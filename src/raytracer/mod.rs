@@ -715,6 +715,7 @@ impl Raytracer {
             ("PAIR_BVH", f64::from(mesh::pair_bvh())),
             ("QUAD_BVH", f64::from(mesh::quad_bvh())),
             ("OCT_BVH", f64::from(mesh::oct_bvh())),
+            ("CW_BVH", f64::from(mesh::cw_bvh())),
             ("HW_RT", f64::from(mesh::hw_rt())),
             ("HW_CLOSEST", f64::from(module_config.hw.closest())),
             ("HW_SHADOWS", f64::from(module_config.hw.shadows())),
@@ -2182,6 +2183,18 @@ fn mesh_source(config: tuner::ModuleConfig) -> String {
     let lanes = config.workgroup[0] * config.workgroup[1];
     // 4-wide traversal stack: workgroup memory (exact, 32 entries; 64-lane workgroups),
     // registers (16 entries) or a module-scope array (64 entries), as configured.
+    // Compressed 8-wide BVH: its stack takes the workgroup memory (16 entries, 8 KB) and
+    // the (unused) 4-wide traversal keeps a private one.
+    if mesh::cw_bvh() && config.stack == Some(Stack::Shared32) && lanes == 64 {
+        let start = source.find("fn meshCwCandidate(").unwrap();
+        let end = start + source[start..].find("\n}\n").unwrap();
+        let body = source[start..end]
+            .replace("var cwEntries:array<vec2<u32>,CW_STACK>;", "")
+            .replace("cwEntries[depth]", "cwShared[depth*64u+quadLane]");
+        source.replace_range(start..end, &body);
+        source.push_str("var<workgroup> cwShared: array<vec2<u32>,1024>;\n");
+        return source;
+    }
     let slm = std::env::var("RT_QUAD_SLM").ok().or_else(|| {
         (config.stack == Some(Stack::Shared32))
             .then(|| if mesh::oct_bvh() { "64" } else { "32" }.to_owned())

@@ -241,3 +241,22 @@ Ranked by expected payoff for the cost. Estimates are guesses grounded in the co
 
 Not pursued, because they are outside "raw tracer first": temporal accumulation and reuse,
 upscaling, and denoiser changes.
+
+## Compressed 8-wide BVH experiment (`--cwbvh`, 2026-11-18)
+
+Ylitie, Karras and Laine's layout (80-byte 8-wide nodes, byte-quantized child boxes,
+contiguous children, octant-ordered traversal with a stack of child groups, workgroup-
+memory stack): images bit-identical to the 4-wide BVH, but slower everywhere measured.
+Per ray on Sponza it visits fewer nodes (19.0 vs 22.6) and twice the triangles (10.8 vs
+5.4): octant order is only roughly near-first and a node's leaf triangles are tested
+before nearer internal children. Tracing at 640x400, 2 bounces:
+
+| | Iris Xe | Steam Deck |
+|---|---:|---:|
+| Sponza, 4-wide | 13.5 ms | 13.8 ms |
+| Sponza, CWBVH | 21.5 ms | 22.4 ms |
+| Bistro day, 4-wide | | 34.1 ms |
+| Bistro day, CWBVH | | 58.4 ms |
+
+Uncompressed 8-wide nodes (`--oct-bvh`) and 8-bit 4-wide nodes (`RT_QUAD_Q8`) also lost on
+the Deck (more bytes per node, or more registers). The distance-sorted 4-wide BVH stays.

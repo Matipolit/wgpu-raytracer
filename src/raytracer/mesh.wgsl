@@ -246,6 +246,14 @@ fn meshIntersection(ray: Ray, outHit: ptr<function, Intersection>, tmax: f32) ->
         *outHit=meshResolve(ray,best);
         return true;
     }
+    if CW_BVH{
+        var best=MeshCandidate();var found:bool;
+        if VIS_PRIMARY && visibilityPending {visibilityPending=false;found=visibilityCandidate(ray,tmax,&best);}
+        else {found=meshCwCandidate(ray,tmax,false,&best);}
+        if !found {return false;}
+        *outHit=meshResolve(ray,best);
+        return true;
+    }
     if QUAD_BVH{
         var best=MeshCandidate();var found:bool;
         if VIS_PRIMARY && visibilityPending {visibilityPending=false;found=visibilityCandidate(ray,tmax,&best);}
@@ -333,6 +341,7 @@ fn scatterPbr(inRay: Ray, hit: Intersection, rng: ptr<function,u32>) -> Scatter 
 
 // Shadow queries stop on the first accepted surface; cutout tests stay in meshCandidate.
 fn meshOccluded(ray: Ray, limit: f32) -> bool {
+    if CW_BVH{var ignored=MeshCandidate();return meshCwCandidate(ray,limit,true,&ignored);}
     if HW_RT && HW_SHADOWS{var ignored=MeshCandidate();return meshHwCandidate(ray,limit,true,&ignored) || meshInstanceCandidate(ray,limit,true,&ignored);}
     if QUAD_BVH{
         var ignored=MeshCandidate();
@@ -751,3 +760,86 @@ fn octSwap(t:ptr<function,array<f32,8>>,r:ptr<function,array<u32,8>>,i:u32,j:u32
 
 // Software builds: hardware ray queries absent (`--hw-rt` swaps in hwrt.wgsl).
 fn meshHwCandidate(ray: Ray, limit: f32, anyHit: bool, outBest: ptr<function, MeshCandidate>) -> bool { return false; }
+
+// Compressed 8-wide BVH traversal (mesh.rs cw_records; Ylitie, Karras and Laine 2017).
+// A group is (first internal child, internal hits by visiting key << 24 | the node's
+// internal-slot mask); keys are slot ^ ray octant, lowest first = roughly near-first.
+// Each node's triangle hits are tested right away, so only node groups are stacked.
+const CW_STACK=16u;
+// With --cwbvh, mesh_source moves the stack to workgroup memory (cwShared, entry i of
+// lane l at i*64+l): a dynamically indexed private array spills to scratch memory.
+fn meshCwCandidate(ray:Ray,limit:f32,anyHit:bool,outBest:ptr<function,MeshCandidate>)->bool{
+    let count=meshData[9u];
+    if count==0u {return false;}
+    rayLength=length(ray.direction);
+    let triangles=16u+count*20u;
+    let parallel=abs(ray.direction)<vec3(1e-20);
+    let inverse=vec3(1.)/select(ray.direction,vec3(1.),parallel);
+    let octant=select(0u,1u,ray.direction.x<0.)|select(0u,2u,ray.direction.y<0.)|select(0u,4u,ray.direction.z<0.);
+    var closest=limit;var found=false;var best=MeshCandidate();
+    var cwEntries:array<vec2<u32>,CW_STACK>;var depth=0u;
+    // The root: node 0 as the only internal child (slot 0) of a virtual parent.
+    var group=vec2(0u,(1u<<(24u+octant))|1u);
+    loop{
+        var triangleBase=0u;var triangleHits=0u;
+        if group.y>0xffffffu {
+            let key=firstTrailingBit(group.y>>24u);
+            group.y&=~(1u<<(24u+key));
+            let slot=key^octant;
+            let node=16u+(group.x+countOneBits(group.y&0xffu&((1u<<slot)-1u)))*20u;
+            if group.y>0xffffffu && depth<CW_STACK {cwEntries[depth]=group;depth+=1u;}
+            if TRAVERSAL_STATS {statNodes+=1u;}
+            let header=meshData[node+3u];
+            let origin=meshVec3(node);
+            let scale=vec3(bitcast<f32>((header&0xffu)<<23u),bitcast<f32>(((header>>8u)&0xffu)<<23u),bitcast<f32>(((header>>16u)&0xffu)<<23u));
+            // t = (origin + q * scale - ray origin) / direction = a + q * b per axis.
+            let a=(origin-ray.origin)*inverse;let b=scale*inverse;
+            let internalMask=header>>24u;
+            var internalHits=0u;
+            for(var half=0u;half<2u;half+=1u){
+                var lower=vec4(MIN_T);var upper=vec4(closest);var outside=vec4(false);
+                for(var axis=0u;axis<3u;axis+=1u){
+                    let qlo=vec4<f32>(unpack4xU8(meshData[node+8u+axis*2u+half]));
+                    let qhi=vec4<f32>(unpack4xU8(meshData[node+14u+axis*2u+half]));
+                    if parallel[axis]{
+                        let o=ray.origin[axis];
+                        outside=outside|(vec4(o)<origin[axis]+qlo*scale[axis])|(vec4(o)>origin[axis]+qhi*scale[axis]);
+                    } else {
+                        let t0=vec4(a[axis])+qlo*b[axis];let t1=vec4(a[axis])+qhi*b[axis];
+                        lower=max(lower,min(t0,t1));upper=min(upper,max(t0,t1));
+                    }
+                }
+                let hit=(lower<=upper)&!outside;
+                let leafMeta=meshData[node+6u+half];
+                for(var lane=0u;lane<4u;lane+=1u){
+                    if !hit[lane] {continue;}
+                    let slot=half*4u+lane;
+                    if (internalMask>>slot&1u)!=0u {internalHits|=1u<<(slot^octant);}
+                    else {
+                        let m=(leafMeta>>(8u*lane))&0xffu;
+                        triangleHits|=((1u<<(m>>5u))-1u)<<(m&31u);
+                    }
+                }
+            }
+            group=vec2(meshData[node+4u],(internalHits<<24u)|internalMask);
+            triangleBase=meshData[node+5u];
+        }
+        loop{
+            if triangleHits==0u {break;}
+            let bit=firstTrailingBit(triangleHits);
+            triangleHits&=triangleHits-1u;
+            if TRAVERSAL_STATS {statTriangles+=1u;}
+            var hit=MeshCandidate();
+            if meshCandidate(ray,meshData[triangles+triangleBase+bit],closest,&hit){
+                if anyHit {return true;}
+                closest=hit.t;best=hit;found=true;
+            }
+        }
+        if group.y<=0xffffffu {
+            if depth==0u {break;}
+            depth-=1u;group=cwEntries[depth];
+        }
+    }
+    if found {*outBest=best;}
+    return found;
+}
