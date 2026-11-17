@@ -644,6 +644,12 @@ impl Raytracer {
             ("DENOISER_INPUT", f64::from(temporal_source.is_some())),
             ("RESTIR", f64::from(scene.mesh.lamp_count() > 0)),
             ("RESTIR_BLOCKS", f64::from(restir_blocks())),
+            ("GI_BLOCKS", f64::from(gi_blocks())),
+            (
+                "GI_SPATIAL",
+                std::env::var("RT_GI_SPATIAL")
+                    .map_or(if gi_blocks() { 8. } else { 4. }, |v| v.parse().unwrap()),
+            ),
             (
                 "RESTIR_GI",
                 f64::from(!scene.mesh.triangles.is_empty() && !crate::has_flag("--no-restir-gi")),
@@ -2300,6 +2306,14 @@ fn scene_stages(visibility: bool) -> wgpu::ShaderStages {
 /// ReSTIR DI's first pass for one pixel per 2x2 block (`--restir-full` or
 /// RT_RESTIR_FULL: every pixel). Night Bistro on the Steam Deck: 60.2 -> 45.3 ms per
 /// frame, inputs 0.2 dB (per pixel) / 1 dB (4x4 averages) noisier.
+/// ReSTIR GI's bounce traced by one pixel per 2x2 block, the rest from reuse
+/// (raytracer.wgsl GI_BLOCKS), unless `--restir-full` or RT_GI_FULL. Steam Deck, 0.67
+/// render scale, Medium: night Bistro 135 -> 82 ms per frame, Sponza 51 -> 32 ms
+/// (no GI: 76 and 30 ms); Sponza 4x4-averaged PSNR 25.8 -> 24.6 dB (no GI: 20.8).
+fn gi_blocks() -> bool {
+    std::env::var_os("RT_GI_FULL").is_none() && !crate::has_flag("--restir-full")
+}
+
 fn restir_blocks() -> bool {
     std::env::var_os("RT_RESTIR_FULL").is_none() && !crate::has_flag("--restir-full")
 }

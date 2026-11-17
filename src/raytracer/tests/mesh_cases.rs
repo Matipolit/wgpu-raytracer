@@ -850,3 +850,53 @@ fn vndf_preserves_energy_and_reduces_grazing_rejections() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires a GPU"]
+fn gi_block_planes_trace_every_pixel_once() {
+    // ReSTIR GI in 2x2 blocks remaps the trace grid into four planes; every pixel of
+    // an odd-sized image and of a trace region at an odd origin must still be traced
+    // (here all sky, so a skipped pixel stays black).
+    let (device, queue) = gpu();
+    let scene = Scene {
+        mesh: lamps(),
+        ..Default::default()
+    };
+    let mut render_params = params();
+    render_params.sampling.restir = true;
+    render_params.sampling.max_samples_per_pixel = 1;
+    let (width, height) = render_params.viewport_size;
+    let mut tracer = Raytracer::new(
+        &device,
+        &queue,
+        &config((width, height)),
+        &scene,
+        &render_params,
+    )
+    .unwrap();
+    tracer
+        .set_render_params(&device, &queue, &render_params)
+        .unwrap();
+    for region in [None, Some((3, 1, 13, 9))] {
+        tracer.set_trace_region(region);
+        // Several frames: the block owner rotates with the ReSTIR frame counter.
+        for _ in 0..4 {
+            tracer.reset_accumulation();
+            let mut encoder = device.create_command_encoder(&Default::default());
+            tracer.accumulate_frame(&queue, &mut encoder);
+            queue.submit([encoder.finish()]);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let radiance = tracer.read_radiance(&device, &queue);
+            let (x0, y0, w, h) = region.unwrap_or((0, 0, width, height));
+            for y in y0..y0 + h {
+                for x in x0..x0 + w {
+                    let p = ((y * width + x) * 3) as usize;
+                    assert!(
+                        radiance[p..p + 3].iter().sum::<f32>() > 0.,
+                        "pixel ({x}, {y}) not traced in {region:?}"
+                    );
+                }
+            }
+        }
+    }
+}

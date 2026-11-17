@@ -178,7 +178,8 @@ impl Settings {
         if !self.gi {
             push("--no-restir-gi", None);
         }
-        // High: fresh lamp candidates for every pixel (cheaper presets share them per 2x2).
+        // High: lamp candidates and the GI bounce for every pixel (cheaper presets do
+        // them for one pixel per 2x2 block and reuse).
         if self.preset == Preset::High {
             push("--restir-full", None);
         }

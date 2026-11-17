@@ -71,15 +71,16 @@ impl ImageBuffers {
             5,
             Some("exposure state"),
         );
-        let (accumulation, filtered, [gbuffer, reservoirs, gi], [trace, filter, display]) = Self::allocate(
-            device,
-            frame,
-            &exposure,
-            bytes,
-            &trace_layout,
-            &filter_layout,
-            &display_layout,
-        );
+        let (accumulation, filtered, [gbuffer, reservoirs, gi], [trace, filter, display]) =
+            Self::allocate(
+                device,
+                frame,
+                &exposure,
+                bytes,
+                &trace_layout,
+                &filter_layout,
+                &display_layout,
+            );
         Self {
             accumulation,
             filtered,
@@ -100,15 +101,16 @@ impl ImageBuffers {
         if self.accumulation.handle().size() == bytes {
             return;
         }
-        let (accumulation, filtered, [gbuffer, reservoirs, gi], [trace, filter, display]) = Self::allocate(
-            device,
-            frame,
-            &self.exposure,
-            bytes,
-            &self.trace_layout,
-            &self.filter_layout,
-            &self.display_layout,
-        );
+        let (accumulation, filtered, [gbuffer, reservoirs, gi], [trace, filter, display]) =
+            Self::allocate(
+                device,
+                frame,
+                &self.exposure,
+                bytes,
+                &self.trace_layout,
+                &self.filter_layout,
+                &self.display_layout,
+            );
         self.accumulation = accumulation;
         self.filtered = filtered;
         self.gbuffer = gbuffer;
@@ -194,6 +196,11 @@ impl ImageBuffers {
                 binding(exposure.handle(), 6),
             ],
         });
-        (accumulation, filtered, [gbuffer, reservoirs, gi], [trace, filter, display])
+        (
+            accumulation,
+            filtered,
+            [gbuffer, reservoirs, gi],
+            [trace, filter, display],
+        )
     }
 }
