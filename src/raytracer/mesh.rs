@@ -915,10 +915,15 @@ impl Mesh {
     /// Scene triangles (not moving objects) with emitting materials and their power
     /// (weight × area).
     fn lamp_triangles(&self, weights: &[f32]) -> Vec<(u32, f64)> {
+        // After an SBVH build the triangle array lists split triangles once per leaf:
+        // each emitter enters the table once (else it is chosen k times as often as
+        // its pdf says, and its light is counted k times).
+        let mut seen = std::collections::HashSet::new();
         self.triangles[..self.scene_triangle_count()]
             .iter()
             .enumerate()
             .filter(|(_, t)| weights[t.material as usize] > 0.)
+            .filter(|(_, t)| seen.insert(t.vertices))
             .filter_map(|(i, t)| {
                 let [a, b, c] = t
                     .vertices
@@ -2214,6 +2219,21 @@ mod local_tests {
                 assert!((i32::from(last[0][c]) - expected).abs() <= 1);
             }
         }
+    }
+    #[test]
+    fn sbvh_duplicate_references_are_one_lamp() {
+        let mut mesh = Mesh::load_uncached(Path::new("tests/assets/triangles.gltf")).unwrap();
+        let material = mesh.triangles[0].material as usize;
+        for c in 4..7 {
+            mesh.materials[material][c] = 1f32.to_bits();
+        }
+        let lamps = mesh.lamp_count();
+        assert!(lamps > 0);
+        // A spatial split repeats a triangle in several leaves.
+        let first = mesh.triangles[0];
+        mesh.triangles.insert(1, first);
+        mesh.triangles.push(first);
+        assert_eq!(mesh.lamp_count(), lamps);
     }
     #[test]
     fn cooked_scene_roundtrip_and_truncation_rejection() {
