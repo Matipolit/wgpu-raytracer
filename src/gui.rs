@@ -7,6 +7,8 @@ pub struct Gui {
     frame: Option<UiFrame>,
     next_repaint: Instant,
     input_geometry: (Option<egui::Rect>, Option<f32>, bool),
+    /// Set by the "Back to launcher" button.
+    pub back_to_launcher: bool,
 }
 
 struct UiFrame {
@@ -23,6 +25,7 @@ impl Gui {
             frame: None,
             next_repaint: Instant::now(),
             input_geometry: (None, None, false),
+            back_to_launcher: false,
         }
     }
 
@@ -52,9 +55,11 @@ impl Gui {
             return None;
         }
         self.input_geometry = geometry;
+        let mut back = false;
         let output = self.context.run_ui(input, |ui| {
-            draw_controls(ui.ctx(), params, camera, fps, progress);
+            back = draw_controls(ui.ctx(), params, camera, fps, progress);
         });
+        self.back_to_launcher |= back;
         // Scene rendering continues independently. Status labels update at 10 Hz;
         // pointer/keyboard events and egui animation deadlines bypass this limit.
         let delay = output
@@ -63,6 +68,15 @@ impl Gui {
             .map_or(Duration::ZERO, |viewport| viewport.repaint_delay);
         self.next_repaint = now + delay.min(Duration::from_millis(100));
         Some(output)
+    }
+
+    /// One UI frame with no repaint throttling (the launcher).
+    pub fn run_ui(
+        &mut self,
+        input: egui::RawInput,
+        ui: impl FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        self.context.run_ui(input, ui)
     }
 
     pub fn prepare(
@@ -119,16 +133,20 @@ fn draw_controls(
     camera: &mut FlyCameraController,
     fps: f32,
     progress: f32,
-) {
+) -> bool {
+    let mut back = false;
     egui::Window::new("Parameters")
         .default_pos([60., 60.])
         .default_size([300., 300.])
         .vscroll(true)
         .show(context, |ui| {
-            ui.label(format!(
-                "FPS: {fps:.1}, render progress: {:.1} %",
-                progress * 100.
-            ));
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "FPS: {fps:.1}, render progress: {:.1} %",
+                    progress * 100.
+                ));
+                back = ui.button("Back to launcher").clicked();
+            });
             ui.separator();
             ui.label("Sampling parameters");
             ui.label("samples per pixel per frame");
@@ -194,6 +212,7 @@ fn draw_controls(
                 ui.color_edit_button_rgb(&mut params.sky.albedo);
             });
         });
+    back
 }
 
 #[cfg(test)]

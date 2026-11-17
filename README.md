@@ -10,6 +10,22 @@ Requires Rust 1.95 or newer.
 $ cargo run --release --locked
 ```
 
+With no arguments this opens the **launcher**: choose a scene (including Bistro at
+night), a quality preset (Low, Medium, High, Reference) and graphics settings
+(resolution, fullscreen, render scale, denoiser, bounces, texture filtering, hardware
+ray tracing, auto-tuner, sun position), then Launch. The launcher restarts the renderer
+with the matching flags (printed to the terminal) and remembers the choices in
+`~/.config/wgpu-raytracer/launcher.txt`. In the renderer: hold the right mouse button to
+look around, WASD to move, Q/E down/up; "Back to launcher" is in the parameter panel.
+`--launcher` opens it explicitly; any other arguments skip it.
+
+Mesh scenes have a sun disk (sampled directly on surfaces) at 45° elevation:
+`--sun-elevation DEG --sun-azimuth DEG` move it, `--no-sun` restores the overcast-looking
+sky, `--night` dims the sky to moonlight so emissive materials light the scene.
+Renderer window options: `--size WxH`, `--fullscreen`, `--max-samples N` (progressive
+budget), `--no-denoise`. Temporal neural denoisers ship in `models/`
+(`--temporal-model models/td2-half24.wgsl`).
+
 The renderer uses wgpu 30, winit 0.30, and egui 0.37. `Cargo.lock` records the
 complete dependency set.
 

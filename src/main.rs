@@ -23,6 +23,7 @@ mod benchmark;
 mod capture;
 mod fly_camera;
 mod gui;
+mod launcher;
 mod offline;
 mod raytracer;
 mod shapes;
@@ -75,6 +76,11 @@ fn main() {
         capture::run();
         return;
     }
+    // No arguments: the launcher menu, which restarts the renderer with its choices.
+    if has_flag("--launcher") || std::env::args().len() == 1 {
+        launcher::run();
+        return;
+    }
     if std::env::args().any(|argument| argument == "--render-output") {
         offline::run();
         return;
@@ -106,12 +112,17 @@ impl ApplicationHandler for App {
         if self.state.is_some() {
             return;
         }
+        let (width, height) = window_size().unwrap_or((800, 600));
         let window = Arc::new(
             event_loop
                 .create_window(
                     Window::default_attributes()
                         .with_title("weekend-raytracer-wgpu")
-                        .with_inner_size(winit::dpi::PhysicalSize::new(800, 600)),
+                        .with_inner_size(winit::dpi::PhysicalSize::new(width, height))
+                        .with_fullscreen(
+                            has_flag("--fullscreen")
+                                .then_some(winit::window::Fullscreen::Borderless(None)),
+                        ),
                 )
                 .expect("Window creation should succeed on desktop"),
         );
@@ -224,6 +235,11 @@ impl AppState {
             sky: scene_sky(&scene),
             sampling: SamplingParams {
                 num_bounces: selected_bounces(),
+                max_samples_per_pixel: argument_value("--max-samples")
+                    .map_or(SamplingParams::default().max_samples_per_pixel, |v| {
+                        v.parse().expect("--max-samples must be a positive integer")
+                    }),
+                denoising_enabled: !has_flag("--no-denoise"),
                 ..Default::default()
             },
             viewport_size: (size.width.max(1), size.height.max(1)),
@@ -333,6 +349,11 @@ impl AppState {
                 std::mem::take(&mut output.platform_output),
             );
         }
+        if std::mem::take(&mut self.gui.back_to_launcher) {
+            launcher::relaunch(&["--launcher".to_owned()]);
+            event_loop.exit();
+            return;
+        }
         self.render_params.camera = self.fly_camera_controller.renderer_camera();
         if let Err(error) = self.raytracer.set_render_params(
             &self.context.device,
@@ -392,9 +413,11 @@ impl AppState {
     }
 }
 
-struct GpuContext {
+pub(crate) struct GpuContext {
     /// GPU, backend and driver, for the auto-tuner's calibration cache.
     adapter_key: String,
+    /// Hardware ray queries are available (`--hw-rt`).
+    ray_query: bool,
     instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -403,7 +426,7 @@ struct GpuContext {
 }
 
 impl GpuContext {
-    async fn new(window: Arc<Window>, display_handle: OwnedDisplayHandle) -> Self {
+    pub(crate) async fn new(window: Arc<Window>, display_handle: OwnedDisplayHandle) -> Self {
         let instance = wgpu::Instance::new(
             wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(display_handle)),
         );
@@ -442,6 +465,9 @@ impl GpuContext {
         surface.configure(&device, &surface_config);
         Self {
             adapter_key: adapter_key(&adapter.get_info()),
+            ray_query: adapter
+                .features()
+                .contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY),
             instance,
             device,
             queue,
@@ -563,6 +589,13 @@ fn argument_value(name: &str) -> Option<String> {
     None
 }
 
+/// `--size WxH`: the initial window size of the interactive renderer.
+fn window_size() -> Option<(u32, u32)> {
+    let value = argument_value("--size")?;
+    let (w, h) = value.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
+}
+
 fn selected_bounces() -> u32 {
     let bounces =
         argument_value("--bounces").map_or(SamplingParams::default().num_bounces, |value| {
@@ -667,7 +700,7 @@ fn scene_exposure(scene: &Scene) -> f32 {
         2.
     }
 }
-/// Mesh scenes: sun at 45° (`--no-sun`: the overcast-looking sky alone, `--night`:
+/// Mesh scenes: sun at 45° elevation unless `--sun-elevation`/`--sun-azimuth` (`--no-sun`: the overcast-looking sky alone, `--night`:
 /// moonlit atmosphere only); the sphere demo keeps its sunless sky.
 fn scene_sky(scene: &Scene) -> SkyParams {
     if scene.mesh.triangles.is_empty() {
@@ -676,8 +709,15 @@ fn scene_sky(scene: &Scene) -> SkyParams {
             ..SkyParams::default()
         }
     } else {
+        let degrees = |name: &str, default: f32| {
+            argument_value(name).map_or(default, |v| {
+                v.parse()
+                    .unwrap_or_else(|_| panic!("{name} must be a number of degrees"))
+            })
+        };
         SkyParams {
-            zenith_degrees: 45.,
+            zenith_degrees: (90. - degrees("--sun-elevation", 45.)).clamp(0., 90.),
+            azimuth_degrees: degrees("--sun-azimuth", 0.).rem_euclid(360.),
             sun: !has_flag("--no-sun"),
             night: has_flag("--night"),
             ..SkyParams::default()
