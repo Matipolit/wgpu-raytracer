@@ -293,6 +293,9 @@ async fn render() {
         "Scene key (log-average luminance): {:.4}",
         (logs.iter().sum::<f64>() / logs.len().max(1) as f64).exp()
     );
+    if let Some(times) = tracer.pass_times() {
+        eprintln!("{times}");
+    }
     eprintln!("Auto-tune: ended on {}", tracer.trace_variant());
     eprintln!(
         "Rendered {width}x{height}, {samples} spp on {} ({:?}); setup {:.2}s, render {:.2}s; warmed median GPU {:?} ms/sample; saved {path}",

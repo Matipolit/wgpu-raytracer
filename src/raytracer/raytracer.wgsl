@@ -109,7 +109,9 @@ const SUN_SHARE = 0.75;
 // Lamp candidates per light sample (resampled importance sampling, the first stage
 // of ReSTIR DI): one shadow ray goes to the candidate chosen by unshadowed
 // contribution, so nearby, facing lamps win over distant bright ones.
-override LAMP_CANDIDATES: u32 = 8u;
+override LAMP_CANDIDATES: u32 = 4u;
+// Candidates at deeper bounces (their noise matters less).
+override LAMP_CANDIDATES_DEEP: u32 = 2u;
 override GGX_VNDF: bool = false;
 override GGX_BOUNDED:bool=false;
 
@@ -607,7 +609,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                         pdf = sunShare/skyState.sunRadiance.w; // inside the cone by construction
                         scale = 1./pdf;
                     } else {
-                        let lamp = lampRis(hit.p,hit.n,rngState);
+                        let lamp = lampRis(hit.p,hit.n,select(LAMP_CANDIDATES_DEEP,LAMP_CANDIDATES,bounce == 0u),rngState);
                         direction = lamp.direction;radiance = lamp.radiance;limit = lamp.distance*0.999;
                         // MIS uses the source pdf; RIS supplies the estimator's weight.
                         pdf = (1.-sunShare)*lamp.pdf;
@@ -1255,9 +1257,9 @@ fn lampPdfAt(material: u32, distance: f32, cosLight: f32) -> f32 {
 // texture, no BSDF, no visibility). `pdf` is the chosen point's source pdf (for MIS),
 // `scale` the RIS estimator weight (1/pdf when there is one candidate); 0 = none.
 struct LampChoice {direction: vec3<f32>, distance: f32, radiance: vec3<f32>, pdf: f32, scale: f32}
-fn lampRis(origin: vec3<f32>, normal: vec3<f32>, rng: ptr<function,u32>) -> LampChoice {
+fn lampRis(origin: vec3<f32>, normal: vec3<f32>, candidates: u32, rng: ptr<function,u32>) -> LampChoice {
     var chosen=LampPoint();var chosenTarget=0.;var sum=0.;
-    for(var k=0u;k<LAMP_CANDIDATES;k+=1u) {
+    for(var k=0u;k<candidates;k+=1u) {
         let candidate=sampleLampPoint(origin,rng);
         let score=meshFloat(meshMaterialOffset(candidate.material)+12u)*max(dot(normal,candidate.direction),0.);
         let w=select(0.,score/candidate.pdf,candidate.pdf>0.);
@@ -1265,13 +1267,20 @@ fn lampRis(origin: vec3<f32>, normal: vec3<f32>, rng: ptr<function,u32>) -> Lamp
         if w>0. && rngNextFloat(rng)*sum<w {chosen=candidate;chosenTarget=score;}
     }
     if chosenTarget<=0. {return LampChoice();}
-    return LampChoice(chosen.direction,chosen.distance,lampRadiance(chosen),chosen.pdf,sum/(f32(LAMP_CANDIDATES)*chosenTarget));
+    return LampChoice(chosen.direction,chosen.distance,lampRadiance(chosen),chosen.pdf,sum/(f32(candidates)*chosenTarget));
 }
-struct LampPoint {direction: vec3<f32>, distance: f32, pdf: f32, material: u32, uv0: vec2<f32>, uv1: vec2<f32>, triangle: u32, bary: vec2<f32>, cosLight: f32}
+struct LampPoint {direction: vec3<f32>, distance: f32, pdf: f32, material: u32, triangle: u32, bary: vec2<f32>, cosLight: f32}
 fn lampRadiance(point: LampPoint) -> vec3<f32> {
     let m=meshMaterialOffset(point.material);
+    let emission=meshVec3(m+4u);
+    if meshData[m+32u]==0u {return emission;}
+    let tri=meshData[2u]+point.triangle*4u;
+    let va=vertexOffset(meshData[tri]);let vb=vertexOffset(meshData[tri+1u]);let vc=vertexOffset(meshData[tri+2u]);
+    let w=vec3(1.-point.bary.x-point.bary.y,point.bary.x,point.bary.y);
+    let uv0=w.x*vertexUV0(va)+w.y*vertexUV0(vb)+w.z*vertexUV0(vc);
+    let uv1=w.x*vertexUV1(va)+w.y*vertexUV1(vb)+w.z*vertexUV1(vc);
     let cones=coneActive;coneActive=false;
-    let radiance=meshVec3(m+4u)*meshTexture(m+32u,point.uv0,point.uv1,true).rgb;
+    let radiance=emission*meshTexture(m+32u,uv0,uv1,true).rgb;
     coneActive=cones;
     return radiance;
 }
@@ -1298,10 +1307,9 @@ fn lampAt(triangle: u32, bary: vec2<f32>, origin: vec3<f32>) -> LampPoint {
     let normal=cross(b-a,c-a);
     let toLight=point-origin;let distance=length(toLight);let direction=toLight/max(distance,1e-20);
     let material=meshData[tri+3u];
-    let uv0=w.x*vertexUV0(va)+w.y*vertexUV0(vb)+w.z*vertexUV0(vc);
-    let uv1=w.x*vertexUV1(va)+w.y*vertexUV1(vb)+w.z*vertexUV1(vc);
     let cosLight=abs(dot(normal,direction))/max(length(normal),1e-20);
-    return LampPoint(direction,distance,lampPdfAt(material,distance,cosLight),material,uv0,uv1,triangle,bary,cosLight);
+    // Texture coordinates are fetched only for the winner (lampRadiance).
+    return LampPoint(direction,distance,lampPdfAt(material,distance,cosLight),material,triangle,bary,cosLight);
 }
 
 // ReSTIR in area measure: target = lamp weight x max(n.w, 0) x cosLight / d^2 (no
@@ -1355,6 +1363,8 @@ fn csRestirInitial(@builtin(global_invocation_id) id: vec3<u32>) {
     var rng=initRng(id.xy,frameData.xy,frameData.z^0x5bd1e995u);
     var jitter=vec2(0.5);
     if SHARED_JITTER {jitter=frameJitter(frameData.z);}
+    // With the visibility raster, the primary hit comes from it (same jitter).
+    if VIS_PRIMARY {jitter=visibilityJitter();gbufferPixel=pixel;visibilityPending=true;}
     let u=(f32(id.x)+jitter.x)/f32(frameData.x);let v=(f32(id.y)+jitter.y)/f32(frameData.y);
     if RAY_CONES {coneActive=false;}
     let ray=cameraMakeRay(camera,&rng,u,1.-v);

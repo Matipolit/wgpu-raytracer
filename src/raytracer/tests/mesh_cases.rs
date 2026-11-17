@@ -167,7 +167,7 @@ fn csLampEnergy(@builtin(global_invocation_id) id:vec3<u32>) {
         let s=sampleLamp(hit.p,&rng);let ev=evaluatePbr(surface,hit,s.direction);
         nee+=ev.rgb*s.radiance/s.pdf;
         // Resampled lamp choice, MIS-weighted with the source pdf.
-        let r=lampRis(hit.p,hit.n,&rng);let er=evaluatePbr(surface,hit,r.direction);
+        let r=lampRis(hit.p,hit.n,8u,&rng);let er=evaluatePbr(surface,hit,r.direction);
         combined+=er.rgb*r.radiance*misWeight(r.pdf,er.a)*r.scale;
         let b=samplePbr(surface,hit,&rng);var h=Intersection();
         if meshIntersection(Ray(hit.p+hit.n*1e-4,b.scatter.ray.direction),&h,MAX_T) {

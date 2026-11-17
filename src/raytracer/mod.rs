@@ -15,6 +15,7 @@ pub mod gpu_textures;
 mod hwrt;
 mod image_buffers;
 pub mod mesh;
+mod profiler;
 mod temporal;
 mod texture;
 mod tuner;
@@ -133,6 +134,7 @@ pub struct Raytracer {
     /// ReSTIR's first pass (raytracer.wgsl csRestirInitial), when the scene has lamps.
     restir_pipeline: Option<wgpu::ComputePipeline>,
     bloom: bloom::Bloom,
+    profiler: Option<profiler::PassProfiler>,
     trace_constants: Vec<(&'static str, f64)>,
     /// Identifies the scene in the calibration cache.
     scene_key: String,
@@ -654,7 +656,11 @@ impl Raytracer {
             ),
             (
                 "LAMP_CANDIDATES",
-                std::env::var("RT_LAMP_CANDIDATES").map_or(8., |v| v.parse().unwrap()),
+                std::env::var("RT_LAMP_CANDIDATES").map_or(4., |v| v.parse().unwrap()),
+            ),
+            (
+                "LAMP_CANDIDATES_DEEP",
+                std::env::var("RT_LAMP_CANDIDATES_DEEP").map_or(2., |v| v.parse().unwrap()),
             ),
             (
                 "SKY_IMPORTANCE",
@@ -763,11 +769,20 @@ impl Raytracer {
             .iter()
             .any(|&(name, value)| name == "RESTIR" && value != 0.)
             .then(|| {
+                // Primary hits from the visibility raster when there is one (it costs a
+                // fraction of re-tracing them).
+                let constants: Vec<(&str, f64)> = trace_constants
+                    .iter()
+                    .map(|&(name, value)| match name {
+                        "VIS_PRIMARY" => (name, f64::from(vis_on)),
+                        _ => (name, value),
+                    })
+                    .collect();
                 create_compute(
                     &pipeline_layout,
                     "csRestirInitial",
                     "ReSTIR initial reservoirs",
-                    &trace_constants,
+                    &constants,
                 )
             });
         if variants.len() > 1 {
@@ -1003,6 +1018,7 @@ impl Raytracer {
             trace_pipelines,
             restir_pipeline,
             bloom,
+            profiler: profiler::PassProfiler::new(device, queue),
             module_config,
             source_prefix: trace_source,
             source_suffix,
@@ -1239,6 +1255,9 @@ impl Raytracer {
 
     /// Call after submitting a frame: starts reading back its timing for the auto-tuner.
     pub fn after_submit(&mut self, device: &wgpu::Device) {
+        if let Some(profiler) = &mut self.profiler {
+            profiler.collect(device);
+        }
         if let Some(timer) = &mut self.timer {
             timer.after_submit();
             let _ = device.poll(wgpu::PollType::Poll);
@@ -1253,8 +1272,25 @@ impl Raytracer {
     /// Dispatch tracing, then filtering; presentation only reads the completed result.
     pub fn accumulate_frame(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
         self.bloom.upload(queue);
+        self.mark(encoder, "start");
         self.accumulate(queue, encoder);
         self.bloom.record(encoder);
+        self.mark(encoder, "bloom");
+        if let Some(profiler) = &mut self.profiler {
+            profiler.finish(encoder);
+        }
+    }
+
+    /// RT_PASS_TIMES: timestamp the end of a pass group.
+    fn mark(&mut self, encoder: &mut wgpu::CommandEncoder, label: &'static str) {
+        if let Some(profiler) = &mut self.profiler {
+            profiler.mark(encoder, label);
+        }
+    }
+
+    /// RT_PASS_TIMES: the average per-pass GPU times so far.
+    pub fn pass_times(&self) -> Option<String> {
+        self.profiler.as_ref().map(profiler::PassProfiler::report)
     }
 
     fn accumulate(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
@@ -1311,11 +1347,11 @@ impl Raytracer {
         } else {
             None
         };
-        if let Some(visibility) = self
-            .visibility
-            .as_ref()
-            .filter(|_| self.tuner.variants[variant].visibility_primary)
-        {
+        if let Some(visibility) = self.visibility.as_ref().filter(|_| {
+            // ReSTIR's first pass takes its primary hits from the raster too.
+            self.tuner.variants[variant].visibility_primary
+                || (params.restir != 0 && self.restir_pipeline.is_some())
+        }) {
             // RT_VIS_RASTER_ONCE: keep the first frame's visibility buffer (static camera,
             // profiling the tracing pass alone).
             let once = std::env::var("RT_VIS_RASTER_ONCE").is_ok();
@@ -1343,6 +1379,7 @@ impl Raytracer {
                 );
             }
         }
+        self.mark(encoder, "visibility raster");
         if params.num_samples_per_pixel != 0
             && params.restir != 0
             && let Some(pipeline) = &self.restir_pipeline
@@ -1361,6 +1398,7 @@ impl Raytracer {
             }
             pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
         }
+        self.mark(encoder, "restir");
         if params.num_samples_per_pixel != 0 {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("path tracing pass"),
@@ -1398,6 +1436,7 @@ impl Raytracer {
         if let (Some(timer), Some(slot)) = (&self.timer, timing) {
             timer.end(encoder, slot);
         }
+        self.mark(encoder, "trace");
         if let Some(temporal) = &self.temporal {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("temporal denoiser pass"),
@@ -1408,13 +1447,22 @@ impl Raytracer {
             pass.set_bind_group(2, &self.parameter_bind_group, &[]);
             pass.set_bind_group(3, &self.scene_bind_group, &[]);
             temporal.record(&mut pass, (width, height));
+            drop(pass);
+            self.mark(encoder, "denoiser");
             if self.latest_render_params.auto_exposure {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("exposure pass"),
+                    timestamp_writes: None,
+                });
                 pass.set_pipeline(&self.exposure_pipeline);
+                pass.set_bind_group(0, &self.vertex_uniform_bind_group, &[]);
                 pass.set_bind_group(1, &self.images.filter, &[]);
+                pass.set_bind_group(2, &self.parameter_bind_group, &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
             self.filter_dirty = false;
         }
+        self.mark(encoder, "exposure");
         if self.filter_dirty && !self.skip_filter {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("denoising pass"),
@@ -1431,6 +1479,7 @@ impl Raytracer {
             }
             self.filter_dirty = false;
         }
+        self.mark(encoder, "spatial filter");
         if let Some(upscaler) = &mut self.upscaler {
             if params.num_samples_per_pixel != 0 {
                 upscaler.record(
@@ -1442,6 +1491,7 @@ impl Raytracer {
                 );
             }
         }
+        self.mark(encoder, "upscale");
     }
 
     /// Float32 RGB averages, little endian, row major; no tone mapping or filtering.
