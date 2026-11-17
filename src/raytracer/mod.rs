@@ -716,6 +716,8 @@ impl Raytracer {
             ("QUAD_BVH", f64::from(mesh::quad_bvh())),
             ("OCT_BVH", f64::from(mesh::oct_bvh())),
             ("HW_RT", f64::from(mesh::hw_rt())),
+            ("HW_CLOSEST", f64::from(module_config.hw.closest())),
+            ("HW_SHADOWS", f64::from(module_config.hw.shadows())),
             (
                 "HW_FLIP_FACING",
                 f64::from(std::env::var("RT_HW_FLIP").is_ok()),
@@ -1083,13 +1085,23 @@ impl Raytracer {
         {
             return;
         }
-        let key = format!("{adapter}|{}|{}", self.scene_key, env!("CARGO_PKG_VERSION"));
+        // Revision 2: back-to-back measurement (earlier entries measured idle clocks);
+        // RADV's wave size changes the best configuration.
+        let key = format!(
+            "{adapter}|{}|{}|c2{}{}",
+            self.scene_key,
+            env!("CARGO_PKG_VERSION"),
+            if mesh::hw_rt() { "|hw" } else { "" },
+            std::env::var("RADV_PERFTEST").map_or(String::new(), |v| format!("|radv:{v}"))
+        );
         let fresh = crate::has_flag("--recalibrate");
         let chosen = match tuner::load_cached(&key).filter(|_| !fresh) {
             Some(config) => config,
             None => {
                 let start = std::time::Instant::now();
                 let saved = (self.frame_number, self.last_camera);
+                // Warm up: bring a power-managed GPU to its working clock first.
+                let _ = self.measure_config(device, queue, self.module_config);
                 let mut best = (
                     self.module_config,
                     self.measure_config(device, queue, self.module_config),
@@ -1111,6 +1123,17 @@ impl Raytracer {
                             }
                         }
                     };
+                // Hardware vs compute first (the stack and workgroup suit each differently);
+                // compute is the baseline hardware queries must beat.
+                if mesh::hw_rt() && std::env::var("RT_HW_MODE").is_err() {
+                    for hw in [
+                        tuner::HwRays::Compute,
+                        tuner::HwRays::Shadows,
+                        tuner::HwRays::All,
+                    ] {
+                        consider(self, tuner::ModuleConfig { hw, ..best.0 }, &mut best);
+                    }
+                }
                 if self.module_config.stack.is_some() && !stack_override() {
                     for stack in [
                         tuner::Stack::Shared32,
@@ -1193,34 +1216,64 @@ impl Raytracer {
         queue: &wgpu::Queue,
         config: tuner::ModuleConfig,
     ) -> f64 {
+        // Measure the variant real frames usually settle on: primary hits from the
+        // visibility raster when there is one (it prefers other stacks than tracing them).
+        let variant = self
+            .tuner
+            .variants
+            .iter()
+            .position(|v| v.visibility_primary && self.visibility.is_some())
+            .unwrap_or(0);
         let pipeline = self
-            .trace_pipelines_for(device, config, &self.tuner.variants[..1])
+            .trace_pipelines_for(device, config, &self.tuner.variants[variant..=variant])
             .remove(0);
+        if self.tuner.variants[variant].visibility_primary
+            && let Some(visibility) = &self.visibility
+        {
+            visibility.set_frame(queue, frame_jitter(self.frame_number));
+            let planes = GpuCamera::new(
+                &self.latest_render_params.camera,
+                self.latest_render_params.viewport_size,
+            )
+            .frustum_planes();
+            let mut encoder = device.create_command_encoder(&Default::default());
+            visibility.raster(
+                &mut encoder,
+                &self.parameter_bind_group,
+                &self.scene_bind_group,
+                &planes,
+            );
+            queue.submit([encoder.finish()]);
+        }
+        // Frames are queued back to back and read once at the end: waiting after each
+        // frame let the GPU idle, and power-managed GPUs (the Steam Deck) drop their
+        // clock in the gaps, so timings measured the clock, not the configuration.
+        const FRAMES: u32 = 24;
         let query = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: None,
             ty: wgpu::QueryType::Timestamp,
-            count: 2,
+            count: 2 * FRAMES,
         });
+        let bytes = 16 * u64::from(FRAMES);
         let resolve = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: 16,
+            size: bytes,
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let read = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: 16,
+            size: bytes,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         let (width, height) = self.latest_render_params.viewport_size;
-        let mut times = Vec::new();
-        for frame in 0..12 {
+        for frame in 0..FRAMES {
             // Keep tracing one sample per frame: never reach the sample target.
             self.render_progress.reset();
             self.prepare_frame(queue);
             let mut encoder = device.create_command_encoder(&Default::default());
-            encoder.write_timestamp(&query, 0);
+            encoder.write_timestamp(&query, 2 * frame);
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("calibration"),
@@ -1240,26 +1293,29 @@ impl Raytracer {
                     1,
                 );
             }
-            encoder.write_timestamp(&query, 1);
-            encoder.resolve_query_set(&query, 0..2, &resolve, 0);
-            encoder.copy_buffer_to_buffer(&resolve, 0, &read, 0, 16);
+            encoder.write_timestamp(&query, 2 * frame + 1);
             queue.submit([encoder.finish()]);
-            read.slice(..)
-                .map_async(wgpu::MapMode::Read, |r| r.unwrap());
-            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-            {
-                let data = read.slice(..).get_mapped_range().unwrap();
-                let ticks: &[u64] = bytemuck::cast_slice(&data);
-                if frame >= 2 {
-                    times.push(
-                        ticks[1].wrapping_sub(ticks[0]) as f64
-                            * f64::from(queue.get_timestamp_period())
-                            / 1e6,
-                    );
-                }
-            }
-            read.unmap();
         }
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.resolve_query_set(&query, 0..2 * FRAMES, &resolve, 0);
+        encoder.copy_buffer_to_buffer(&resolve, 0, &read, 0, bytes);
+        queue.submit([encoder.finish()]);
+        read.slice(..)
+            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let mut times: Vec<f64> = {
+            let data = read.slice(..).get_mapped_range().unwrap();
+            let ticks: &[u64] = bytemuck::cast_slice(&data);
+            // The first frames warm caches (and clocks).
+            (4..FRAMES as usize)
+                .map(|f| {
+                    ticks[2 * f + 1].wrapping_sub(ticks[2 * f]) as f64
+                        * f64::from(queue.get_timestamp_period())
+                        / 1e6
+                })
+                .collect()
+        };
+        read.unmap();
         times.sort_by(f64::total_cmp);
         times[times.len() / 2]
     }
@@ -2022,6 +2078,8 @@ fn build_trace_pipelines(
                     }
                     "VIS_PRIMARY" => (name, f64::from(variant.visibility_primary)),
                     "TRACE_WIDTH" => (name, f64::from(config.workgroup[0])),
+                    "HW_CLOSEST" => (name, f64::from(config.hw.closest())),
+                    "HW_SHADOWS" => (name, f64::from(config.hw.shadows())),
                     "TRACE_HEIGHT" => (name, f64::from(config.workgroup[1])),
                     _ => (name, value),
                 })
@@ -2091,7 +2149,17 @@ fn default_module_config() -> tuner::ModuleConfig {
     let workgroup = trace_workgroup_size();
     let stack = (mesh::quad_bvh() && !stack_override() && workgroup[0] * workgroup[1] == 64)
         .then_some(tuner::Stack::Shared32);
-    tuner::ModuleConfig { stack, workgroup }
+    // RT_HW_MODE=closest|shadows|compute fixes the hardware query split (experiments).
+    let hw = match std::env::var("RT_HW_MODE").as_deref() {
+        Ok("shadows") => tuner::HwRays::Shadows,
+        Ok("compute") => tuner::HwRays::Compute,
+        _ => tuner::HwRays::All,
+    };
+    tuner::ModuleConfig {
+        stack,
+        workgroup,
+        hw,
+    }
 }
 
 fn mesh_source(config: tuner::ModuleConfig) -> String {
@@ -2219,11 +2287,10 @@ fn trace_variants(device: &wgpu::Device, scene: &Scene) -> Vec<tuner::Variant> {
     } else {
         &[Cones::Primary, Cones::All]
     };
-    // The visibility hook is in the 4-wide BVH query; hardware ray queries bypass it.
+    // The visibility hook serves the 4-wide BVH query and hardware closest-hit queries.
     let available = device.features().contains(wgpu::Features::PRIMITIVE_INDEX)
         && !scene.mesh.triangles.is_empty()
-        && mesh::quad_bvh()
-        && !mesh::hw_rt();
+        && mesh::quad_bvh();
     let primary: &[bool] = if crate::has_flag("--visibility-primary") {
         assert!(
             available,

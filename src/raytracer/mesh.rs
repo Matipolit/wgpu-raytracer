@@ -1475,7 +1475,9 @@ impl Mesh {
         {
             // Shader-tested: one-sided, alpha-masked or transmissive (shadow rays pass).
             let flags = self.materials[tri.material as usize][11];
-            lists[usize::from(flags & 11 != 1)].push(index as u32);
+            // RT_HW_OPAQUE: everything opaque (an experiment measuring the alpha tests).
+            let shaded = flags & 11 != 1 && std::env::var_os("RT_HW_OPAQUE").is_none();
+            lists[usize::from(shaded)].push(index as u32);
         }
         lists
     }

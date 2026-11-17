@@ -329,6 +329,35 @@ pub struct ModuleConfig {
     /// None: not the 4-wide BVH (or a stack experiment set through RT_* variables).
     pub stack: Option<Stack>,
     pub workgroup: [u32; 2],
+    /// With `--hw-rt`: which queries use the RT hardware (raytracer.wgsl HW_CLOSEST,
+    /// HW_SHADOWS); calibration picks the fastest per GPU and scene.
+    pub hw: HwRays,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HwRays {
+    /// The compute BVH for every query.
+    Compute,
+    /// Hardware for shadow (any-hit) rays, compute for closest hits.
+    Shadows,
+    /// Hardware for every query.
+    All,
+}
+
+impl HwRays {
+    pub fn closest(self) -> bool {
+        self == Self::All
+    }
+    pub fn shadows(self) -> bool {
+        self != Self::Compute
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Compute => "compute",
+            Self::Shadows => "hwshadows",
+            Self::All => "hwall",
+        }
+    }
 }
 
 impl ModuleConfig {
@@ -339,11 +368,22 @@ impl ModuleConfig {
             Some(Stack::Registers16) => "registers16",
             Some(Stack::Private64) => "private64",
         };
-        format!("{stack} {}x{}", self.workgroup[0], self.workgroup[1])
+        format!(
+            "{stack} {}x{} {}",
+            self.workgroup[0],
+            self.workgroup[1],
+            self.hw.name()
+        )
     }
 
     fn decode(text: &str) -> Option<Self> {
-        let (stack, size) = text.trim().split_once(' ')?;
+        let mut fields = text.split_whitespace();
+        let (stack, size) = (fields.next()?, fields.next()?);
+        let hw = match fields.next().unwrap_or("hwall") {
+            "compute" => HwRays::Compute,
+            "hwshadows" => HwRays::Shadows,
+            _ => HwRays::All,
+        };
         let stack = match stack {
             "none" => None,
             "shared32" => Some(Stack::Shared32),
@@ -355,6 +395,7 @@ impl ModuleConfig {
         Some(Self {
             stack,
             workgroup: [x.parse().ok()?, y.parse().ok()?],
+            hw,
         })
     }
 }

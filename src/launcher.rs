@@ -517,9 +517,11 @@ impl winit::application::ApplicationHandler for LauncherApp {
                 } else {
                     s.apply_preset(Preset::Medium, &models);
                 }
-                // Off by default: slower than the compute tracer on the Deck (2.5x) and
-                // on the RTX (Bistro day 28 vs 22 ms); opt in per machine.
-                s.hw_rt = false;
+                // With hardware RT on, the startup calibration still picks compute,
+                // hardware shadows or hardware for all rays per GPU and scene. On the
+                // Deck it is never faster (RDNA2 traverses in the shader), so the
+                // structure is not even built there by default.
+                s.hw_rt = context.ray_query && !handheld();
                 s
             },
             Settings::parse,
@@ -859,7 +861,7 @@ fn graphics(
     ui.end_row();
     ui.label("Hardware ray tracing");
     let note = if ray_query {
-        "usually slower than the compute tracer"
+        "used where calibration finds it faster"
     } else {
         "not supported"
     };

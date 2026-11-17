@@ -153,6 +153,10 @@ override QUAD_BVH:bool=false;
 override OCT_BVH:bool=false;
 // Hardware ray queries (--hw-rt); see hwrt.wgsl.
 override HW_RT:bool=false;
+// With HW_RT: which queries use the hardware structure (the others traverse the
+// compute BVH, which is built too): closest hits, shadow (any-hit) rays.
+override HW_CLOSEST:bool=true;
+override HW_SHADOWS:bool=true;
 override HW_FLIP_FACING:bool=false;
 override QUAD_CULL:bool=false;
 override QUAD_LEAF_COUNT:bool=false;

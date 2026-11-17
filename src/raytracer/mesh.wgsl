@@ -235,9 +235,12 @@ fn meshTriangle(ray: Ray, index: u32, tmax: f32, outHit: ptr<function, Intersect
     return true;
 }
 fn meshIntersection(ray: Ray, outHit: ptr<function, Intersection>, tmax: f32) -> bool {
-    if HW_RT {
+    if HW_RT && HW_CLOSEST {
         var best=MeshCandidate();
-        var found=meshHwCandidate(ray,tmax,false,&best);
+        var found:bool;
+        // Primary hits from the visibility raster (VIS_PRIMARY) in hardware mode too.
+        if VIS_PRIMARY && visibilityPending {visibilityPending=false;found=visibilityCandidate(ray,tmax,&best);}
+        else {found=meshHwCandidate(ray,tmax,false,&best);}
         found=meshInstanceCandidate(ray,select(tmax,best.t,found),false,&best) || found;
         if !found {return false;}
         *outHit=meshResolve(ray,best);
@@ -330,7 +333,7 @@ fn scatterPbr(inRay: Ray, hit: Intersection, rng: ptr<function,u32>) -> Scatter 
 
 // Shadow queries stop on the first accepted surface; cutout tests stay in meshCandidate.
 fn meshOccluded(ray: Ray, limit: f32) -> bool {
-    if HW_RT{var ignored=MeshCandidate();return meshHwCandidate(ray,limit,true,&ignored) || meshInstanceCandidate(ray,limit,true,&ignored);}
+    if HW_RT && HW_SHADOWS{var ignored=MeshCandidate();return meshHwCandidate(ray,limit,true,&ignored) || meshInstanceCandidate(ray,limit,true,&ignored);}
     if QUAD_BVH{
         var ignored=MeshCandidate();
         return meshQuadCandidate(ray,limit,true,&ignored,0u) || meshInstanceCandidate(ray,limit,true,&ignored);
