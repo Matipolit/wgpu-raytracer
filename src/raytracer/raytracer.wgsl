@@ -89,7 +89,7 @@ override DENOISER_INPUT: bool = false;
 // frames (temporal reuse along motion) and borrow from previous-frame neighbours
 // (spatial reuse), so each pixel effectively weighs hundreds of lamp candidates.
 override RESTIR: bool = false;
-override RESTIR_SPATIAL: u32 = 3u;
+override RESTIR_SPATIAL: u32 = 6u;
 override RESTIR_RADIUS: f32 = 16.;
 override RESTIR_CAP: f32 = 20.;
 // Reservoirs: two frames (parity) x pixels x 3 vec2<u32>: (triangle, barycentrics

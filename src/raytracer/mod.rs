@@ -630,7 +630,7 @@ impl Raytracer {
             // Experiments: RT_RESTIR_SPATIAL, RT_RESTIR_RADIUS, RT_RESTIR_CAP.
             (
                 "RESTIR_SPATIAL",
-                std::env::var("RT_RESTIR_SPATIAL").map_or(3., |v| v.parse().unwrap()),
+                std::env::var("RT_RESTIR_SPATIAL").map_or(6., |v| v.parse().unwrap()),
             ),
             (
                 "RESTIR_RADIUS",
