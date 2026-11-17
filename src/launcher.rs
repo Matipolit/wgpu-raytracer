@@ -389,21 +389,36 @@ fn settings_path() -> Option<PathBuf> {
     Some(config.join("wgpu-raytracer/launcher.txt"))
 }
 
-/// Starts the renderer (this executable) with `args` from the repository root.
+/// Starts the renderer (this executable) with `args` from the repository root. On
+/// Unix the process replaces itself (the terminal, Ctrl+C and Steam keep tracking it);
+/// elsewhere it starts a child process. Returns only if that failed or on spawn.
 pub fn relaunch(args: &[String]) {
     let exe = std::env::current_exe().expect("current executable");
     println!("launching: {} {}", exe.display(), args.join(" "));
-    if let Err(error) = std::process::Command::new(exe)
-        .args(args)
-        .current_dir(root())
-        .spawn()
+    let mut command = std::process::Command::new(exe);
+    command.args(args).current_dir(root());
+    #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
+        let error = command.exec();
+        eprintln!("cannot start the renderer: {error}");
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = command.spawn() {
         eprintln!("cannot start the renderer: {error}");
     }
 }
 
-const RESOLUTIONS: [(u32, u32); 6] = [
+/// Running in Steam's Game Mode / on a Steam Deck (gamescope session).
+fn handheld() -> bool {
+    std::env::var_os("SteamDeck").is_some()
+        || std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.eq_ignore_ascii_case("gamescope"))
+        || std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some()
+}
+
+const RESOLUTIONS: [(u32, u32); 7] = [
     (960, 540),
+    (1280, 800),
     (1280, 720),
     (1600, 900),
     (1920, 1080),
@@ -421,12 +436,16 @@ const RENDER_SCALES: [(f32, &str); 5] = [
 pub fn run() {
     let event_loop = winit::event_loop::EventLoop::new().expect("event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
-    let mut app = LauncherApp { state: None };
+    let mut app = LauncherApp {
+        state: None,
+        gamepad: crate::gamepad::Gamepad::new(),
+    };
     event_loop.run_app(&mut app).expect("event loop failed");
 }
 
 struct LauncherApp {
     state: Option<LauncherState>,
+    gamepad: crate::gamepad::Gamepad,
 }
 
 struct LauncherState {
@@ -439,6 +458,8 @@ struct LauncherState {
     scenes: Vec<SceneEntry>,
     models: Vec<String>,
     gpu_name: String,
+    /// Controller A: launch at the next redraw.
+    launch_requested: bool,
     _display_handle: winit::event_loop::OwnedDisplayHandle,
 }
 
@@ -477,7 +498,14 @@ impl winit::application::ApplicationHandler for LauncherApp {
         let mut settings = saved.as_deref().map_or_else(
             || {
                 let mut s = Settings::default();
-                s.apply_preset(Preset::Medium, &models);
+                if handheld() {
+                    // Steam Deck class: native 1280x800, fullscreen, cheapest preset.
+                    s.apply_preset(Preset::Low, &models);
+                    (s.size, s.fullscreen) = ((1280, 800), true);
+                    s.scene = "Sponza atrium".to_owned();
+                } else {
+                    s.apply_preset(Preset::Medium, &models);
+                }
                 s.hw_rt = context.ray_query;
                 s
             },
@@ -508,6 +536,7 @@ impl winit::application::ApplicationHandler for LauncherApp {
             scenes,
             models,
             gpu_name,
+            launch_requested: false,
             _display_handle: display,
         });
     }
@@ -553,6 +582,52 @@ impl winit::application::ApplicationHandler for LauncherApp {
         }
     }
 
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        // Controller: D-pad up/down scene, left/right preset, A launches, B quits.
+        let pad = self.gamepad.poll();
+        if let Some(state) = &mut self.state
+            && !pad.pressed.is_empty()
+        {
+            let names: Vec<&str> = state.scenes.iter().map(|s| s.name.as_str()).collect();
+            let scene = names
+                .iter()
+                .position(|n| *n == state.settings.scene)
+                .unwrap_or(0);
+            let preset = Preset::ALL
+                .iter()
+                .position(|p| *p == state.settings.preset)
+                .unwrap_or(0);
+            for button in &pad.pressed {
+                use gilrs::Button;
+                match button {
+                    Button::DPadUp => {
+                        state.settings.scene =
+                            names[(scene + names.len() - 1) % names.len()].to_owned();
+                    }
+                    Button::DPadDown => {
+                        state.settings.scene = names[(scene + 1) % names.len()].to_owned();
+                    }
+                    Button::DPadLeft | Button::DPadRight => {
+                        let step = if *button == Button::DPadLeft {
+                            Preset::ALL.len() - 1
+                        } else {
+                            1
+                        };
+                        let next = Preset::ALL[(preset + step) % Preset::ALL.len()];
+                        state.settings.apply_preset(next, &state.models);
+                    }
+                    Button::South => state.launch_requested = true,
+                    Button::East => event_loop.exit(),
+                    _ => {}
+                }
+            }
+            state.window.request_redraw();
+        }
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            std::time::Instant::now() + std::time::Duration::from_millis(30),
+        ));
+    }
+
     fn exiting(&mut self, _: &winit::event_loop::ActiveEventLoop) {
         self.state = None;
     }
@@ -577,7 +652,7 @@ impl LauncherState {
             }
         };
         let input = self.egui_state.take_egui_input(&self.window);
-        let mut launch = false;
+        let mut launch = std::mem::take(&mut self.launch_requested);
         let (settings, scenes, models) = (&mut self.settings, &self.scenes, &self.models);
         let (gpu, ray_query) = (&self.gpu_name, self.context.ray_query);
         let mut output = self.gui.run_ui(input, |ui| {
@@ -683,6 +758,11 @@ fn draw(
             ui.small(
                 "In the renderer: hold the right mouse button to look, WASD to move, Q/E \
                  down/up; \"Back to launcher\" is in the parameter panel.",
+            );
+            ui.small(
+                "Controller: D-pad scene/preset, A launch, B quit. In the renderer: sticks \
+                 move/look, triggers down/up, L1/R1 slower/faster, Select hides the panel, \
+                 Start returns here.",
             );
         });
     });

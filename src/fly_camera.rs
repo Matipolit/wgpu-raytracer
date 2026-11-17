@@ -120,6 +120,28 @@ impl FlyCameraController {
         }
     }
 
+    /// Controller look and movement for one frame: `look` turns at up to 150°/s
+    /// (x right, y up), `movement` (x right, y forward) and `vertical` move at up to
+    /// `distance` per frame along the view.
+    pub fn apply_gamepad(
+        &mut self,
+        look: [f32; 2],
+        movement: [f32; 2],
+        vertical: f32,
+        dt: f32,
+        distance: f32,
+    ) {
+        let turn = 150_f32.to_radians() * dt;
+        self.yaw = self.yaw + Angle::radians(look[0] * turn);
+        self.pitch = (self.pitch + Angle::radians(look[1] * turn))
+            .clamp(Angle::degrees(-89.0), Angle::degrees(89.0));
+        let orientation = camera_orientation(self);
+        self.position += distance
+            * (orientation.right * movement[0]
+                + orientation.forward * movement[1]
+                + orientation.up * vertical);
+    }
+
     pub fn after_events(&mut self, viewport_size: (u32, u32), translation_scale: f32) {
         if self.look_pressed {
             if let Some(prev_mouse_pos) = self.previous_mouse_pos {

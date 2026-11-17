@@ -9,6 +9,10 @@ pub struct Gui {
     input_geometry: (Option<egui::Rect>, Option<f32>, bool),
     /// Set by the "Back to launcher" button.
     pub back_to_launcher: bool,
+    /// The parameter panel is not drawn (controller Select).
+    pub hidden: bool,
+    /// `hidden` as of the last UI frame (a toggle forces a new frame).
+    drawn_hidden: bool,
 }
 
 struct UiFrame {
@@ -26,6 +30,8 @@ impl Gui {
             next_repaint: Instant::now(),
             input_geometry: (None, None, false),
             back_to_launcher: false,
+            hidden: false,
+            drawn_hidden: false,
         }
     }
 
@@ -48,6 +54,7 @@ impl Gui {
         );
         if self.frame.is_some()
             && input.events.is_empty()
+            && !self.hidden_changed()
             && geometry == self.input_geometry
             && now < self.next_repaint
             && !self.context.has_requested_repaint()
@@ -56,8 +63,12 @@ impl Gui {
         }
         self.input_geometry = geometry;
         let mut back = false;
+        let hidden = self.hidden;
+        self.drawn_hidden = hidden;
         let output = self.context.run_ui(input, |ui| {
-            back = draw_controls(ui.ctx(), params, camera, fps, progress);
+            if !hidden {
+                back = draw_controls(ui.ctx(), params, camera, fps, progress);
+            }
         });
         self.back_to_launcher |= back;
         // Scene rendering continues independently. Status labels update at 10 Hz;
@@ -68,6 +79,10 @@ impl Gui {
             .map_or(Duration::ZERO, |viewport| viewport.repaint_delay);
         self.next_repaint = now + delay.min(Duration::from_millis(100));
         Some(output)
+    }
+
+    fn hidden_changed(&self) -> bool {
+        self.hidden != self.drawn_hidden
     }
 
     /// One UI frame with no repaint throttling (the launcher).

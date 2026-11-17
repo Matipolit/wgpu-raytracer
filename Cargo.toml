@@ -20,3 +20,4 @@ gltf = { version = "1.4.1", features = ["KHR_materials_emissive_strength", "KHR_
 
 half = "2.7.1"
 texpresso = "2.0.2"
+gilrs = "0.11"

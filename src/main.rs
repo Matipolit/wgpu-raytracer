@@ -22,6 +22,7 @@ use winit::{
 mod benchmark;
 mod capture;
 mod fly_camera;
+mod gamepad;
 mod gui;
 mod launcher;
 mod offline;
@@ -214,6 +215,7 @@ struct AppState {
     render_params: RenderParams,
     last_time: Instant,
     fps_counter: FpsCounter,
+    gamepad: gamepad::Gamepad,
     _display_handle: OwnedDisplayHandle,
 }
 
@@ -276,6 +278,7 @@ impl AppState {
             egui_state,
             last_time: Instant::now(),
             fps_counter: FpsCounter::new(),
+            gamepad: gamepad::Gamepad::new(),
             _display_handle: display_handle,
         }
     }
@@ -337,6 +340,25 @@ impl AppState {
             self.render_params.viewport_size,
             self.move_speed * dt.as_secs_f32(),
         );
+        // Controller: sticks move and look, triggers up/down, L1/R1 slower/faster,
+        // Select hides the panel, Start returns to the launcher.
+        let pad = self.gamepad.poll();
+        self.fly_camera_controller.apply_gamepad(
+            pad.look,
+            pad.movement,
+            pad.vertical,
+            dt.as_secs_f32().min(0.1),
+            self.move_speed * dt.as_secs_f32().min(0.1),
+        );
+        for button in pad.pressed {
+            match button {
+                gilrs::Button::LeftTrigger => self.move_speed *= 0.5,
+                gilrs::Button::RightTrigger => self.move_speed *= 2.,
+                gilrs::Button::Select => self.gui.hidden = !self.gui.hidden,
+                gilrs::Button::Start => self.gui.back_to_launcher = true,
+                _ => {}
+            }
+        }
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let mut output = self.gui.run(
             raw_input,
