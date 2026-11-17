@@ -95,8 +95,29 @@ async fn capture() {
 
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     let mut scene = crate::selected_scene();
+    // `--objects N`: N moving triangle objects (procedural shapes, random materials)
+    // instead of the analytic spheres. `--fast-fraction F`: that share of sequences are
+    // fast-motion edge cases (fast camera, fast objects, or both). Both default off, and
+    // then draw no random numbers, so older captures stay reproducible (--low-only).
+    let objects: u32 = number("--objects", 0);
+    let fast_fraction: f32 = number("--fast-fraction", 0.);
+    for i in 0..objects as usize {
+        let color = [
+            rng.range(0.05, 0.95),
+            rng.range(0.05, 0.95),
+            rng.range(0.05, 0.95),
+        ];
+        let metallic = if rng.next() < 0.3 { 1. } else { 0. };
+        let roughness = rng.range(0.05, 0.9);
+        let (vertices, triangles) = crate::shapes::shape(i + seed as usize);
+        scene.mesh.append_object(
+            vertices,
+            triangles,
+            crate::raytracer::mesh::plain_material(color, metallic, roughness),
+        );
+    }
     // Fixed per run: the material list and sphere count are pipeline constants.
-    for i in 0..SPHERES {
+    for i in 0..if objects > 0 { 0 } else { SPHERES } {
         let color = glm::vec3(
             rng.range(0.1, 0.95),
             rng.range(0.1, 0.95),
@@ -249,10 +270,27 @@ async fn capture() {
             Some((lo, hi)) => (lo.ln() + rng.next() * (hi.ln() - lo.ln())).exp(),
             None => motion_scale,
         };
+        // Fast-motion edge cases: camera (x4-6), objects (x5-8), or both.
+        let (camera_fast, object_fast) = if fast_fraction > 0. && rng.next() < fast_fraction {
+            let kind = rng.next();
+            let camera = if kind < 2. / 3. {
+                rng.range(4., 6.)
+            } else {
+                1.
+            };
+            let object = if kind > 1. / 3. {
+                rng.range(5., 8.)
+            } else {
+                1.
+            };
+            (camera, object)
+        } else {
+            (1., 1.)
+        };
         let speed = if still {
             0.
         } else {
-            motion * scale * rng.range(0., 0.2)
+            motion * scale * rng.range(0., 0.2) * camera_fast
         };
         let velocity = {
             let mut d = rng.unit();
@@ -263,8 +301,8 @@ async fn capture() {
             (0., 0.)
         } else {
             (
-                motion * rng.range(-0.05, 0.05),
-                motion * rng.range(-0.015, 0.015),
+                motion * rng.range(-0.05, 0.05) * camera_fast,
+                motion * rng.range(-0.015, 0.015) * camera_fast,
             )
         };
         let forward = |yaw: f32, pitch: f32| {
@@ -285,8 +323,22 @@ async fn capture() {
                 + start_right * scale * rng.range(-2., 2.)
                 + up * scale * rng.range(-0.6, 0.8);
             *sphere = Sphere::new(center, radius, sphere_material(sphere));
-            sphere_velocity.push(rng.unit() * motion * scale * rng.range(0., 0.15));
+            sphere_velocity.push(rng.unit() * motion * scale * rng.range(0., 0.15) * object_fast);
         }
+        // Moving objects: placed like the spheres, random size, orientation, velocity and spin.
+        let mut movers: Vec<Mover> = (0..objects)
+            .map(|_| Mover {
+                position: eye
+                    + start_dir * scale * rng.range(1.5, 5.)
+                    + start_right * scale * rng.range(-2., 2.)
+                    + up * scale * rng.range(-0.6, 0.8),
+                rotation: glm::rotation(rng.range(0., std::f32::consts::TAU), &rng.unit()),
+                size: scale * rng.range(0.3, 0.9),
+                velocity: rng.unit() * motion * scale * rng.range(0., 0.15) * object_fast,
+                axis: rng.unit(),
+                spin: motion * rng.range(0., 0.2) * object_fast.min(4.),
+            })
+            .collect();
         for frame in 0..frames {
             params.camera.eye_pos = eye;
             params.camera.eye_dir = forward(yaw, pitch);
@@ -294,6 +346,12 @@ async fn capture() {
             if !low_only {
                 tracer.set_render_params(&device, &queue, &params).unwrap();
                 tracer.set_spheres(&queue, &spheres);
+                if objects > 0 {
+                    tracer.set_objects(
+                        &queue,
+                        &movers.iter().map(Mover::transform).collect::<Vec<_>>(),
+                    );
+                }
                 // Noisy 1-spp frame and its guides.
                 params.sampling.num_samples_per_pixel = 1;
                 tracer.set_render_params(&device, &queue, &params).unwrap();
@@ -354,6 +412,12 @@ async fn capture() {
                     .set_render_params(&device, &queue, &low.params)
                     .unwrap();
                 low.tracer.set_spheres(&queue, &spheres);
+                if objects > 0 {
+                    low.tracer.set_objects(
+                        &queue,
+                        &movers.iter().map(Mover::transform).collect::<Vec<_>>(),
+                    );
+                }
                 render(&device, &queue, &mut low.tracer, 1);
                 low.jitters.push(low.tracer.last_frame_jitter());
                 let noisy = low.tracer.read_radiance(&device, &queue);
@@ -387,6 +451,10 @@ async fn capture() {
             pitch = (pitch + pitch_rate).clamp(-1.2, 1.2);
             for (sphere, v) in spheres.iter_mut().zip(&sphere_velocity) {
                 sphere.set_center(sphere.center() + v);
+            }
+            for mover in &mut movers {
+                mover.position += mover.velocity;
+                mover.rotation = glm::rotation(mover.spin, &mover.axis) * mover.rotation;
             }
         }
         if !lows.is_empty() {
@@ -448,6 +516,24 @@ async fn capture() {
         ),
     )
     .unwrap();
+}
+
+/// A moving object's state in a sequence (per frame: position += velocity, spin about axis).
+struct Mover {
+    position: glm::Vec3,
+    rotation: glm::Mat4,
+    size: f32,
+    velocity: glm::Vec3,
+    axis: glm::Vec3,
+    spin: f32,
+}
+
+impl Mover {
+    fn transform(&self) -> glm::Mat4 {
+        glm::translation(&self.position)
+            * self.rotation
+            * glm::scaling(&glm::vec3(self.size, self.size, self.size))
+    }
 }
 
 /// A low-resolution tracer of --upscale-capture and its crop.

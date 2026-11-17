@@ -38,6 +38,46 @@ pub struct BvhNode {
     pub count: u32,
 }
 
+/// A rigid moving object (see `Mesh::append_object`): its triangles follow the scene's,
+/// its own BVH (leaf triangle indices global) is packed after the scene's, and its
+/// per-frame transform comes from the renderer's instance buffer.
+pub struct MeshObject {
+    pub nodes: Vec<BvhNode>,
+    /// Object-space bounds.
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub first_triangle: u32,
+}
+
+impl MeshVertex {
+    pub fn new(position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> Self {
+        Self {
+            position,
+            _pad0: 0.,
+            normal,
+            _pad1: 0.,
+            uv0: uv,
+            uv1: [0.; 2],
+            tangent: [0.; 4],
+        }
+    }
+}
+
+/// Untextured, double-sided metallic/roughness material words (see import_material).
+pub fn plain_material(color: [f32; 3], metallic: f32, roughness: f32) -> [u32; 48] {
+    let mut words = [0u32; 48];
+    words[..4].copy_from_slice(&[color[0], color[1], color[2], 1.].map(f32::to_bits));
+    words[7] = metallic.to_bits();
+    words[8] = roughness.to_bits();
+    words[9] = 1f32.to_bits();
+    words[10] = 0.5f32.to_bits();
+    words[11] = 1;
+    for slot in super::gpu_textures::SLOTS {
+        words[slot] = u32::MAX;
+    }
+    words
+}
+
 #[derive(Default)]
 pub struct Mesh {
     pub vertices: Vec<MeshVertex>,
@@ -49,6 +89,8 @@ pub struct Mesh {
     pub camera: Option<Camera>,
     pub depth: usize,
     pub opacity_cells: Vec<u32>,
+    /// Rigid moving objects after the scene's triangles (instance i = object i).
+    pub objects: Vec<MeshObject>,
 }
 
 type LoadResult<T> = Result<T, Box<dyn Error>>;
@@ -433,6 +475,59 @@ fn wide_node(mesh: &Mesh, index: usize, width: usize, words: &mut Vec<u32>) -> u
 }
 
 impl Mesh {
+    /// Add a rigid moving object (geometry in object space, one material). Its BVH is
+    /// built on its own (same builder and options as the scene) and traversed after the
+    /// scene's with the ray in object space. Needs the 4-wide BVH.
+    pub fn append_object(
+        &mut self,
+        vertices: Vec<MeshVertex>,
+        triangles: Vec<[u32; 3]>,
+        material: [u32; 48],
+    ) {
+        assert!(quad_bvh(), "moving objects need --quad-bvh (or --fastest)");
+        let mut object = Mesh {
+            vertices,
+            triangles: triangles
+                .iter()
+                .map(|&vertices| Triangle {
+                    vertices,
+                    material: 0,
+                })
+                .collect(),
+            materials: vec![material],
+            ..Default::default()
+        };
+        object.build_bvh();
+        let (vertex_offset, triangle_offset) =
+            (self.vertices.len() as u32, self.triangles.len() as u32);
+        let material = self.materials.len() as u32;
+        self.vertices.extend(&object.vertices);
+        self.triangles
+            .extend(object.triangles.iter().map(|t| Triangle {
+                vertices: t.vertices.map(|v| v + vertex_offset),
+                material,
+            }));
+        self.materials.push(object.materials[0]);
+        let mut nodes = object.nodes;
+        for node in nodes.iter_mut().filter(|n| n.count != 0) {
+            node.first += triangle_offset;
+        }
+        let (min, max) = (nodes[0].min, nodes[0].max);
+        self.objects.push(MeshObject {
+            nodes,
+            min,
+            max,
+            first_triangle: triangle_offset,
+        });
+    }
+
+    /// Triangles of the static scene (moving objects' triangles follow them).
+    pub fn scene_triangle_count(&self) -> usize {
+        self.objects
+            .first()
+            .map_or(self.triangles.len(), |o| o.first_triangle as usize)
+    }
+
     pub fn load(path: &Path) -> LoadResult<Self> {
         use std::hash::{Hash, Hasher};
         let cache = if option("--scene-cache") && option("--sponza") {
@@ -754,6 +849,7 @@ impl Mesh {
     pub fn gpu_words(&self, sphere_count: u32, light_count: u32) -> Vec<u32> {
         // Header, nodes (8), triangles (4), vertices (16), materials (48), texture descriptors (4).
         let mut words = vec![0; 16];
+        let mut object_roots: Vec<u32> = Vec::new();
         words[0] = self.nodes.len() as u32;
         words[1] = self.triangles.len() as u32;
         words[6] = sphere_count;
@@ -763,10 +859,31 @@ impl Mesh {
         } else if quad_bvh() && !self.nodes.is_empty() {
             let records = quad_records(&self.nodes);
             if quad_q8() {
+                assert!(
+                    self.objects.is_empty(),
+                    "moving objects do not support RT_QUAD_Q8"
+                );
                 words.extend(quantize_quad(&records));
             } else {
                 words.extend(records);
             }
+            // Moving objects' BVHs follow, child record references offset; their roots
+            // are listed at header word 15.
+            let mut roots = Vec::new();
+            for object in &self.objects {
+                let base = ((words.len() - 16) / 32) as u32;
+                let mut records = quad_records(&object.nodes);
+                for record in records.chunks_exact_mut(32) {
+                    for reference in &mut record[24..28] {
+                        if *reference & PAIR_LEAF == 0 {
+                            *reference += base;
+                        }
+                    }
+                }
+                roots.push(base);
+                words.extend(records);
+            }
+            object_roots = roots;
         } else if pair_bvh() && !self.nodes.is_empty() {
             words.extend(pair_records(&self.nodes));
         } else if bvh_width() > 2 && !self.nodes.is_empty() {
@@ -876,7 +993,13 @@ impl Mesh {
         }
         // Pair traversal walks a leaf's triangles until the one flagged last (bit 2).
         let mut leaf_last = vec![false; self.triangles.len()];
-        for node in self.nodes.iter().filter(|n| n.count != 0) {
+        let object_nodes = self.objects.iter().flat_map(|o| &o.nodes);
+        for node in self
+            .nodes
+            .iter()
+            .chain(object_nodes)
+            .filter(|n| n.count != 0)
+        {
             leaf_last[(node.first + node.count - 1) as usize] = true;
         }
         for (index, tri) in self.triangles.iter().enumerate() {
@@ -915,6 +1038,10 @@ impl Mesh {
             words.extend(opaque);
             words[5] = words.len() as u32;
             words.extend(shaded);
+        }
+        if !object_roots.is_empty() {
+            words[15] = words.len() as u32;
+            words.extend(&object_roots);
         }
         if !self.opacity_cells.is_empty() {
             words[10] = words.len() as u32;
@@ -1052,7 +1179,10 @@ impl Mesh {
     pub fn visibility_triangles(&self) -> [Vec<u32>; 3] {
         let mut seen = std::collections::HashSet::new();
         let mut lists = [Vec::new(), Vec::new(), Vec::new()];
-        for (index, tri) in self.triangles.iter().enumerate() {
+        for (index, tri) in self.triangles[..self.scene_triangle_count()]
+            .iter()
+            .enumerate()
+        {
             if !seen.insert((tri.vertices, tri.material)) {
                 continue;
             }
@@ -1071,7 +1201,10 @@ impl Mesh {
 
     pub fn hw_geometry_triangles(&self) -> [Vec<u32>; 2] {
         let mut lists = [Vec::new(), Vec::new()];
-        for (index, tri) in self.triangles.iter().enumerate() {
+        for (index, tri) in self.triangles[..self.scene_triangle_count()]
+            .iter()
+            .enumerate()
+        {
             let flags = self.materials[tri.material as usize][11];
             lists[usize::from(flags & 3 != 1)].push(index as u32);
         }
@@ -1471,6 +1604,7 @@ fn decode_scene_cache(mut bytes: &[u8]) -> Option<Mesh> {
         pixels: array(&mut bytes)?,
         depth,
         opacity_cells: array(&mut bytes)?,
+        objects: Vec::new(),
         camera: Some(Camera {
             eye_pos: glm::vec3(c[0], c[1], c[2]),
             eye_dir: glm::vec3(c[3], c[4], c[5]),

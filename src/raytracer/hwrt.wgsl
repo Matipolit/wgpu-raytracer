@@ -42,6 +42,6 @@ fn meshHwCandidate(ray: Ray, limit: f32, anyHit: bool, outBest: ptr<function, Me
     }
     let h = rayQueryGetCommittedIntersection(&rq);
     if h.kind == RAY_QUERY_INTERSECTION_NONE { return false; }
-    *outBest = MeshCandidate(h.t, h.barycentrics.x, h.barycentrics.y, hwTriangle(h.geometry_index, h.primitive_index));
+    *outBest = MeshCandidate(h.t, h.barycentrics.x, h.barycentrics.y, hwTriangle(h.geometry_index, h.primitive_index), 0u);
     return true;
 }

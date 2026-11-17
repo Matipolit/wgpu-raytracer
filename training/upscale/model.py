@@ -29,30 +29,57 @@ ALBEDO, DIST, NORMAL, ROUGH, MOTION, METAL, KIND = slice(0, 3), 3, slice(4, 7), 
 LOW_RADIANCE, LOW_ALBEDO = slice(0, 3), slice(3, 6)
 FEATURES = 18
 CHANNELS = 16
+LAYERS = 2
+HALF = True
 DILATIONS = (1, 2, 4)
 HEAD = 1 + 9 * len(DILATIONS)
 
+# Quality tiers, each aimed at a class of GPU (see README.md): channels, 3x3 conv layers,
+# whether the convs run at half output resolution.
+TIERS = {
+    "tiny": dict(channels=8, layers=2, half=True),
+    "small": dict(channels=16, layers=2, half=True),
+    "medium": dict(channels=24, layers=3, half=True),
+    "large": dict(channels=48, layers=3, half=True),
+    "ultra": dict(channels=64, layers=4, half=True),
+}
 
-def configure(channels, dilations):
-    global CHANNELS, DILATIONS, HEAD
-    CHANNELS, DILATIONS = channels, tuple(dilations)
+
+def configure(channels, dilations, layers=2, half=True):
+    global CHANNELS, DILATIONS, HEAD, LAYERS, HALF
+    CHANNELS, DILATIONS, LAYERS, HALF = channels, tuple(dilations), layers, half
     HEAD = 1 + 9 * len(DILATIONS)
 
 
+def configure_from(config):
+    configure(config["channels"], config["dilations"], config.get("layers", 2), config.get("half", True))
+
+
+def macs_per_pixel():
+    """Multiply-adds of the learned layers per output pixel."""
+    convs = 9 * (FEATURES * CHANNELS + (LAYERS - 1) * CHANNELS * CHANNELS)
+    return convs / (4 if HALF else 1) + (CHANNELS + FEATURES) * HEAD
+
+
 class Net(nn.Module):
-    """Two 3x3 convs at half output resolution, a 1x1 head at full resolution."""
+    """LAYERS 3x3 convs (at half output resolution when HALF) and a 1x1 head at full
+    resolution over the conv output and the features."""
 
     def __init__(self):
         super().__init__()
-        self.c1 = nn.Conv2d(FEATURES, CHANNELS, 3, padding=1, padding_mode="replicate")
-        self.c2 = nn.Conv2d(CHANNELS, CHANNELS, 3, padding=1, padding_mode="replicate")
+        self.convs = nn.ModuleList(
+            nn.Conv2d(FEATURES if i == 0 else CHANNELS, CHANNELS, 3, padding=1, padding_mode="replicate")
+            for i in range(LAYERS)
+        )
         self.head = nn.Conv2d(CHANNELS + FEATURES, HEAD, 1)
 
     def forward(self, f):
         h, w = f.shape[-2:]
-        x = F.avg_pool2d(F.pad(f, (0, w % 2, 0, h % 2), mode="replicate"), 2)
-        x = F.relu(self.c2(F.relu(self.c1(x))))
-        x = F.interpolate(x, scale_factor=2, mode="nearest")[..., :h, :w]
+        x = F.avg_pool2d(F.pad(f, (0, w % 2, 0, h % 2), mode="replicate"), 2) if HALF else f
+        for conv in self.convs:
+            x = F.relu(conv(x))
+        if HALF:
+            x = F.interpolate(x, scale_factor=2, mode="nearest")[..., :h, :w]
         return self.head(torch.cat((x, f), 1))
 
 

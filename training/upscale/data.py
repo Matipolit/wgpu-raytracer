@@ -36,8 +36,19 @@ class Sequence:
             )
 
 
-def load(root):
-    """All complete sequences under root, grouped by scene: {scene: [Sequence]}."""
+def load(roots):
+    """All complete sequences under one or more capture roots (a list, or a comma-separated
+    string), grouped by root and scene: {"root/scene": [Sequence]}; Sequence.scene is the
+    scene name (the hold-out key)."""
+    if isinstance(roots, str):
+        roots = [r for r in roots.split(",") if r]
+    scenes = {}
+    for root in roots:
+        scenes.update({f"{pathlib.Path(root).name}/{k}": v for k, v in load_root(root).items()})
+    return scenes
+
+
+def load_root(root):
     scenes = {}
     for scene_dir in sorted(pathlib.Path(root).iterdir()):
         if not (scene_dir / "meta.json").exists():
@@ -62,8 +73,8 @@ def load(root):
 def split(scenes, holdout_scene):
     """Train: all but each scene's last two sequences; validation: those; test: holdout scene."""
     train, val, test = [], [], []
-    for name, seqs in scenes.items():
-        if name == holdout_scene:
+    for seqs in scenes.values():
+        if seqs[0].scene == holdout_scene:
             test += seqs
         else:
             train += seqs[:-2]

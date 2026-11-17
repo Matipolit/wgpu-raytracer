@@ -25,6 +25,44 @@ use std::f32::consts::*;
 pub(crate) const TRACE_WORKGROUP_SIZE: [u32; 2] = [8, 8];
 
 /// Explicit tuning override for reproducible GPU experiments; cached per process.
+/// GPU instance records (mesh.wgsl meshInstances): world-to-object, object-to-world and
+/// previous object-to-world rows, then world bounds; at least one record.
+fn instance_words(
+    current: &[glm::Mat4],
+    previous: &[glm::Mat4],
+    bounds: &[([f32; 3], [f32; 3])],
+) -> Vec<[f32; 4]> {
+    let rows = |m: &glm::Mat4| [0, 1, 2].map(|r| [m[(r, 0)], m[(r, 1)], m[(r, 2)], m[(r, 3)]]);
+    let mut words = Vec::new();
+    for ((m, p), (lo, hi)) in current.iter().zip(previous).zip(bounds) {
+        let inverse = m
+            .try_inverse()
+            .expect("object transform must be invertible");
+        words.extend(rows(&inverse));
+        words.extend(rows(m));
+        words.extend(rows(p));
+        let mut min = glm::vec3(f32::MAX, f32::MAX, f32::MAX);
+        let mut max = -min;
+        for k in 0..8 {
+            let corner = glm::vec4(
+                if k & 1 == 0 { lo[0] } else { hi[0] },
+                if k & 2 == 0 { lo[1] } else { hi[1] },
+                if k & 4 == 0 { lo[2] } else { hi[2] },
+                1.,
+            );
+            let w = m * corner;
+            min = glm::min2(&min, &w.xyz());
+            max = glm::max2(&max, &w.xyz());
+        }
+        words.push([min.x, min.y, min.z, 0.]);
+        words.push([max.x, max.y, max.z, 0.]);
+    }
+    if words.is_empty() {
+        words.push([0.; 4]);
+    }
+    words
+}
+
 /// Sub-pixel jitter of frame `frame` (Halton 2, 3), identical to raytracer.wgsl
 /// `frameJitter`: shared by the tracer (SHARED_JITTER), the visibility raster and the upscaler.
 pub(crate) fn frame_jitter(frame: u32) -> [f32; 2] {
@@ -71,6 +109,10 @@ pub struct Raytracer {
     last_camera: GpuCamera,
     sphere_buffer: wgpu::Buffer,
     sphere_prev_buffer: StorageBuffer,
+    /// Moving objects: instance buffer, object-space bounds, last transforms.
+    instance_buffer: StorageBuffer,
+    object_bounds: Vec<([f32; 3], [f32; 3])>,
+    last_object_transforms: Option<Vec<glm::Mat4>>,
     last_sphere_centers: Vec<[f32; 4]>,
     sampling_parameter_buffer: UniformBuffer,
     hw_sky_state_buffer: StorageBuffer,
@@ -238,6 +280,21 @@ impl Raytracer {
             7_u32,
             Some("previous sphere centres"),
         );
+        // Moving objects: 11 vec4 per instance (see mesh.wgsl meshInstances), identity
+        // transforms until set_objects.
+        let object_bounds: Vec<([f32; 3], [f32; 3])> =
+            scene.mesh.objects.iter().map(|o| (o.min, o.max)).collect();
+        assert!(
+            object_bounds.is_empty() || std::env::var("RT_QUAD_Q8").is_err(),
+            "moving objects need the plain 4-wide BVH"
+        );
+        let identity: Vec<glm::Mat4> = vec![glm::identity(); object_bounds.len()];
+        let instance_buffer = StorageBuffer::new_from_bytes(
+            device,
+            bytemuck::cast_slice(&instance_words(&identity, &identity, &object_bounds)),
+            9,
+            Some("moving object instances"),
+        );
         let (scene_bind_group_layout, scene_bind_group, light_count, sphere_handle) = {
             let sphere_buffer = StorageBuffer::new_from_bytes(
                 device,
@@ -337,6 +394,7 @@ impl Raytracer {
                         texture_layout,
                         sampler_layout,
                         sphere_prev_buffer.layout(scene_stages(vis_on), true),
+                        instance_buffer.layout(scene_stages(vis_on), true),
                     ][usize::from(hw_accel.is_none())..],
                     label: Some("scene layout"),
                 });
@@ -355,6 +413,7 @@ impl Raytracer {
                     resource: wgpu::BindingResource::SamplerArray(&samplers),
                 },
                 sphere_prev_buffer.binding(),
+                instance_buffer.binding(),
             ];
             if let Some(accel) = &hw_accel {
                 scene_entries.push(wgpu::BindGroupEntry {
@@ -551,6 +610,7 @@ impl Raytracer {
             };
         let trace_constants = [
             ("SPHERE_COUNT", scene.spheres.len() as f64),
+            ("INSTANCE_COUNT", scene.mesh.objects.len() as f64),
             ("LIGHT_COUNT", light_count),
             ("TRACE_MESHES", f64::from(!scene.mesh.triangles.is_empty())),
             ("TRACE_SPHERES", f64::from(!scene.spheres.is_empty())),
@@ -865,6 +925,9 @@ impl Raytracer {
             last_camera: initial_camera,
             sphere_buffer: sphere_handle,
             sphere_prev_buffer,
+            instance_buffer,
+            object_bounds,
+            last_object_transforms: None,
             last_sphere_centers: sphere_prev_centers,
             sampling_parameter_buffer,
             hw_sky_state_buffer,
@@ -1472,6 +1535,29 @@ impl Raytracer {
         for (last, sphere) in self.last_sphere_centers.iter_mut().zip(spheres) {
             *last = sphere.center.into();
         }
+        self.render_progress.reset();
+        self.filter_dirty = true;
+    }
+
+    /// Move the scene's moving objects (object-to-world transforms, rigid with optional
+    /// uniform scale); the previous call's transforms feed motion vectors. Restarts
+    /// accumulation, as the image content changed.
+    pub fn set_objects(&mut self, queue: &wgpu::Queue, transforms: &[glm::Mat4]) {
+        assert_eq!(
+            transforms.len(),
+            self.object_bounds.len(),
+            "one transform per moving object"
+        );
+        let previous = self
+            .last_object_transforms
+            .take()
+            .unwrap_or_else(|| transforms.to_vec());
+        queue.write_buffer(
+            self.instance_buffer.handle(),
+            0,
+            bytemuck::cast_slice(&instance_words(transforms, &previous, &self.object_bounds)),
+        );
+        self.last_object_transforms = Some(transforms.to_vec());
         self.render_progress.reset();
         self.filter_dirty = true;
     }

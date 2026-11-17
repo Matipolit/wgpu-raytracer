@@ -15,9 +15,10 @@
 #   2. re-export last night's denoisers with the current exporter + PyTorch parity check
 #   3. RTX: compute vs hardware ray queries on every benchmark view
 #   4. denoise + upscale data at render scales 0.5, 0.6, 0.67, 0.77: added to last night's
-#      2048-spp captures (--low-only, minutes) or captured from scratch if those are missing;
-#      evaluation set; 5 s 60 fps video inputs
-#   5. train two joint denoise + upscale networks (16 and 24 channels) in parallel
+#      2048-spp sphere captures (--low-only, minutes) or captured from scratch if missing;
+#      new 2048-spp captures with moving triangle objects and fast-motion sequences
+#      (hardware ray queries, compute-only fallback); evaluation sets; 60 fps video inputs
+#   5. train the joint denoise + upscale network at five quality tiers (tiny ... ultra) in parallel
 #   6. evaluate per scale, render videos, write training/runs/pc-summary.txt
 set -u
 cd "$(dirname "$0")/.."
@@ -67,9 +68,12 @@ BIN=$PWD/target/release/weekend-raytracer-wgpu
 SCALES=0.5,0.6,0.67,0.77
 if [ $SMOKE = 1 ]; then
     SEQ=3 FRAMES=3 SPP=16 SIZE=640x400 CROP=128 EVAL_SIZE=640x400 VIDEO_FRAMES=12 SCENES=sponza-atrium,fireplace-room
+    OBJ_SEQ=3 OBJ_CROP=128 OBJ_EVAL_FRAMES=3 OBJ_EVAL_SPP=16
 else
     SEQ=24 FRAMES=16 SPP=2048 SIZE=1280x720 CROP=384 EVAL_SIZE=1280x720 VIDEO_FRAMES=300 SCENES=""
+    OBJ_SEQ=12 OBJ_CROP=320 OBJ_EVAL_FRAMES=8 OBJ_EVAL_SPP=1024
 fi
+OBJECTS="--objects 6 --fast-fraction 0.15"
 scene_arg() { [ -n "$SCENES" ] && echo "--scenes $SCENES"; }
 HWRT=""
 nvidia-smi > /dev/null 2>&1 && HWRT="--extra=--hw-rt"
@@ -129,6 +133,27 @@ else
     python3 training/temporal/capture.py $EVAL $(scene_arg) --sequences 2 --frames $FRAMES --spp $SPP --size $EVAL_SIZE \
         --seed-base 9000 --motion-range 0.05,0.12 --render-scale $SCALES --low-only $HWRT
 fi
+# Moving triangle objects (6 per sequence; 15% of training and 25% of evaluation
+# sequences are fast-motion cases). Scenes use hardware ray queries when available and
+# the objects the compute traversal; if that capture fails, it reruns compute-only
+# (capture.py skips scenes that are already complete).
+objects_capture() {  # out, capture.py arguments...
+    local out=$1; shift
+    python3 training/temporal/capture.py "$out" "$@" $HWRT || { [ -n "$HWRT" ] && {
+        stamp "capture with hardware ray queries failed; compute-only"
+        python3 training/temporal/capture.py "$out" "$@"
+    }; }
+}
+OBJ=$R/upscale-objects
+OBJ_EVAL=$R/upscale-objects-eval
+[ $SMOKE = 1 ] && OBJ=$R/upscale-smoke-objects && OBJ_EVAL=$R/upscale-smoke-objects-eval
+stamp "capture moving-object training data into $OBJ"
+objects_capture $OBJ $(scene_arg) --sequences $OBJ_SEQ --frames $FRAMES --spp $SPP --size $SIZE --crop $OBJ_CROP \
+    --seed-base 4000 --motion-range 0.03,1 --render-scale $SCALES $OBJECTS
+stamp "capture moving-object evaluation set into $OBJ_EVAL"
+objects_capture $OBJ_EVAL $(scene_arg) --sequences 2 --frames $OBJ_EVAL_FRAMES --spp $OBJ_EVAL_SPP --size $EVAL_SIZE \
+    --seed-base 9500 --motion-range 0.05,0.12 --render-scale $SCALES --objects 6 --fast-fraction 0.25
+
 stamp "video inputs"
 for spec in "bistro assets/scenes/exterior.glb -10,2,0,1,0,0.3,65 1.2 7101" \
             "sponza assets/sponza/sponza-png.glb -8,1.6,0,1,0.08,-0.08,65 1.0 7201" \
@@ -137,7 +162,7 @@ for spec in "bistro assets/scenes/exterior.glb -10,2,0,1,0,0.3,65 1.2 7101" \
     [ -f $R/upscale-video/$1/meta.json ] && continue
     [ -e "$2" ] || continue
     $BIN --model $2 --camera $3 --capture $R/upscale-video/$1 --scale $4 --sequences 1 --frames $VIDEO_FRAMES --no-reference \
-        --size $EVAL_SIZE --seed $5 --motion-scale 0.08 --upscale-capture 0.5,0.67 --fastest ${HWRT#--extra=} 2>&1 | tail -1
+        --size $EVAL_SIZE --seed $5 --motion-scale 0.08 --upscale-capture 0.5,0.67 --objects 6 --fastest ${HWRT#--extra=} 2>&1 | tail -1
 done
 
 # --- 5. training ---
@@ -148,21 +173,24 @@ stamp "train for $HRS h"
 train() {  # name, batch, args...: halves the batch and resumes on failure (out of memory)
     local name=$1 batch=$2; shift 2
     while [ "$batch" -ge 1 ]; do
-        $PY training/upscale/train.py --data $TRAIN --out $R/$name --hours $HRS --batch $batch --crop 160 \
+        $PY training/upscale/train.py --data $TRAIN,$OBJ --out $R/$name --hours $HRS --batch $batch --crop 160 \
             --eval-every $([ $SMOKE = 1 ] && echo 5 || echo 300) --max-steps $STEPS "$@" >> $R/$name.log 2>&1 && return 0
         echo "train $name failed at batch $batch" >> $R/$name.log
         batch=$((batch / 2))
     done
 }
-train up-half16 6 --channels 16 &
-train up-half24 6 --channels 24 &
+TIERS="tiny small medium large ultra"
+for tier in $TIERS; do
+    train up-$tier 6 --tier $tier &
+done
 wait
 
 # --- 6. evaluation, videos, summary ---
-for m in up-half16 up-half24; do
+for m in $(for t in $TIERS; do echo up-$t; done); do
     [ -f $R/$m/best.pt ] || continue
     stamp "evaluate $m"
     $PY training/upscale/evaluate.py --data $EVAL --weights $R/$m/best.pt --out $R/$m/eval --all > $R/$m/eval.txt 2>&1
+    $PY training/upscale/evaluate.py --data $OBJ_EVAL --weights $R/$m/best.pt --out $R/$m/eval-objects --all > $R/$m/eval-objects.txt 2>&1
     for v in bistro sponza living; do
         [ -d $R/upscale-video/$v ] || continue
         $PY training/upscale/upscale_video.py $R/upscale-video/$v 0 $R/$m/best.pt $R/videos/upscale-$v-$m.mp4 --panel split 2>&1 | tail -1
@@ -179,8 +207,9 @@ import json; d = json.load(open('performance/scenes/results/rtx-hwrt/results.jso
 for r in d['rows']:
     if r['config'] == 'hwrt': print(f\"{r['scene']:24} {r['speedup']:.2f}x  ({r['ms']:.1f} ms)\")
 print('geomean', round(d['summary']['hwrt']['geomean_speedup'], 3))"
-    for m in up-half16 up-half24; do
-        [ -f $R/$m/eval.txt ] && { echo; echo "## Denoise + upscale $m (evaluation set)"; sed -n '/mean over scenes/,$p' $R/$m/eval.txt; }
+    for m in $(for t in $TIERS; do echo up-$t; done); do
+        [ -f $R/$m/eval.txt ] && { echo; echo "## Denoise + upscale $m, spheres (evaluation set)"; sed -n '/mean over scenes/,$p' $R/$m/eval.txt; }
+        [ -f $R/$m/eval-objects.txt ] && { echo; echo "## Denoise + upscale $m, moving objects incl. fast motion"; sed -n '/mean over scenes/,$p' $R/$m/eval-objects.txt; }
     done
     echo; echo "Videos: $R/videos/upscale-*.mp4 (left: raw 1-spp samples, right: network)"
 } > $R/pc-summary.txt

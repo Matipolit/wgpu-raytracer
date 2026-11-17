@@ -461,7 +461,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                 } else {scatter = scatterPbr(ray,hit,rngState);}
                 if GBUFFER && gbufferPending {
                     gbufferPending = false;
-                    writeGbuffer(shadedBase, hit.t * length(ray.direction), hit.n, shadedRough, shadedMetal, hit.p, 1.);
+                    writeGbuffer(shadedBase, hit.t * length(ray.direction), hit.n, shadedRough, shadedMetal, meshPrevious, 1.);
                 }
                 ray = scatter.ray;
                 if RAY_CONES {coneSpread=min(1.,coneSpread+0.25*meshFloat(m+8u));}
@@ -1082,7 +1082,7 @@ fn writeGbufferHit(ray: Ray, hit: Intersection) {
         let base = (meshVec4(m) * meshTexture(m + 16u, uv0, hit.uv1, true)).rgb;
         let mr = meshTexture(m + 24u, uv0, hit.uv1, false);
         writeGbuffer(base, distance, hit.n, clamp(meshFloat(m + 8u) * mr.g, 0.045, 1.),
-            clamp(meshFloat(m + 7u) * mr.b, 0., 1.), hit.p, 1.);
+            clamp(meshFloat(m + 7u) * mr.b, 0., 1.), meshPrevious, 1.);
         return;
     }
     if TRACE_SPHERES {

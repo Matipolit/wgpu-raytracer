@@ -33,7 +33,10 @@ p.add_argument("--lr", type=float, default=2e-3)
 p.add_argument("--holdout-scene", default="fireplace-room")
 p.add_argument("--temporal-weight", type=float, default=0.5)
 p.add_argument("--eval-every", type=int, default=300)
+p.add_argument("--tier", choices=list(M.TIERS), help="architecture preset (overrides --channels/--layers/--full-res)")
 p.add_argument("--channels", type=int, default=16)
+p.add_argument("--layers", type=int, default=2)
+p.add_argument("--full-res", action="store_true", help="3x3 convs at output resolution (default: half)")
 p.add_argument("--dilations", default="1,2,4")
 p.add_argument("--init", help="start from these weights (same architecture)")
 p.add_argument("--max-steps", type=int, default=0, help="stop after this many steps (smoke tests)")
@@ -46,8 +49,9 @@ torch.manual_seed(0)
 random.seed(0)
 out = pathlib.Path(a.out)
 out.mkdir(parents=True, exist_ok=True)
-M.configure(a.channels, [int(d) for d in a.dilations.split(",")])
-(out / "config.json").write_text(json.dumps(dict(channels=M.CHANNELS, dilations=list(M.DILATIONS))))
+tier = M.TIERS[a.tier] if a.tier else dict(channels=a.channels, layers=a.layers, half=not a.full_res)
+M.configure(tier["channels"], [int(d) for d in a.dilations.split(",")], tier["layers"], tier["half"])
+(out / "config.json").write_text(json.dumps(dict(tier=a.tier, channels=M.CHANNELS, layers=M.LAYERS, half=M.HALF, dilations=list(M.DILATIONS))))
 
 scenes = D.load(a.data)
 train, val, test = D.split(scenes, a.holdout_scene)
@@ -78,9 +82,18 @@ def run(net, frames, coords, origin, scale, grad=True):
     return loss / len(frames), outs
 
 
+# Batches stack sequences of one stored size (datasets may use different crops).
+groups = {}
+for seq in train:
+    key = (seq.size, tuple(l["frames"][0].shape for l in seq.lows))
+    groups.setdefault(key, []).append(seq)
+groups = list(groups.values())
+
+
 def batch():
     k = random.randrange(scales)
-    seqs = random.sample(train, min(a.batch, len(train)))
+    group = random.choices(groups, weights=[len(g) for g in groups])[0]
+    seqs = random.sample(group, min(a.batch, len(group)))
     h, w = seqs[0].size
     c = min(a.crop, h, w)
     window = (random.randrange(h - c + 1), random.randrange(w - c + 1), c)

@@ -32,8 +32,7 @@ out = pathlib.Path(a.out)
 out.mkdir(parents=True, exist_ok=True)
 config = pathlib.Path(a.weights).with_name("config.json")
 if config.exists():
-    c = json.loads(config.read_text())
-    M.configure(c["channels"], c["dilations"])
+    M.configure_from(json.loads(config.read_text()))
 net = M.Net().to(a.device)
 net.load_state_dict(torch.load(a.weights, map_location=a.device))
 net.eval()
@@ -47,7 +46,7 @@ def image(x):
 scenes = D.load(a.data)
 results = {}
 for name, seqs in scenes.items():
-    held = seqs if a.all or name == a.holdout_scene else seqs[-2:]
+    held = seqs if a.all or seqs[0].scene == a.holdout_scene else seqs[-2:]
     results[name] = {}
     for k in range(len(held[0].lows)):
         stats = {m: dict(l1=0.0, mse=0.0, flicker=0.0, n=0, nf=0) for m in ("splat", "taau", "network")}
@@ -87,7 +86,7 @@ for name, seqs in scenes.items():
         }
         from PIL import Image  # noqa: E402
 
-        Image.fromarray(np.concatenate(strip, 0)).save(out / f"{name}-{label}.png")
+        Image.fromarray(np.concatenate(strip, 0)).save(out / f"{name.replace('/', '_')}-{label}.png")
         r = results[name][label]
         print(f"{name:24} scale {label}  " + "  ".join(f"{m}: PSNR {v['psnr']:.2f} flicker {v['flicker']:.4f}" for m, v in r.items()), flush=True)
 (out / "metrics.json").write_text(json.dumps(results, indent=1))

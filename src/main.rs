@@ -25,6 +25,7 @@ mod fly_camera;
 mod gui;
 mod offline;
 mod raytracer;
+mod shapes;
 
 /// GPU, backend and driver, identifying the auto-tuner's calibration results.
 pub(crate) fn adapter_key(info: &wgpu::AdapterInfo) -> String {

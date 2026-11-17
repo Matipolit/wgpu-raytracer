@@ -70,7 +70,7 @@ fn csWfTrace(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoca
     let r = wfRays[path];
     var best = MeshCandidate();
     var hit = vec4(0xffffffffu, 0u, 0u, 0u);
-    if meshQuadCandidate(Ray(r.origin, r.direction), MAX_T, false, &best) {
+    if meshQuadCandidate(Ray(r.origin, r.direction), MAX_T, false, &best, 0u) {
         hit = vec4(best.index, bitcast<u32>(best.t), bitcast<u32>(best.u), bitcast<u32>(best.v));
     }
     wfHits[path] = hit;
@@ -121,7 +121,7 @@ fn wfShadePath(path: u32, b: u32) -> bool {
             state.radiance += throughput * skyRadiance(normalize(ray.direction));
             alive = false;
         } else {
-            let hit = meshResolve(ray, MeshCandidate(bitcast<f32>(h.y), bitcast<f32>(h.z), bitcast<f32>(h.w), h.x));
+            let hit = meshResolve(ray, MeshCandidate(bitcast<f32>(h.y), bitcast<f32>(h.z), bitcast<f32>(h.w), h.x, 0u));
             let m = meshMaterialOffset(hit.materialIdx);
             state.radiance += throughput * meshVec3(m + 4u) * meshTexture(m + 32u, vec2(hit.u, hit.v), hit.uv1, true).rgb;
             if b + 1u >= samplingParams.numBounces {

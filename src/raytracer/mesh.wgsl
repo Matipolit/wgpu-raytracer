@@ -1,6 +1,42 @@
 // Mesh buffer header: node/triangle counts, triangle/vertex/material/texture
 // word offsets, logical sphere/light counts. BVH nodes begin at word 16.
 @group(3) @binding(4) var<storage, read> meshData: array<u32>;
+// Moving objects (Mesh::append_object): 11 vec4 per instance: world-to-object rows
+// (0-2), object-to-world rows (3-5), previous object-to-world rows (6-8), world bounds
+// min (9) and max (10). Instance i is object i; its BVH root is meshData[meshData[15] + i].
+@group(3) @binding(9) var<storage, read> meshInstances: array<vec4<f32>>;
+override INSTANCE_COUNT: u32 = 0u;
+// World position of the last resolved mesh hit one frame earlier (motion vectors).
+var<private> meshPrevious: vec3<f32>;
+fn instanceTransform(i: u32, row: u32, p: vec3<f32>, w: f32) -> vec3<f32> {
+    let b = i * 11u + row;
+    let q = vec4(p, w);
+    return vec3(dot(meshInstances[b], q), dot(meshInstances[b + 1u], q), dot(meshInstances[b + 2u], q));
+}
+// Closest (or any) hit among the moving objects nearer than `limit`; the candidate's
+// instance is i + 1 for object i.
+fn meshInstanceCandidate(ray: Ray, limit: f32, anyHit: bool, best: ptr<function, MeshCandidate>) -> bool {
+    if INSTANCE_COUNT == 0u { return false; }
+    let parallel = abs(ray.direction) < vec3(1e-20);
+    let inverse = vec3(1.) / select(ray.direction, vec3(1.), parallel);
+    var closest = limit;
+    var found = false;
+    for (var i = 0u; i < INSTANCE_COUNT; i += 1u) {
+        let lo = meshInstances[i * 11u + 9u].xyz;
+        let hi = meshInstances[i * 11u + 10u].xyz;
+        if meshBounds(ray, inverse, parallel, lo, hi, closest) >= closest { continue; }
+        let local = Ray(instanceTransform(i, 0u, ray.origin, 1.), instanceTransform(i, 0u, ray.direction, 0.));
+        var hit = MeshCandidate();
+        if meshQuadCandidate(local, closest, anyHit, &hit, meshData[meshData[15u] + i]) {
+            hit.instance = i + 1u;
+            *best = hit;
+            closest = hit.t;
+            found = true;
+            if anyHit { return true; }
+        }
+    }
+    return found;
+}
 // Sampled glTF textures (one per texture and colour interpretation) and the 18
 // wrap/filter samplers; material slot word 7 holds the sampler index. Slot
 // word 0 is the texture index plus one; 0 means none (white placeholder).
@@ -66,7 +102,8 @@ fn meshBounds(ray:Ray,inverse:vec3<f32>,parallel:vec3<bool>,lo:vec3<f32>,hi:vec3
     let far=min(tmax,min(upper.x,min(upper.y,upper.z)));
     return select(MAX_T,near,near<=far);
 }
-struct MeshCandidate { t: f32, u: f32, v: f32, index: u32 }
+// instance: 0 for the static scene, i + 1 for moving object i.
+struct MeshCandidate { t: f32, u: f32, v: f32, index: u32, instance: u32 }
 fn meshCandidate(ray: Ray, index: u32, tmax: f32, outHit: ptr<function, MeshCandidate>) -> bool {
     let accel=meshData[8u]+index*12u;
     let a=meshVec3(accel); let e1=meshVec3(accel+4u); let e2=meshVec3(accel+8u);
@@ -105,12 +142,29 @@ fn meshCandidate(ray: Ray, index: u32, tmax: f32, outHit: ptr<function, MeshCand
         let alpha=meshFloat(material+3u)*meshTexture(material+16u,uv0,uv1,false).a;
         if alpha<meshFloat(material+10u) {return false;}
     }
-    *outHit=MeshCandidate(t,u,v,index);
+    *outHit=MeshCandidate(t,u,v,index,0u);
     return true;
 }
 
 // Resolve attributes and sample the normal map once, after closest-hit traversal.
+// Moving objects resolve in object space and transform the result to world space.
 fn meshResolve(ray: Ray, candidate: MeshCandidate) -> Intersection {
+    if INSTANCE_COUNT == 0u || candidate.instance == 0u {
+        meshPrevious = ray.origin + candidate.t * ray.direction;
+        return meshResolveLocal(ray, candidate);
+    }
+    let i = candidate.instance - 1u;
+    let local = Ray(instanceTransform(i, 0u, ray.origin, 1.), instanceTransform(i, 0u, ray.direction, 0.));
+    var hit = meshResolveLocal(local, candidate);
+    meshPrevious = instanceTransform(i, 6u, local.origin + candidate.t * local.direction, 1.);
+    hit.p = ray.origin + candidate.t * ray.direction;
+    let n = instanceTransform(i, 3u, hit.n, 0.);
+    let g = instanceTransform(i, 3u, hit.geometricNormal, 0.);
+    hit.n = select(vec3(0.), normalize(n), dot(n, n) > 0.);
+    hit.geometricNormal = select(vec3(0.), normalize(g), dot(g, g) > 0.);
+    return hit;
+}
+fn meshResolveLocal(ray: Ray, candidate: MeshCandidate) -> Intersection {
     let tri=meshData[2u]+candidate.index*4u;
     let va=vertexOffset(meshData[tri]);
     let vb=vertexOffset(meshData[tri+1u]);
@@ -180,14 +234,17 @@ fn meshTriangle(ray: Ray, index: u32, tmax: f32, outHit: ptr<function, Intersect
 fn meshIntersection(ray: Ray, outHit: ptr<function, Intersection>, tmax: f32) -> bool {
     if HW_RT {
         var best=MeshCandidate();
-        if !meshHwCandidate(ray,tmax,false,&best) {return false;}
+        var found=meshHwCandidate(ray,tmax,false,&best);
+        found=meshInstanceCandidate(ray,select(tmax,best.t,found),false,&best) || found;
+        if !found {return false;}
         *outHit=meshResolve(ray,best);
         return true;
     }
     if QUAD_BVH{
         var best=MeshCandidate();var found:bool;
         if VIS_PRIMARY && visibilityPending {visibilityPending=false;found=visibilityCandidate(ray,tmax,&best);}
-        else {found=meshQuadCandidate(ray,tmax,false,&best);}
+        else {found=meshQuadCandidate(ray,tmax,false,&best,0u);}
+        found=meshInstanceCandidate(ray,select(tmax,best.t,found),false,&best) || found;
         if !found {return false;}
         *outHit=meshResolve(ray,best);
         return true;
@@ -270,8 +327,11 @@ fn scatterPbr(inRay: Ray, hit: Intersection, rng: ptr<function,u32>) -> Scatter 
 
 // Shadow queries stop on the first accepted surface; cutout tests stay in meshCandidate.
 fn meshOccluded(ray: Ray) -> bool {
-    if HW_RT{var ignored=MeshCandidate();return meshHwCandidate(ray,MAX_T,true,&ignored);}
-    if QUAD_BVH{var ignored=Intersection();return meshQuadQuery(ray,&ignored,MAX_T,true);}
+    if HW_RT{var ignored=MeshCandidate();return meshHwCandidate(ray,MAX_T,true,&ignored) || meshInstanceCandidate(ray,MAX_T,true,&ignored);}
+    if QUAD_BVH{
+        var ignored=MeshCandidate();
+        return meshQuadCandidate(ray,MAX_T,true,&ignored,0u) || meshInstanceCandidate(ray,MAX_T,true,&ignored);
+    }
     if PAIR_BVH{var ignored=Intersection();return meshPairQuery(ray,&ignored,MAX_T,true);}
     if WIDE_BVH>2u{var ignored=Intersection();return meshWideQuery(ray,&ignored,MAX_T,true);}
     if meshData[0u]==0u {return false;}
@@ -508,17 +568,17 @@ fn quadSwap(t:ptr<function,vec4<f32>>,r:ptr<function,vec4<u32>>,i:u32,j:u32){
 }
 fn meshQuadQuery(ray:Ray,outHit:ptr<function,Intersection>,limit:f32,anyHit:bool)->bool{
     var best=MeshCandidate();
-    if !meshQuadCandidate(ray,limit,anyHit,&best){return false;}
+    if !meshQuadCandidate(ray,limit,anyHit,&best,0u){return false;}
     *outHit=meshResolve(ray,best);
     return true;
 }
 // Closest (or any) hit as a raw candidate; callers resolve attributes later.
-fn meshQuadCandidate(ray:Ray,limit:f32,anyHit:bool,outBest:ptr<function,MeshCandidate>)->bool{
+fn meshQuadCandidate(ray:Ray,limit:f32,anyHit:bool,outBest:ptr<function,MeshCandidate>,root:u32)->bool{
     if meshData[0u]==0u{return false;}
     rayLength=length(ray.direction);
     let parallel=abs(ray.direction)<vec3(1e-20);let inverse=vec3(1.)/select(ray.direction,vec3(1.),parallel);
     var closest=limit;var found=false;var best=MeshCandidate();
-    var stack:array<u32,QUAD_STACK>;var stackT:array<f32,QUAD_CULL_SLOTS>;var size=0u;var current=0u;
+    var stack:array<u32,QUAD_STACK>;var stackT:array<f32,QUAD_CULL_SLOTS>;var size=0u;var current=root;
     if TRAVERSAL_STATS {statRays+=1u;}
     loop{
         if OCT_BVH && (current&PAIR_LEAF)==0u{

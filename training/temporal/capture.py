@@ -41,6 +41,8 @@ p.add_argument("--extra", nargs="*", default=[], help="extra renderer flags, e.g
 p.add_argument("--motion-range", help="LO,HI per-sequence motion multiplier (log-uniform)")
 p.add_argument("--render-scale", help="S1,S2,...: also capture 1-spp inputs at these render scales (denoise + upscale training)")
 p.add_argument("--low-only", action="store_true", help="add the --render-scale inputs to an existing capture (same arguments and seeds)")
+p.add_argument("--objects", type=int, default=0, help="moving triangle objects instead of spheres")
+p.add_argument("--fast-fraction", type=float, default=0.0, help="share of fast-motion sequences (camera, objects or both)")
 p.add_argument("--seed-base", type=int, default=1000, help="use a different base for evaluation sets")
 a = p.parse_args()
 scenes = json.loads((ROOT / "performance/scenes/scenes.json").read_text())
@@ -59,6 +61,8 @@ for index, name in enumerate(a.scenes.split(",")):
          *(["--motion-range", a.motion_range] if a.motion_range else []),
          *(["--upscale-capture", a.render_scale] if a.render_scale else []),
          *(["--low-only"] if a.low_only else []),
+         *(["--objects", str(a.objects)] if a.objects else []),
+         *(["--fast-fraction", str(a.fast_fraction)] if a.fast_fraction else []),
          "--sah-stop", "--skip-final-scatter", "--quad-bvh", "--sbvh", *a.extra],
         cwd=ROOT, env=env, check=True,
     )

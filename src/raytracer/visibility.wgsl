@@ -122,7 +122,7 @@ fn visibilityCandidateAt(ray: Ray, pixel: vec2<u32>, tmax: f32, best: ptr<functi
     let bu = clamp(dot(delta, p) * inv, 0., 1.);
     let bv = clamp(dot(ray.direction, q) * inv, 0., 1. - bu);
     if !(t > MIN_T && t < tmax) { return false; }
-    *best = MeshCandidate(t, bu, bv, triangle);
+    *best = MeshCandidate(t, bu, bv, triangle, 0u);
     return true;
 }
 
@@ -132,7 +132,10 @@ fn visibilityHit(ray: Ray, pixel: vec2<u32>, outHit: ptr<function, Intersection>
     var closest = MAX_T;
     var found = false;
     var candidate = MeshCandidate();
-    if TRACE_MESHES && visibilityCandidateAt(ray, pixel, MAX_T, &candidate) {
+    var meshFound = TRACE_MESHES && visibilityCandidateAt(ray, pixel, MAX_T, &candidate);
+    // Moving objects are not rasterized: trace them in front of the rasterized hit.
+    meshFound = meshInstanceCandidate(ray, select(MAX_T, candidate.t, meshFound), false, &candidate) || meshFound;
+    if meshFound {
         hit = meshResolve(ray, candidate);
         closest = candidate.t;
         found = true;

@@ -33,13 +33,12 @@ p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu
 a = p.parse_args()
 config = pathlib.Path(a.weights).with_name("config.json")
 if config.exists():
-    c = json.loads(config.read_text())
-    M.configure(c["channels"], c["dilations"])
+    M.configure_from(json.loads(config.read_text()))
 net = M.Net().to(a.device)
 net.load_state_dict(torch.load(a.weights, map_location=a.device))
 net.eval()
 scene = pathlib.Path(a.scene)
-seq = D.load(scene.parent)[scene.name][a.seq]
+seq = D.load_root(scene.parent)[scene.name][a.seq]
 
 
 def curve(v):
