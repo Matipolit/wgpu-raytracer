@@ -16,6 +16,7 @@ fn hwAccept(index: u32, u: f32, v: f32, frontFace: bool) -> bool {
     let accel = meshData[8u] + index * 12u;
     let flags = meshData[accel + 11u];
     if (flags & 1u) == 0u && !frontFace { return false; }
+    if shadowRay && (flags & 8u) != 0u { return false; }
     if (flags & 2u) == 0u { return true; }
     let tri = meshData[2u] + index * 4u;
     let va = vertexOffset(meshData[tri]);

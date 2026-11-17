@@ -16,7 +16,7 @@ pollster = "1.0.1"
 thiserror = "2.0.21"
 wgpu = "30.0.2"
 winit = "0.30.13"
-gltf = { version = "1.4.1", features = ["KHR_materials_emissive_strength", "KHR_texture_transform", "extensions"] }
+gltf = { version = "1.4.1", features = ["KHR_materials_emissive_strength", "KHR_materials_ior", "KHR_materials_specular", "KHR_materials_transmission", "KHR_materials_volume", "KHR_texture_transform", "extensions"] }
 
 half = "2.7.1"
 texpresso = "2.0.2"

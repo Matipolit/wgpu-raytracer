@@ -47,7 +47,7 @@ fn meshFloat(offset: u32) -> f32 { return bitcast<f32>(meshData[offset]); }
 fn meshVec2(offset: u32) -> vec2<f32> { return vec2(meshFloat(offset), meshFloat(offset+1u)); }
 fn meshVec3(offset: u32) -> vec3<f32> { return vec3(meshFloat(offset),meshFloat(offset+1u),meshFloat(offset+2u)); }
 fn meshVec4(offset: u32) -> vec4<f32> { return vec4(meshVec3(offset),meshFloat(offset+3u)); }
-fn meshMaterialOffset(index: u32) -> u32 { return meshData[4u]+48u*index; }
+fn meshMaterialOffset(index: u32) -> u32 { return meshData[4u]+64u*index; }
 
 fn meshUV(slot: u32, uv0: vec2<f32>, uv1: vec2<f32>) -> vec2<f32> {
     let uv=select(uv0,uv1,meshData[slot+1u]==1u)*meshVec2(slot+4u);
@@ -66,7 +66,7 @@ fn meshTexture(slot: u32, uv0: vec2<f32>, uv1: vec2<f32>, color: bool) -> vec4<f
     // Alpha tests keep the base level so cutouts do not erode with distance, and so
     // does the base colour of alpha-tested (MASK) materials: their mips average in
     // the colour of transparent texels.
-    let materialSlot=(slot-meshData[4u])%48u;
+    let materialSlot=(slot-meshData[4u])%64u;
     let masked=materialSlot==16u && (meshData[slot-materialSlot+11u]&2u)!=0u;
     if RAY_CONES && coneActive && (color || materialSlot!=16u) && !masked {
         let gradient=select(footprintUV0,footprintUV1,meshData[slot+1u]==1u)*abs(meshVec2(slot+4u));
@@ -111,6 +111,8 @@ fn meshCandidate(ray: Ray, index: u32, tmax: f32, outHit: ptr<function, MeshCand
     if abs(determinant)<=meshFloat(accel+3u)*select(length(ray.direction),rayLength,QUAD_BVH) {return false;}
     let flags=meshData[accel+11u];
     if (flags&1u)==0u && determinant<0. {return false;}
+    // Shadow rays pass through glass and other transmissive surfaces (untinted).
+    if shadowRay && (flags&8u)!=0u {return false;}
     let inv=1./determinant;let delta=ray.origin-a;
     let u=dot(delta,crossD)*inv;
     if u<0. || u>1. {return false;}
@@ -363,7 +365,10 @@ fn meshOccluded(ray: Ray, limit: f32) -> bool {
 }
 
 // Loaded once per vertex, shared by environment evaluation and BSDF sampling.
-struct PbrSurface {base:vec3<f32>,metal:f32,alpha2:f32,view:vec3<f32>,nv:f32,f0:vec3<f32>,specChance:f32}
+// transmission: share of the dielectric diffuse lobe that passes through (glTF
+// KHR_materials_transmission, x (1 - metal)); thin: no volume (KHR_materials_volume
+// thickness 0) so rays pass straight through; f90: dielectric Fresnel at grazing.
+struct PbrSurface {base:vec3<f32>,metal:f32,alpha2:f32,view:vec3<f32>,nv:f32,f0:vec3<f32>,specChance:f32,transmission:f32,ior:f32,thin:bool,sigma:vec3<f32>,f90:f32}
 struct PbrSample {scatter:Scatter,pdf:f32}
 fn pbrSurface(inRay: Ray,hit: Intersection) -> PbrSurface {
     let m=meshMaterialOffset(hit.materialIdx);let uv0=vec2(hit.u,hit.v);
@@ -374,8 +379,10 @@ fn pbrSurface(inRay: Ray,hit: Intersection) -> PbrSurface {
     shadedBase=base;shadedRough=rough;shadedMetal=metal;
     let alpha=rough*rough;
     let view=normalize(-inRay.direction);
-    let f0=mix(vec3(0.04),base,metal);
-    return PbrSurface(base,metal,alpha*alpha,view,max(dot(hit.n,view),1e-6),f0,clamp(max(f0.r,max(f0.g,f0.b)),0.25,0.9));
+    let f0=mix(meshVec3(m+55u),base,metal);
+    let f90=mix(meshFloat(m+54u),1.,metal);
+    let transmission=meshFloat(m+48u)*(1.-metal);
+    return PbrSurface(base,metal,alpha*alpha,view,max(dot(hit.n,view),1e-6),f0,clamp(max(f0.r,max(f0.g,f0.b)),0.25,0.9),transmission,meshFloat(m+49u),meshFloat(m+50u)<=0.,meshVec3(m+51u),f90);
 }
 fn evaluatePbr(s: PbrSurface,hit: Intersection,wi: vec3<f32>) -> vec4<f32> {
     return evaluatePbrMode(s,hit,wi,GGX_VNDF || GGX_BOUNDED);
@@ -388,14 +395,14 @@ fn evaluatePbrMode(s: PbrSurface,hit: Intersection,wi: vec3<f32>,visible: bool) 
     let distribution=s.alpha2/(PI*denom*denom);
     let gv=2.*s.nv/(s.nv+sqrt(s.alpha2+(1.-s.alpha2)*s.nv*s.nv));
     let gl=2.*nl/(nl+sqrt(s.alpha2+(1.-s.alpha2)*nl*nl));
-    let fresnel=s.f0+(vec3(1.)-s.f0)*pow(1.-vh,5.);
-    let brdf=(vec3(1.)-fresnel)*(1.-s.metal)*s.base*FRAC_1_PI+fresnel*distribution*gv*gl/(4.*s.nv*nl);
+    let fresnel=s.f0+(vec3(s.f90)-s.f0)*pow(1.-vh,5.);
+    let brdf=(vec3(1.)-fresnel)*(1.-s.metal)*(1.-s.transmission)*s.base*FRAC_1_PI+fresnel*distribution*gv*gl/(4.*s.nv*nl);
     var specularPdf=distribution*nh/(4.*vh);
     if visible && dot(hit.n,s.view)>1e-6 {
         specularPdf=distribution*gv/(4.*s.nv);
         if GGX_BOUNDED {specularPdf=distribution/(2.*(boundedGgxK(s.nv,s.alpha2)*s.nv+sqrt(s.alpha2*(1.-s.nv*s.nv)+s.nv*s.nv)));}
     }
-    let pdf=s.specChance*specularPdf+(1.-s.specChance)*nl*FRAC_1_PI;
+    let pdf=s.specChance*specularPdf+(1.-s.specChance)*(1.-s.transmission)*nl*FRAC_1_PI;
     return vec4(brdf*nl,pdf);
 }
 fn samplePbr(s: PbrSurface,hit: Intersection,rng: ptr<function,u32>) -> PbrSample {
@@ -418,9 +425,45 @@ fn samplePbrMode(s: PbrSurface,hit: Intersection,rng: ptr<function,u32>,visible:
             let halfVector=pixarOnb(hit.n)*vec3(cos(phi)*sinTheta,sin(phi)*sinTheta,cosTheta);
             wi=reflect(-s.view,halfVector);
         }
+    } else if s.transmission>0. && rngNextFloat(rng)<s.transmission {
+        return sampleTransmission(s,hit,rng);
     } else {wi=sampleLambertian(hit,rng);}
     let ev=evaluatePbrMode(s,hit,wi,visible);
     return PbrSample(Scatter(Ray(hit.p+hit.geometricNormal*0.0001,wi),ev.rgb/max(ev.a,1e-12)),ev.a);
+}
+
+// The transmission lobe, sampled alone (a near-specular event: its pdf is reported
+// as a delta so MIS gives what it reaches full weight; light sampling never targets
+// it). A GGX microfacet normal, Schlick Fresnel with the material's F0/F90:
+// thin-walled surfaces mirror the reflected direction through the surface (straight
+// through when smooth); volumes refract (Snell, ior), tracked by pathInside so the
+// next segment is absorbed with sigma (Beer-Lambert) and the exit refracts back.
+// Throughput: base colour x (1 - Fresnel) over the lobe's choice probability.
+fn sampleTransmission(s: PbrSurface,hit: Intersection,rng: ptr<function,u32>) -> PbrSample {
+    let r1=rngNextFloat(rng);let r2=min(rngNextFloat(rng),0.999999);
+    let cosTheta=sqrt((1.-r2)/(1.+(s.alpha2-1.)*r2));
+    let sinTheta=sqrt(max(0.,1.-cosTheta*cosTheta));let phi=2.*PI*r1;
+    var h=pixarOnb(hit.n)*vec3(cos(phi)*sinTheta,sin(phi)*sinTheta,cosTheta);
+    let vh=max(dot(s.view,h),1e-6);
+    let fresnel=s.f0+(vec3(s.f90)-s.f0)*pow(1.-vh,5.);
+    let lobe=1.-s.specChance;
+    var wi=vec3(0.);var throughput=s.base*(vec3(1.)-fresnel)/lobe;
+    if s.thin {
+        let reflected=reflect(-s.view,h);
+        wi=reflected-2.*dot(reflected,hit.geometricNormal)*hit.geometricNormal;
+        if dot(wi,hit.geometricNormal)>=0. {wi=-s.view;}
+    } else {
+        let eta=select(1./s.ior,s.ior,pathInside);
+        let k=1.-eta*eta*(1.-vh*vh);
+        if k>=0. {wi=-eta*s.view+(eta*vh-sqrt(k))*h;}
+        if k<0. {
+            // Total internal reflection: all of it stays on this side.
+            wi=reflect(-s.view,h);throughput=vec3(1./lobe);
+            return PbrSample(Scatter(Ray(hit.p+hit.geometricNormal*0.0001,wi),throughput),1e8);
+        }
+        pathInside=!pathInside;pathSigma=select(vec3(0.),s.sigma,pathInside);
+    }
+    return PbrSample(Scatter(Ray(hit.p-hit.geometricNormal*0.0001,wi),throughput),1e8);
 }
 
 // Isotropic GGX visible-normal sampling via projected hemisphere sampling.

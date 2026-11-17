@@ -102,7 +102,7 @@ fn csVndf(@builtin(global_invocation_id) id:vec3<u32>) {
     let nv=queries[id.x].origin.x;let rough=queries[id.x].origin.y;let metal=queries[id.x].origin.z;
     let alpha=rough*rough;let view=vec3(sqrt(max(0.,1.-nv*nv)),0.,nv);
     let f0=mix(vec3(0.04),vec3(0.8),metal);
-    let surface=PbrSurface(vec3(0.8),metal,alpha*alpha,view,nv,f0,clamp(f0.r,0.25,0.9));
+    let surface=PbrSurface(vec3(0.8),metal,alpha*alpha,view,nv,f0,clamp(f0.r,0.25,0.9),0.,1.5,true,vec3(0.),1.);
     var hit=Intersection();hit.n=vec3(0.,0.,1.);hit.geometricNormal=hit.n;
     var rng=jenkinsHash(id.x+971u);var sums=vec4(0.);var rejected=vec2(0.);var invalid=0.;
     for(var i=0u;i<512u;i+=1u) {

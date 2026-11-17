@@ -63,9 +63,147 @@ impl MeshVertex {
     }
 }
 
+/// Words per GPU material: factors (0-15), four texture slots (16-47), then the
+/// optical extensions (48-63, see `Optics`).
+pub const MATERIAL_WORDS: usize = 64;
+pub type Material = [u32; MATERIAL_WORDS];
+
+/// glTF KHR_materials_transmission / _ior / _specular / _volume, packed at words
+/// 48 transmission, 49 ior, 50 volume thickness (0 = thin-walled), 51-53 absorption
+/// coefficient rgb, 54 dielectric F90 (the specular factor), 55-57 dielectric F0 rgb.
+/// Word 11 bit 3 marks transmissive materials (shadow rays pass through them).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Optics {
+    pub transmission: f32,
+    pub ior: f32,
+    pub specular: f32,
+    pub specular_color: [f32; 3],
+    pub thickness: f32,
+    pub attenuation_color: [f32; 3],
+    pub attenuation_distance: f32,
+}
+
+impl Default for Optics {
+    fn default() -> Self {
+        Self {
+            transmission: 0.,
+            ior: 1.5,
+            specular: 1.,
+            specular_color: [1.; 3],
+            thickness: 0.,
+            attenuation_color: [1.; 3],
+            attenuation_distance: f32::INFINITY,
+        }
+    }
+}
+
+impl Optics {
+    fn from_gltf(material: &gltf::Material<'_>) -> Self {
+        let mut o = Self::default();
+        if let Some(t) = material.transmission() {
+            o.transmission = t.transmission_factor();
+        }
+        if let Some(ior) = material.ior() {
+            o.ior = ior;
+        }
+        if let Some(s) = material.specular() {
+            o.specular = s.specular_factor();
+            o.specular_color = s.specular_color_factor();
+        }
+        if let Some(v) = material.volume() {
+            o.thickness = v.thickness_factor();
+            o.attenuation_color = v.attenuation_color();
+            o.attenuation_distance = v.attenuation_distance();
+        }
+        o
+    }
+
+    fn write(&self, words: &mut Material) {
+        let f0 = ((self.ior - 1.) / (self.ior + 1.)).powi(2);
+        let sigma = self.attenuation_color.map(|c| {
+            if self.attenuation_distance.is_finite() && self.attenuation_distance > 0. {
+                -c.clamp(1e-4, 1.).ln() / self.attenuation_distance
+            } else {
+                0.
+            }
+        });
+        let dielectric = self
+            .specular_color
+            .map(|c| self.specular * (f0 * c).min(1.));
+        words[48] = self.transmission.clamp(0., 1.).to_bits();
+        words[49] = self.ior.to_bits();
+        words[50] = self.thickness.max(0.).to_bits();
+        words[51..54].copy_from_slice(&sigma.map(f32::to_bits));
+        words[54] = self.specular.clamp(0., 1.).to_bits();
+        words[55..58].copy_from_slice(&dielectric.map(f32::to_bits));
+        words[11] = (words[11] & !8) | if self.transmission > 0. { 8 } else { 0 };
+    }
+}
+
+/// Per-scene fixes for broken material data (`performance/scenes/material_overrides.txt`):
+/// lines `FILE PATTERN key=value...`, PATTERN `*` or a substring of the material name;
+/// keys transmission, ior, specular, thickness, roughness, base=r,g,b. Later lines win.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaterialOverride {
+    pub file: String,
+    pub pattern: String,
+    pub settings: Vec<(String, Vec<f32>)>,
+}
+
+pub fn parse_overrides(text: &str) -> Vec<MaterialOverride> {
+    text.lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let file = fields.next()?.to_owned();
+            let pattern = fields.next()?.to_owned();
+            let settings = fields
+                .filter_map(|f| {
+                    let (key, value) = f.split_once('=')?;
+                    let values: Option<Vec<f32>> =
+                        value.split(',').map(|v| v.parse().ok()).collect();
+                    Some((key.to_owned(), values?))
+                })
+                .collect();
+            Some(MaterialOverride {
+                file,
+                pattern,
+                settings,
+            })
+        })
+        .collect()
+}
+
+/// Applies the overrides for `file` that match `name` to a material and its optics.
+fn apply_overrides(
+    overrides: &[MaterialOverride],
+    file: &str,
+    name: &str,
+    words: &mut Material,
+    optics: &mut Optics,
+) {
+    for o in overrides
+        .iter()
+        .filter(|o| o.file == file && (o.pattern == "*" || name.contains(&o.pattern)))
+    {
+        for (key, values) in &o.settings {
+            match (key.as_str(), values.as_slice()) {
+                ("transmission", [v]) => optics.transmission = *v,
+                ("ior", [v]) => optics.ior = *v,
+                ("specular", [v]) => optics.specular = *v,
+                ("thickness", [v]) => optics.thickness = *v,
+                ("roughness", [v]) => words[8] = v.to_bits(),
+                ("base", [r, g, b]) => words[..3].copy_from_slice(&[*r, *g, *b].map(f32::to_bits)),
+                _ => eprintln!("material override: unknown setting {key}"),
+            }
+        }
+    }
+}
+
 /// Untextured, double-sided metallic/roughness material words (see import_material).
-pub fn plain_material(color: [f32; 3], metallic: f32, roughness: f32) -> [u32; 48] {
-    let mut words = [0u32; 48];
+pub fn plain_material(color: [f32; 3], metallic: f32, roughness: f32) -> Material {
+    let mut words = [0u32; MATERIAL_WORDS];
     words[..4].copy_from_slice(&[color[0], color[1], color[2], 1.].map(f32::to_bits));
     words[7] = metallic.to_bits();
     words[8] = roughness.to_bits();
@@ -75,6 +213,7 @@ pub fn plain_material(color: [f32; 3], metallic: f32, roughness: f32) -> [u32; 4
     for slot in super::gpu_textures::SLOTS {
         words[slot] = u32::MAX;
     }
+    Optics::default().write(&mut words);
     words
 }
 
@@ -83,7 +222,7 @@ pub struct Mesh {
     pub vertices: Vec<MeshVertex>,
     pub triangles: Vec<Triangle>,
     pub nodes: Vec<BvhNode>,
-    pub materials: Vec<[u32; 48]>,
+    pub materials: Vec<Material>,
     pub textures: Vec<[u32; 4]>,
     pub pixels: Vec<u32>,
     pub camera: Option<Camera>,
@@ -482,7 +621,7 @@ impl Mesh {
         &mut self,
         vertices: Vec<MeshVertex>,
         triangles: Vec<[u32; 3]>,
-        material: [u32; 48],
+        material: Material,
     ) {
         assert!(quad_bvh(), "moving objects need --quad-bvh (or --fastest)");
         let mut object = Mesh {
@@ -678,7 +817,12 @@ impl Mesh {
         for extension in file.document.extensions_used() {
             if !matches!(
                 extension,
-                "KHR_materials_emissive_strength" | "KHR_texture_transform"
+                "KHR_materials_emissive_strength"
+                    | "KHR_texture_transform"
+                    | "KHR_materials_transmission"
+                    | "KHR_materials_ior"
+                    | "KHR_materials_specular"
+                    | "KHR_materials_volume"
             ) {
                 eprintln!(
                     "glTF: optional {extension} is not implemented; using its core glTF fallback"
@@ -732,10 +876,31 @@ impl Mesh {
                 | (u32::from(sampler.mag_filter() == Some(gltf::texture::MagFilter::Nearest)) << 4);
             mesh.textures.push(desc);
         }
+        let overrides = parse_overrides(
+            &std::fs::read_to_string("performance/scenes/material_overrides.txt")
+                .unwrap_or_default(),
+        );
+        let file_name = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
         for material in document.materials() {
-            mesh.materials.push(import_material(&material)?);
+            let mut words = import_material(&material)?;
+            let mut optics = Optics::from_gltf(&material);
+            apply_overrides(
+                &overrides,
+                &file_name,
+                material.name().unwrap_or(""),
+                &mut words,
+                &mut optics,
+            );
+            optics.write(&mut words);
+            mesh.materials.push(words);
         }
-        let mut default = [0; 48];
+        if overrides.iter().any(|o| o.file == file_name) {
+            eprintln!("glTF: applied material overrides for {file_name}");
+        }
+        let mut default = [0; MATERIAL_WORDS];
         default[..4].fill(1f32.to_bits());
         for i in [7, 8, 9] {
             default[i] = 1f32.to_bits();
@@ -744,6 +909,7 @@ impl Mesh {
         for i in [16, 24, 32, 40] {
             default[i] = u32::MAX;
         }
+        Optics::default().write(&mut default);
         mesh.materials.push(default);
         let scene = document
             .default_scene()
@@ -939,7 +1105,7 @@ impl Mesh {
     }
 
     pub fn gpu_words(&self, sphere_count: u32, light_count: u32) -> Vec<u32> {
-        // Header, nodes (8), triangles (4), vertices (16), materials (48), texture descriptors (4).
+        // Header, nodes (8), triangles (4), vertices (16), materials (64), texture descriptors (4).
         let mut words = vec![0; 16];
         let mut object_roots: Vec<u32> = Vec::new();
         words[0] = self.nodes.len() as u32;
@@ -1307,8 +1473,9 @@ impl Mesh {
             .iter()
             .enumerate()
         {
+            // Shader-tested: one-sided, alpha-masked or transmissive (shadow rays pass).
             let flags = self.materials[tri.material as usize][11];
-            lists[usize::from(flags & 3 != 1)].push(index as u32);
+            lists[usize::from(flags & 11 != 1)].push(index as u32);
         }
         lists
     }
@@ -1385,11 +1552,11 @@ fn required_uv_sets(material: &gltf::Material<'_>) -> LoadResult<Vec<u32>> {
     Ok(sets)
 }
 
-fn import_material(material: &gltf::Material<'_>) -> LoadResult<[u32; 48]> {
+fn import_material(material: &gltf::Material<'_>) -> LoadResult<Material> {
     if material.alpha_mode() == gltf::material::AlphaMode::Blend {
         return Err("glTF alphaMode BLEND is not yet supported; use OPAQUE or MASK".into());
     }
-    let mut words = [0; 48];
+    let mut words = [0; MATERIAL_WORDS];
     let pbr = material.pbr_metallic_roughness();
     words[..4].copy_from_slice(&pbr.base_color_factor().map(f32::to_bits));
     let strength = material.emissive_strength().unwrap_or(1.);
@@ -1620,7 +1787,7 @@ fn traversal_cost() -> f32 {
 }
 
 fn encode_scene_cache(mesh: &Mesh) -> Vec<u8> {
-    let mut bytes = b"RTSCENE5".to_vec();
+    let mut bytes = b"RTSCENE6".to_vec();
     let camera = mesh.camera.unwrap();
     let values = [
         camera.eye_pos.x,
@@ -1689,7 +1856,7 @@ fn decode_scene_cache(mut bytes: &[u8]) -> Option<Mesh> {
                 .collect(),
         )
     }
-    if take(&mut bytes, 8)? != b"RTSCENE5" {
+    if take(&mut bytes, 8)? != b"RTSCENE6" {
         return None;
     }
     let c: Vec<f32> = take(&mut bytes, 48)?
@@ -1750,6 +1917,54 @@ fn outward_half(value: f32, upper: bool) -> u16 {
 #[cfg(test)]
 mod local_tests {
     use super::*;
+
+    #[test]
+    fn material_overrides_parse_match_and_later_lines_win() {
+        let overrides = parse_overrides(
+            "# comment\nscene.glb * transmission=0 ior=1.5\nscene.glb Glass transmission=1 base=1,0.5,0 # tail\nother.glb * ior=2\nbad\n",
+        );
+        assert_eq!(overrides.len(), 3);
+        let mut words = plain_material([0.2; 3], 0., 0.5);
+        let mut optics = Optics {
+            transmission: 1.,
+            ior: 1.,
+            ..Optics::default()
+        };
+        apply_overrides(&overrides, "scene.glb", "Pavement", &mut words, &mut optics);
+        assert_eq!((optics.transmission, optics.ior), (0., 1.5));
+        apply_overrides(
+            &overrides,
+            "scene.glb",
+            "MASTER_Glass_Clean",
+            &mut words,
+            &mut optics,
+        );
+        assert_eq!(optics.transmission, 1.);
+        assert_eq!(f32::from_bits(words[1]), 0.5);
+    }
+
+    #[test]
+    fn optics_pack_fresnel_absorption_and_the_transmissive_flag() {
+        let mut words = plain_material([1.; 3], 0., 0.5);
+        // Defaults reproduce the old fixed dielectric F0 of 0.04, F90 1, opaque.
+        assert!((f32::from_bits(words[55]) - 0.04).abs() < 1e-6);
+        assert_eq!(f32::from_bits(words[54]), 1.);
+        assert_eq!(words[11] & 8, 0);
+        Optics {
+            transmission: 1.,
+            ior: 1.,
+            specular: 0.5,
+            attenuation_color: [0.5, 1., 1.],
+            attenuation_distance: 2.,
+            ..Optics::default()
+        }
+        .write(&mut words);
+        assert_eq!(f32::from_bits(words[55]), 0.);
+        assert_eq!(f32::from_bits(words[54]), 0.5);
+        assert!((f32::from_bits(words[51]) - std::f32::consts::LN_2 / 2.).abs() < 1e-6);
+        assert_eq!(f32::from_bits(words[52]), 0.);
+        assert_eq!(words[11] & 8, 8);
+    }
     #[test]
     fn quantized_bounds_are_outward_rounded() {
         for i in -10000..=10000 {

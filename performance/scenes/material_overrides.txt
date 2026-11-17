@@ -1,0 +1,28 @@
+# Fixes for broken material data in converted scenes, applied at load time
+# (src/raytracer/mesh.rs MaterialOverride):
+#   FILE  PATTERN  key=value ...
+# PATTERN is * or a substring of the material name; later lines win. Keys:
+# transmission, ior, specular, thickness, roughness, base=r,g,b.
+
+# Bistro: the conversion marked nearly every material (pavement, bricks, metal) fully
+# transmissive, glass with ior 1 (no reflection) and most surfaces with specular 0.
+# Reset everything to opaque glTF defaults, then make the real glass glass: lamp
+# glass, bottles, signs. Window panes become dark reflective glass and the lit shop
+# windows (MASTER_Glass_Exterior, emissive) stay opaque: the buildings have no rooms.
+exterior.glb  *                     transmission=0 ior=1.5 specular=1
+exterior.glb  Glass                 transmission=1 ior=1.5 base=1,1,1
+exterior.glb  MASTER_Glass_Clean    transmission=0 base=0.02,0.02,0.02 roughness=0.05
+exterior.glb  MASTER_Glass_Dirty    transmission=0 base=0.04,0.04,0.04 roughness=0.25
+exterior.glb  Streetlight_Glass     roughness=0.1
+exterior.glb  MASTER_Glass_Exterior transmission=0
+exterior-untextured.glb  *                     transmission=0 ior=1.5 specular=1
+exterior-untextured.glb  Glass                 transmission=1 ior=1.5 base=1,1,1
+exterior-untextured.glb  MASTER_Glass_Clean    transmission=0 base=0.02,0.02,0.02 roughness=0.05
+exterior-untextured.glb  MASTER_Glass_Dirty    transmission=0 base=0.04,0.04,0.04 roughness=0.25
+exterior-untextured.glb  Streetlight_Glass     roughness=0.1
+exterior-untextured.glb  MASTER_Glass_Exterior transmission=0
+
+# Fireplace room: walls, sofa and table marked fully transmissive, ior 1 everywhere.
+fireplace_room.glb  *                transmission=0 ior=1.5 specular=1
+fireplace_room.glb  :Glass           transmission=1 base=1,1,1 roughness=0.02
+fireplace_room.glb  FireplaceGlass   transmission=1 base=1,1,1 roughness=0.05

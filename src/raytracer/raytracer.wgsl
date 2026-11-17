@@ -97,6 +97,12 @@ override RESTIR_CAP: f32 = 20.;
 // (W f32, M f32), (distance from the camera f32, normal oct snorm16x2).
 @group(1) @binding(8) var<storage, read_write> reservoirs: array<vec2<u32>>;
 var<private> sampleIndex: u32;
+// Shadow (visibility) queries pass through transmissive surfaces.
+var<private> shadowRay: bool;
+// The path is inside a refracting volume (KHR_materials_volume), absorbing pathSigma
+// per unit length.
+var<private> pathInside: bool;
+var<private> pathSigma: vec3<f32>;
 var<private> primaryEmission: vec3<f32>;
 // Share of light samples given to the sun when lamps are sampled too.
 const SUN_SHARE = 0.75;
@@ -459,6 +465,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
     var sunMisWeight = 1.;
     // Pdf of the BSDF sample that continued the path (< 0: no light sampling there).
     var lastBsdfPdf = -1.;
+    pathInside = false;pathSigma = vec3(0.);
     let sunOn = SUN && skyState.sunRadiance.g > 0.;
     let sunShare = select(0.,select(1.,SUN_SHARE,LAMPS),sunOn);
     // Light-sample shares of the vertex the path continues from (for MIS of what the
@@ -480,6 +487,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
         if VIS_PRIMARY {visibilityPending = bounce == 0u;}
 
         if intersection(ray, &hit) {
+            if pathInside {throughput *= exp(-pathSigma * hit.t * length(ray.direction));}
             if GBUFFER && bounce == 0u {
                 let shaded = TRACE_MESHES && hit.sphereIdx == 0xffffffffu && !(SKIP_FINAL_SCATTER && samplingParams.numBounces == 1u);
                 if shaded { gbufferPending = true; } else { writeGbufferHit(ray, hit); }
@@ -1145,6 +1153,12 @@ fn occludedWithin(ray: Ray, limit: f32) -> bool {
     return blocked;
 }
 fn skyOccludedExact(ray: Ray, limit: f32) -> bool {
+    shadowRay=true;
+    let blocked=skyOccludedQuery(ray,limit);
+    shadowRay=false;
+    return blocked;
+}
+fn skyOccludedQuery(ray: Ray, limit: f32) -> bool {
     if ALPHA_CAP {alphaQueries=0u;}
     for(var i=0u;i<SPHERE_COUNT;i+=1u) {
         var hit=Intersection();
