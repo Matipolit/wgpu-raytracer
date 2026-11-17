@@ -89,8 +89,9 @@ override DENOISER_INPUT: bool = false;
 // frames (temporal reuse along motion) and borrow from previous-frame neighbours
 // (spatial reuse), so each pixel effectively weighs hundreds of lamp candidates.
 override RESTIR: bool = false;
-const RESTIR_SPATIAL = 3u;
-const RESTIR_RADIUS = 16.;
+override RESTIR_SPATIAL: u32 = 3u;
+override RESTIR_RADIUS: f32 = 16.;
+override RESTIR_CAP: f32 = 20.;
 // Reservoirs: two frames (parity) x pixels x 3 vec2<u32>: (triangle, barycentrics
 // unorm16x2), (W f32, M f32), (distance from the camera f32, normal oct snorm16x2).
 @group(1) @binding(8) var<storage, read_write> reservoirs: array<vec2<u32>>;
@@ -1249,7 +1250,7 @@ fn restirLamps(hit: Intersection, surface: PbrSurface, rng: ptr<function,u32>) -
         if w>0. && rngNextFloat(rng)*sum<w {chosen=candidate;chosenTarget=score;}
     }
     m=f32(LAMP_CANDIDATES);
-    let cap=20.*f32(LAMP_CANDIDATES);
+    let cap=RESTIR_CAP*f32(LAMP_CANDIDATES);
     let previous=previousPixel(hit.p);
     let seenFrom=distance(prevCamera.eye,hit.p);
     let parity=samplingParams.restir&1u;

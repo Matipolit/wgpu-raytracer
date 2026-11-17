@@ -627,6 +627,19 @@ impl Raytracer {
             ("LAMPS", f64::from(scene.mesh.lamp_count() > 0)),
             ("DENOISER_INPUT", f64::from(temporal_source.is_some())),
             ("RESTIR", f64::from(scene.mesh.lamp_count() > 0)),
+            // Experiments: RT_RESTIR_SPATIAL, RT_RESTIR_RADIUS, RT_RESTIR_CAP.
+            (
+                "RESTIR_SPATIAL",
+                std::env::var("RT_RESTIR_SPATIAL").map_or(3., |v| v.parse().unwrap()),
+            ),
+            (
+                "RESTIR_RADIUS",
+                std::env::var("RT_RESTIR_RADIUS").map_or(16., |v| v.parse().unwrap()),
+            ),
+            (
+                "RESTIR_CAP",
+                std::env::var("RT_RESTIR_CAP").map_or(20., |v| v.parse().unwrap()),
+            ),
             (
                 "LAMP_CANDIDATES",
                 std::env::var("RT_LAMP_CANDIDATES").map_or(8., |v| v.parse().unwrap()),
