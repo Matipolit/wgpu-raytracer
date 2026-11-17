@@ -337,6 +337,7 @@ fn run_scene_queries_with(
         ),
         ("LIGHT_COUNT", light_count),
         ("WIDE_BVH", f64::from(crate::raytracer::mesh::bvh_width())),
+        ("CW_BVH", f64::from(crate::raytracer::mesh::cw_bvh())),
         (
             "QUANTIZED_BVH",
             f64::from(crate::raytracer::mesh::quantized_bvh()),

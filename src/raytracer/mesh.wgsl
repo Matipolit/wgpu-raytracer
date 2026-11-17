@@ -830,9 +830,11 @@ fn meshCwCandidate(ray:Ray,limit:f32,anyHit:bool,outBest:ptr<function,MeshCandid
             triangleHits&=triangleHits-1u;
             if TRAVERSAL_STATS {statTriangles+=1u;}
             var hit=MeshCandidate();
-            if meshCandidate(ray,meshData[triangles+triangleBase+bit],closest,&hit){
+            // Equal distances keep the lowest triangle index (as the other traversals).
+            let limit=select(closest,bitcast<f32>(bitcast<u32>(closest)+1u),found);
+            if meshCandidate(ray,meshData[triangles+triangleBase+bit],limit,&hit){
                 if anyHit {return true;}
-                closest=hit.t;best=hit;found=true;
+                if !found || hit.t<closest || (hit.t==closest && hit.index<best.index) {closest=hit.t;best=hit;found=true;}
             }
         }
         if group.y<=0xffffffu {
