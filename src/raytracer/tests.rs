@@ -9,15 +9,12 @@ fn gpu() -> (wgpu::Device, wgpu::Queue) {
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
             .expect("GPU regression tests require an available adapter");
+        let (required_features, required_limits) = gpu_textures::device_requirements(&adapter);
         adapter
             .request_device(&wgpu::DeviceDescriptor {
-                required_limits: wgpu::Limits {
-                    max_storage_buffer_binding_size: adapter
-                        .limits()
-                        .max_storage_buffer_binding_size,
-                    max_buffer_size: adapter.limits().max_buffer_size,
-                    ..Default::default()
-                },
+                required_features,
+                required_limits,
+                experimental_features: crate::raytracer::gpu_textures::experimental_features(),
                 ..Default::default()
             })
             .await
@@ -50,6 +47,7 @@ fn params() -> RenderParams {
             focus_distance: 10.,
         },
         exposure: 0.246,
+        auto_exposure: false,
         sky: SkyParams::default(),
         sampling: SamplingParams {
             max_samples_per_pixel: 8,
@@ -204,7 +202,8 @@ fn textured_scene_and_egui_share_the_display_pass() {
     params.viewport_size = (640, 480);
     params.sampling.num_samples_per_pixel = 8;
     let surface_config = config(params.viewport_size);
-    let mut tracer = Raytracer::new(&device, &surface_config, &crate::scene(), &params).unwrap();
+    let mut tracer =
+        Raytracer::new(&device, &queue, &surface_config, &crate::scene(), &params).unwrap();
     let scene_only = render(&device, &queue, &mut tracer);
     assert!(scene_only.chunks_exact(4).any(|pixel| pixel[..3] != [0; 3]));
 
@@ -262,6 +261,7 @@ fn resizing_and_accumulation_keep_every_pixel_at_the_same_brightness() {
     let mut params = params();
     let mut tracer = Raytracer::new(
         &device,
+        &queue,
         &config(params.viewport_size),
         &uniform_scene(),
         &params,
@@ -315,8 +315,14 @@ fn denoiser_enable_radius_and_sigma_control_the_display() {
     scene
         .spheres
         .push(Sphere::new(glm::vec3(0., 0., -3.), 0.5, 1));
-    let mut tracer =
-        Raytracer::new(&device, &config(params.viewport_size), &scene, &params).unwrap();
+    let mut tracer = Raytracer::new(
+        &device,
+        &queue,
+        &config(params.viewport_size),
+        &scene,
+        &params,
+    )
+    .unwrap();
     let unfiltered = render(&device, &queue, &mut tracer);
 
     // Reuse the seed so each setting is tested against identical path samples.
@@ -358,8 +364,8 @@ impl FragmentReference {
             source: wgpu::ShaderSource::Wgsl(include_str!("tests/fragment_reference.wgsl").into()),
         });
         let vertex = tracer.display_pipeline.get_bind_group_layout(0);
-        let parameters = tracer.accumulation_pipeline.get_bind_group_layout(2);
-        let scene = tracer.accumulation_pipeline.get_bind_group_layout(3);
+        let parameters = tracer.trace_pipelines[0].get_bind_group_layout(2);
+        let scene = tracer.trace_pipelines[0].get_bind_group_layout(3);
         let trace_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("reference trace layout"),
             bind_group_layouts: &[
@@ -459,10 +465,22 @@ fn compute_matches_fragment_reference_through_accumulation_and_resize() {
     let mut params = params();
     params.camera = crate::FlyCameraController::default().renderer_camera();
     let scene = crate::scene();
-    let mut compute =
-        Raytracer::new(&device, &config(params.viewport_size), &scene, &params).unwrap();
-    let mut fragment =
-        Raytracer::new(&device, &config(params.viewport_size), &scene, &params).unwrap();
+    let mut compute = Raytracer::new(
+        &device,
+        &queue,
+        &config(params.viewport_size),
+        &scene,
+        &params,
+    )
+    .unwrap();
+    let mut fragment = Raytracer::new(
+        &device,
+        &queue,
+        &config(params.viewport_size),
+        &scene,
+        &params,
+    )
+    .unwrap();
     let reference = FragmentReference::new(&device, &fragment);
     let mut largest_error = 0;
     for size in [(13, 9), (63, 47), (128, 96)] {

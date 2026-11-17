@@ -23,15 +23,12 @@ async fn run_async() {
         adapter.features().contains(features),
         "Benchmark requires GPU timestamp queries"
     );
-    let limits = adapter.limits();
+    let required = crate::raytracer::gpu_textures::device_requirements(&adapter);
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
-            required_features: features | crate::experiment_features(&adapter),
-            required_limits: wgpu::Limits {
-                max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
-                max_buffer_size: limits.max_buffer_size,
-                ..Default::default()
-            },
+            required_features: features | crate::experiment_features(&adapter) | required.0,
+            required_limits: required.1,
+            experimental_features: crate::raytracer::gpu_textures::experimental_features(),
             ..Default::default()
         })
         .await
@@ -51,6 +48,7 @@ async fn run_async() {
             let mut params = RenderParams {
                 camera: camera.renderer_camera(),
                 exposure: crate::scene_exposure(&scene),
+                auto_exposure: false,
                 sky: crate::scene_sky(&scene),
                 sampling: SamplingParams {
                     num_samples_per_pixel: if converged { 8 } else { 1 },
@@ -71,7 +69,7 @@ async fn run_async() {
                 desired_maximum_frame_latency: 2,
                 color_space: wgpu::SurfaceColorSpace::Auto,
             };
-            let mut tracer = Raytracer::new(&device, &config, &scene, &params).unwrap();
+            let mut tracer = Raytracer::new(&device, &queue, &config, &scene, &params).unwrap();
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("benchmark output"),
                 size: wgpu::Extent3d {
@@ -162,6 +160,7 @@ async fn run_async() {
                 encoder.resolve_query_set(&queries, 0..2, &resolve, 0);
                 encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, 16);
                 queue.submit(ui_commands.into_iter().chain([encoder.finish()]));
+                tracer.after_submit(&device);
                 gui.free_textures();
                 let cpu = start.elapsed().as_secs_f64() * 1000.;
                 readback

@@ -1,3 +1,6 @@
+// Mesh textures are a binding array (see mesh.wgsl and gpu_textures.rs).
+enable wgpu_binding_array;
+
 const EPSILON = 0.001f;
 
 const PI = 3.1415927f;
@@ -41,15 +44,27 @@ struct VertexOutput {
 @group(1) @binding(2) var<storage, read> accumulatedImage: array<array<f32, 3>>;
 @group(1) @binding(3) var<storage, read_write> filteredImage: array<array<f32, 3>>;
 @group(1) @binding(4) var<storage, read> displayImage: array<array<f32, 3>>;
+// [0]: log-average luminance of the filtered image (written by csExposure),
+// [1]: nonzero when automatic exposure is enabled (written by the host).
+@group(1) @binding(5) var<storage, read_write> exposureState: array<f32, 4>;
+@group(1) @binding(6) var<storage, read> displayExposure: array<f32, 4>;
 
 @group(2) @binding(0) var<uniform> camera: Camera;
 @group(2) @binding(1) var<uniform> samplingParams: SamplingParams;
 @group(2) @binding(2) var<storage, read> skyState: SkyState;
+// The camera of the previous frame, for motion vectors.
+@group(2) @binding(3) var<uniform> prevCamera: Camera;
 
 @group(3) @binding(0) var<storage, read> spheres: array<Sphere>;
 @group(3) @binding(1) var<storage, read> materials: array<Material>;
 @group(3) @binding(2) var<storage, read> textures: array<array<f32, 3>>;
 @group(3) @binding(3) var<storage, read> lights: array<u32>;
+// Sphere centres in the previous frame (xyz), for motion vectors of moving spheres.
+@group(3) @binding(7) var<storage, read> spherePrevCenters: array<vec4<f32>>;
+// Primary-hit guides for the temporal denoiser, three vec4 per pixel:
+// (albedo.rgb, distance), (normal.xyz, roughness), (motion.xy in pixels, metallic, hit kind).
+// Distance 0 and kind 0 mark a sky pixel; kind 1 a mesh, 2 a sphere.
+@group(1) @binding(7) var<storage, read_write> gbuffer: array<vec4<f32>>;
 
 // Specialized by the host; dispatch dimensions use the same constants.
 override SPHERE_COUNT: u32 = 0u;
@@ -65,7 +80,35 @@ override GGX_VNDF: bool = false;
 override GGX_BOUNDED:bool=false;
 
 override SPARSE_DENOISE:bool=false;
+// Diagnostics: output (BVH nodes visited, triangles tested, rays traced) per pixel instead of radiance.
+override TRAVERSAL_STATS:bool=false;
+// Write primary-hit guides and motion vectors (temporal denoiser input).
+override GBUFFER:bool=false;
+override COHERENCE_TEST:bool=false;
+var<private> gbufferPixel:u32;
+var<private> gbufferSample:vec2<f32>;
+// Set at a bounce-0 mesh hit: the G-buffer takes the material values the mesh shading
+// already sampled (shaded*, set by scatterPbr/pbrSurface) instead of sampling twice.
+var<private> gbufferPending:bool;
+var<private> shadedBase:vec3<f32>;
+var<private> shadedRough:f32;
+var<private> shadedMetal:f32;
+var<private> statNodes:u32;
+var<private> statTriangles:u32;
+var<private> statRays:u32;
 override WIDE_BVH:u32=2u;
+override PAIR_BVH:bool=false;
+override QUAD_BVH:bool=false;
+override OCT_BVH:bool=false;
+// Hardware ray queries (--hw-rt); see hwrt.wgsl.
+override HW_RT:bool=false;
+override HW_FLIP_FACING:bool=false;
+override QUAD_CULL:bool=false;
+override QUAD_LEAF_COUNT:bool=false;
+override QUAD_Q8:bool=false;
+// Workgroup-memory traversal stack (RT_QUAD_SLM): entry i of lane l at i*64+l.
+var<private> quadLane: u32;
+const QUAD_CULL_SLOTS=64u;
 override QUANTIZED_BVH:bool=false;
 override OPACITY_APPROX:bool=false;
 override SOFTWARE_OPACITY:bool=false;
@@ -78,7 +121,33 @@ override STOCHASTIC_TEXTURE:u32=0u;
 override PACKED_DIRECTIONS:bool=false;
 override SKIP_FINAL_SCATTER:bool=false;
 override BLUE_NOISE_JITTER:bool=false;
+// `--blue-noise-path`: the first BLUE_NOISE_DIMS random numbers of every path (pixel
+// jitter, lens, bounce-0 lobe and direction) come from the 64x64 blue-noise masks,
+// shifted per dimension (R2 offsets) and per frame (golden ratio), so 1-spp error
+// is spread as blue noise in screen space and low-discrepancy over frames.
+override BLUE_NOISE_PATH:bool=false;
+// `--center-jitter`: primary rays through pixel centres (rasterized-visibility comparisons).
+override CENTER_JITTER:bool=false;
+// `--visibility-primary`: bounce 0 takes its hit from the rasterized visibility buffer
+// (visibility.wgsl) instead of tracing the primary ray; all pixels share the raster's
+// per-frame sub-pixel jitter.
+override VIS_PRIMARY:bool=false;
+// Set for the primary ray: the next mesh query takes its candidate from the visibility
+// buffer instead of traversing (spheres and hit resolution stay shared).
+var<private> visibilityPending:bool;
+// VISIBILITY STUBS: removed when visibility.wgsl is part of the module.
+fn visibilityCandidate(ray: Ray, tmax: f32, best: ptr<function, MeshCandidate>) -> bool { return false; }
+fn visibilityJitter() -> vec2<f32> { return vec2(0.5); }
+// END VISIBILITY STUBS
+const BLUE_NOISE_DIMS = 8u;
+var<private> blueNoiseDim:u32;
+var<private> blueNoisePixel:vec2<u32>;
+var<private> blueNoiseShift:f32;
 override RAY_CONES:bool=false;
+// Ray cones only at the primary hit (later bounces sample the base level).
+override CONES_PRIMARY_ONLY:bool=false;
+// Whether the current hit selects mips from its ray cone.
+var<private> coneActive:bool;
 var<private> coneWidth:f32;
 var<private> coneSpread:f32;
 var<private> footprintUV0:vec2<f32>;
@@ -86,13 +155,15 @@ var<private> footprintUV1:vec2<f32>;
 var<private> textureRng:u32;
 // Every invocation owns one pixel; the next pass only sees completed sums.
 @compute @workgroup_size(TRACE_WIDTH, TRACE_HEIGHT)
-fn csAccumulate(@builtin(global_invocation_id) id: vec3<u32>) {
-    let x = id.x;
-    let y = id.y;
+fn csAccumulate(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
+    quadLane = lane;
+    let x = id.x + (samplingParams.traceOrigin & 0xffffu);
+    let y = id.y + (samplingParams.traceOrigin >> 16u);
     if x >= frameData.x || y >= frameData.y {
         return;
     }
     let idx = frameData.x * y + x;
+    gbufferPixel = idx;
     var pixel = vec3(0f);
     if samplingParams.clearAccumulatedSamples == 0u {
         pixel = vec3(imageBuffer[idx][0], imageBuffer[idx][1], imageBuffer[idx][2]);
@@ -201,6 +272,44 @@ fn csDenoise(
     filteredImage[frameData.x * id.y + id.x] = array<f32, 3>(color.r, color.g, color.b);
 }
 
+// Log-average ("key") luminance over a fixed 64x64 grid of 4x4 blocks of the filtered image,
+// so the cost does not grow with resolution. One workgroup; runs after filtering.
+var<workgroup> exposureSums: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn csExposure(@builtin(local_invocation_index) lane: u32) {
+    let width = frameData.x;
+    let height = frameData.y;
+    let columns = min(width, 64u);
+    let rows = min(height, 64u);
+    var sum = 0f;
+    for (var i = lane; i < columns * rows; i += 256u) {
+        // Average a 4x4 block first: the log of single noisy low-spp pixels
+        // (many black, few bright) would bias the key low and overexpose.
+        let x0 = min((i % columns) * width / columns, max(width, 4u) - 4u);
+        let y0 = min((i / columns) * height / rows, max(height, 4u) - 4u);
+        var luminance = 0f;
+        for (var y = y0; y < min(y0 + 4u, height); y += 1u) {
+            for (var x = x0; x < min(x0 + 4u, width); x += 1u) {
+                let color = filteredImage[width * y + x];
+                luminance += dot(vec3(color[0], color[1], color[2]), vec3(0.2126, 0.7152, 0.0722));
+            }
+        }
+        sum += log(max(luminance / f32((min(y0 + 4u, height) - y0) * (min(x0 + 4u, width) - x0)), 1e-4));
+    }
+    exposureSums[lane] = sum;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride >>= 1u) {
+        if lane < stride {
+            exposureSums[lane] += exposureSums[lane + stride];
+        }
+        workgroupBarrier();
+    }
+    if lane == 0u {
+        exposureState[0] = exposureSums[0] / f32(columns * rows);
+    }
+}
+
 // The remaining raster pass only tone-maps the computed image and draws the UI.
 @fragment
 fn fsMain(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -216,7 +325,10 @@ fn fsMain(in: VertexOutput) -> @location(0) vec4<f32> {
 fn uncharted2(x: vec3<f32>) -> vec3<f32> {
     // Based on uncharted2 tonemapping function
     // https://dmnsgn.github.io/glsl-tone-map/
-    let exposureBias = bitcast<f32>(frameData.w);
+    // Automatic exposure maps the log-average luminance to middle grey (0.18);
+    // the user exposure then acts as compensation on top of it.
+    let automatic = select(1f, 0.18 / exp(displayExposure[0]), displayExposure[1] != 0f);
+    let exposureBias = bitcast<f32>(frameData.w) * automatic;
     let curr = uncharted2Tonemap(exposureBias * x);
 
     let w = 11.2;
@@ -244,7 +356,14 @@ fn samplePixel(x: u32, y: u32, rngState: ptr<function, u32>) -> vec3<f32> {
     let numSamples = samplingParams.numSamplesPerPixel;
     var color = vec3(0f);
     for (var i = 0u; i < numSamples; i += 1u) {
+        if BLUE_NOISE_PATH {
+            blueNoiseDim = 0u;
+            blueNoisePixel = vec2(x, y);
+            blueNoiseShift = fract(0.6180339887 * f32((frameData.z * numSamples + i) % 65536u));
+        }
         var jitter=vec2(rngNextFloat(rngState),rngNextFloat(rngState));
+        if CENTER_JITTER {jitter=vec2(0.5);}
+        if VIS_PRIMARY {jitter=visibilityJitter();}
         if BLUE_NOISE_JITTER {
             let mask=unpack2x16unorm(meshData[meshData[14u]+(y%64u)*64u+(x%64u)]);
             let sequence=fract(vec2(0.7548776662,0.569840291)*f32(frameData.z%65536u));
@@ -258,9 +377,10 @@ fn samplePixel(x: u32, y: u32, rngState: ptr<function, u32>) -> vec3<f32> {
             coneWidth=0.;coneSpread=length(camera.vertical)/(f32(imageHeight)*max(length(camera.lowerLeftCorner+0.5*camera.horizontal+0.5*camera.vertical-camera.eye),1e-5));
         }
         let primaryRay = cameraMakeRay(camera, rngState, u, 1f - v);
+        gbufferSample = vec2(u * f32(imageWidth), v * f32(imageHeight));
         color += rayColor(primaryRay, rngState);
     }
-
+    if TRAVERSAL_STATS {return vec3(f32(statNodes),f32(statTriangles),f32(statRays));}
     return color;
 }
 
@@ -287,9 +407,15 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
             if max(throughput.r, max(throughput.g, throughput.b)) <= 0. { break; }
         }
         if PACKED_DIRECTIONS && packedValid {ray.direction=decodeOct(packedDirection);}
+        if RAY_CONES {coneActive=!CONES_PRIMARY_ONLY || bounce==0u;}
         var hit = Intersection();
+        if VIS_PRIMARY {visibilityPending = bounce == 0u;}
 
         if intersection(ray, &hit) {
+            if GBUFFER && bounce == 0u {
+                let shaded = TRACE_MESHES && hit.sphereIdx == 0xffffffffu && !(SKIP_FINAL_SCATTER && samplingParams.numBounces == 1u);
+                if shaded { gbufferPending = true; } else { writeGbufferHit(ray, hit); }
+            }
             if TRACE_MESHES && hit.sphereIdx == 0xffffffffu {
                 let m = meshMaterialOffset(hit.materialIdx);
                 color += throughput * meshVec3(m+4u) * meshTexture(m+32u,vec2(hit.u,hit.v),hit.uv1,true).rgb;
@@ -313,6 +439,10 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                     scatter = sampled.scatter;
                     skyMisWeight = misWeight(sampled.pdf,skyPdf(scatter.ray.direction));
                 } else {scatter = scatterPbr(ray,hit,rngState);}
+                if GBUFFER && gbufferPending {
+                    gbufferPending = false;
+                    writeGbuffer(shadedBase, hit.t * length(ray.direction), hit.n, shadedRough, shadedMetal, hit.p, 1.);
+                }
                 ray = scatter.ray;
                 if RAY_CONES {coneSpread=min(1.,coneSpread+0.25*meshFloat(m+8u));}
                 if PACKED_DIRECTIONS {packedDirection=pack2x16snorm(encodeOct(normalize(ray.direction)));ray.direction=vec3(0.);packedValid=true;}
@@ -337,6 +467,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                 if max(throughput.r,max(throughput.g,throughput.b)) <= 0. {break;}
             }
         } else {
+            if GBUFFER && bounce == 0u { writeGbufferMiss(ray); }
             color += throughput * skyRadiance(normalize(ray.direction)) * skyMisWeight;
 
             break;
@@ -615,7 +746,8 @@ struct SamplingParams {
     denoisingEnabled: u32,
     denoisingRadius: u32,
     denoisingSigmaColor: f32,
-    padding: u32,
+    // Origin of the traced region: x in bits 0-15, y in bits 16-31 (0 = full frame).
+    traceOrigin: u32,
 }
 
 struct Sphere {
@@ -791,7 +923,17 @@ fn rngNextUintInRange(state: ptr<function, u32>, min: u32, max: u32) -> u32 {
     return min + (x) % (max - min);
 }
 
+fn blueNoiseNext() -> f32 {
+    let d = blueNoiseDim;
+    blueNoiseDim += 1u;
+    let offset = vec2<u32>(fract(vec2(0.7548776662, 0.569840291) * f32(d / 2u + 1u)) * 64.);
+    let p = (blueNoisePixel + offset) % vec2(64u);
+    let mask = unpack2x16unorm(meshData[meshData[14u] + p.y * 64u + p.x]);
+    return fract(select(mask.x, mask.y, (d & 1u) == 1u) + blueNoiseShift);
+}
+
 fn rngNextFloat(state: ptr<function, u32>) -> f32 {
+    if BLUE_NOISE_PATH && blueNoiseDim < BLUE_NOISE_DIMS { return min(blueNoiseNext(), 0.99999994); }
     let x = rngNextInt(state);
     return f32(x) / f32(0xffffffffu);
 }
@@ -888,4 +1030,64 @@ fn sparseBilateral(x:u32,y:u32)->vec3<f32>{
         let weight=exp(-dot(delta,delta)/(2.*sigma*sigma));sum+=weight*color;weights+=weight;
     }
     return sum/weights;
+}
+
+// Pixel position of a world point in the previous frame (pinhole camera model).
+fn previousPixel(p: vec3<f32>) -> vec2<f32> {
+    let w = prevCamera.lowerLeftCorner - prevCamera.eye;
+    let n = cross(prevCamera.horizontal, prevCamera.vertical);
+    let d = p - prevCamera.eye;
+    let dn = dot(d, n);
+    if dn * dot(w, n) <= 0. { return vec2(-1e9); }
+    let q = d * (dot(w, n) / dn) - w;
+    let s = dot(q, prevCamera.horizontal) / dot(prevCamera.horizontal, prevCamera.horizontal);
+    let t = dot(q, prevCamera.vertical) / dot(prevCamera.vertical, prevCamera.vertical);
+    return vec2(s * f32(frameData.x), (1. - t) * f32(frameData.y));
+}
+
+// Guides for the primary vertex. `previous` is where the hit point was last frame.
+fn writeGbuffer(albedo: vec3<f32>, distance: f32, normal: vec3<f32>, roughness: f32, metallic: f32, previous: vec3<f32>, kind: f32) {
+    let motion = previousPixel(previous) - gbufferSample;
+    let base = gbufferPixel * 3u;
+    gbuffer[base] = vec4(albedo, distance);
+    gbuffer[base + 1u] = vec4(normal, roughness);
+    gbuffer[base + 2u] = vec4(motion, metallic, kind);
+}
+
+fn writeGbufferHit(ray: Ray, hit: Intersection) {
+    let distance = hit.t * length(ray.direction);
+    if TRACE_MESHES && hit.sphereIdx == 0xffffffffu {
+        let m = meshMaterialOffset(hit.materialIdx);
+        let uv0 = vec2(hit.u, hit.v);
+        let base = (meshVec4(m) * meshTexture(m + 16u, uv0, hit.uv1, true)).rgb;
+        let mr = meshTexture(m + 24u, uv0, hit.uv1, false);
+        writeGbuffer(base, distance, hit.n, clamp(meshFloat(m + 8u) * mr.g, 0.045, 1.),
+            clamp(meshFloat(m + 7u) * mr.b, 0., 1.), hit.p, 1.);
+        return;
+    }
+    if TRACE_SPHERES {
+        let material = materials[hit.materialIdx];
+        var albedo = vec3(1.);
+        var roughness = 1.;
+        var metallic = 0.;
+        switch material.id {
+            case 0u, 4u: { albedo = textureLookup(material.desc1, hit.u, hit.v); }
+            case 1u: { albedo = textureLookup(material.desc1, hit.u, hit.v); roughness = material.x; metallic = 1.; }
+            case 2u: { roughness = 0.; }
+            case 3u: {
+                let sines = sin(5. * hit.p.x) * sin(5. * hit.p.y) * sin(5. * hit.p.z);
+                albedo = textureLookup(material.desc2, hit.u, hit.v);
+                if sines < 0. { albedo = textureLookup(material.desc1, hit.u, hit.v); }
+            }
+            default: {}
+        }
+        let moved = spheres[hit.sphereIdx].centerAndPad.xyz - spherePrevCenters[hit.sphereIdx].xyz;
+        writeGbuffer(albedo, distance, hit.n, roughness, metallic, hit.p - moved, 2.);
+    }
+}
+
+fn writeGbufferMiss(ray: Ray) {
+    // A direction: compare against the previous camera at a very large distance.
+    let previous = prevCamera.eye + normalize(ray.direction) * 1e6;
+    writeGbuffer(skyRadiance(normalize(ray.direction)), 0., -normalize(ray.direction), 1., 0., previous, 0.);
 }

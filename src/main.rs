@@ -20,10 +20,19 @@ use winit::{
 };
 
 mod benchmark;
+mod capture;
 mod fly_camera;
 mod gui;
 mod offline;
 mod raytracer;
+
+/// GPU, backend and driver, identifying the auto-tuner's calibration results.
+pub(crate) fn adapter_key(info: &wgpu::AdapterInfo) -> String {
+    format!(
+        "{}|{:?}|{}|{}",
+        info.name, info.backend, info.driver, info.driver_info
+    )
+}
 
 pub(crate) fn experiment_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     if has_flag("--fp16-state") {
@@ -53,12 +62,16 @@ fn main() {
     }
     if std::env::args().any(|argument| argument == "--help") {
         println!(
-            "Usage: cargo run --release -- [--sponza | --model FILE.gltf|FILE.glb] [--inspect-model] [--render-output FILE.png --samples N --size WIDTHxHEIGHT] [--russian-roulette | --no-russian-roulette] [--bounces N] [--sky-importance] [--ggx-vndf] [--sample-offset N] [--timing-output FILE.json] [--benchmark]\nDownload Sponza first with: python scripts/download_sponza.py\nLocal experiments: --bvh4 --bvh8 --quantized-bvh --bvh-leaf N --sah32 --sah-stop --packed-shading --stochastic-color --stochastic-all --fp16-state --packed-directions --skip-final-scatter --classify-opacity --approximate-alpha --alpha-cap4 --blue-noise-jitter --bounded-vndf --ray-cones --scene-cache"
+            "Usage: cargo run --release -- [--sponza | --model FILE.gltf|FILE.glb] [--inspect-model] [--render-output FILE.png --samples N --size WIDTHxHEIGHT] [--russian-roulette | --no-russian-roulette] [--bounces N] [--sky-importance] [--ggx-vndf] [--exposure X | --exposure-compensation X] [--no-auto-exposure] [--camera x,y,z,dx,dy,dz,fov] [--move-speed UNITS_PER_S] [--sample-offset N] [--timing-output FILE.json] [--benchmark]\nDownload Sponza first with: python scripts/download_sponza.py\nLocal experiments: --bvh4 --bvh8 --quantized-bvh --bvh-leaf N --sah32 --sah-stop --packed-shading --stochastic-color --stochastic-all --fp16-state --packed-directions --skip-final-scatter --classify-opacity --approximate-alpha --alpha-cap4 --blue-noise-jitter --bounded-vndf --ray-cones --scene-cache"
         );
         return;
     }
     if std::env::args().any(|argument| argument == "--inspect-model") {
         let _ = selected_scene();
+        return;
+    }
+    if has_flag("--capture") {
+        capture::run();
         return;
     }
     if std::env::args().any(|argument| argument == "--render-output") {
@@ -184,6 +197,8 @@ struct AppState {
     context: GpuContext,
     window: Arc<Window>,
     fly_camera_controller: FlyCameraController,
+    /// WASD speed in scene units per second.
+    move_speed: f32,
     render_params: RenderParams,
     last_time: Instant,
     fps_counter: FpsCounter,
@@ -199,7 +214,12 @@ impl AppState {
         let fly_camera_controller = scene_camera(&scene);
         let render_params = RenderParams {
             camera: fly_camera_controller.renderer_camera(),
-            exposure: scene_exposure(&scene),
+            exposure: if has_flag("--no-auto-exposure") {
+                scene_exposure(&scene)
+            } else {
+                AUTO_EXPOSURE_COMPENSATION
+            },
+            auto_exposure: !has_flag("--no-auto-exposure"),
             sky: scene_sky(&scene),
             sampling: SamplingParams {
                 num_bounces: selected_bounces(),
@@ -207,13 +227,15 @@ impl AppState {
             },
             viewport_size: (size.width.max(1), size.height.max(1)),
         };
-        let raytracer = Raytracer::new(
+        let mut raytracer = Raytracer::new(
             &context.device,
+            &context.queue,
             &context.surface_config,
             &scene,
             &render_params,
         )
         .expect("The default values should be selected correctly");
+        raytracer.calibrate(&context.device, &context.queue, &context.adapter_key);
         let gui = gui::Gui::new(&context.device, context.surface_config.format);
         let egui_state = egui_winit::State::new(
             gui.context.clone(),
@@ -227,6 +249,7 @@ impl AppState {
             window,
             context,
             fly_camera_controller,
+            move_speed: scene_move_speed(&scene),
             render_params,
             raytracer,
             gui,
@@ -290,8 +313,10 @@ impl AppState {
         let dt = now - self.last_time;
         self.last_time = now;
         self.fps_counter.update(dt.as_secs_f32());
-        self.fly_camera_controller
-            .after_events(self.render_params.viewport_size, 2.0 * dt.as_secs_f32());
+        self.fly_camera_controller.after_events(
+            self.render_params.viewport_size,
+            self.move_speed * dt.as_secs_f32(),
+        );
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let mut output = self.gui.run(
             raw_input,
@@ -356,6 +381,7 @@ impl AppState {
         self.context
             .queue
             .submit(ui_commands.into_iter().chain([encoder.finish()]));
+        self.raytracer.after_submit(&self.context.device);
         self.gui.free_textures();
         self.window.pre_present_notify();
         self.context.queue.present(frame);
@@ -366,6 +392,8 @@ impl AppState {
 }
 
 struct GpuContext {
+    /// GPU, backend and driver, for the auto-tuner's calibration cache.
+    adapter_key: String,
     instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -388,15 +416,12 @@ impl GpuContext {
             })
             .await
             .expect("Adapter should be available on desktop");
-        let supported = adapter.limits();
+        let (features, limits) = raytracer::gpu_textures::device_requirements(&adapter);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                required_features: experiment_features(&adapter),
-                required_limits: wgpu::Limits {
-                    max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
-                    max_buffer_size: supported.max_buffer_size,
-                    ..Default::default()
-                },
+                required_features: experiment_features(&adapter) | features,
+                required_limits: limits,
+                experimental_features: crate::raytracer::gpu_textures::experimental_features(),
                 ..Default::default()
             })
             .await
@@ -415,6 +440,7 @@ impl GpuContext {
         }
         surface.configure(&device, &surface_config);
         Self {
+            adapter_key: adapter_key(&adapter.get_info()),
             instance,
             device,
             queue,
@@ -512,8 +538,15 @@ fn scene() -> Scene {
     }
 }
 
+/// `--fastest` turns on every measured-best tracer option (exact or visually
+/// equivalent); see performance/scenes/README.md.
+const FASTEST: [&str; 4] = ["--sah-stop", "--skip-final-scatter", "--quad-bvh", "--sbvh"];
+
 pub(crate) fn has_flag(name: &str) -> bool {
     std::env::args().any(|a| a == name)
+        || (FASTEST.contains(&name) && std::env::args().any(|a| a == "--fastest"))
+        // Paths starting from the visibility buffer need the visibility raster.
+        || (name == "--visibility" && std::env::args().any(|a| a == "--visibility-primary"))
 }
 
 fn argument_value(name: &str) -> Option<String> {
@@ -530,11 +563,13 @@ fn argument_value(name: &str) -> Option<String> {
 }
 
 fn selected_bounces() -> u32 {
-    let bounces = argument_value("--bounces")
-        .map_or(SamplingParams::default().num_bounces, |value| {
-            value.parse().expect("--bounces must be a positive integer")
+    let bounces =
+        argument_value("--bounces").map_or(SamplingParams::default().num_bounces, |value| {
+            value
+                .parse()
+                .expect("--bounces must be a non-negative integer")
         });
-    assert!(bounces > 0, "--bounces must be positive");
+    // 0 traces nothing: a frame's fixed cost, for overhead measurements.
     bounces
 }
 
@@ -580,9 +615,49 @@ fn scene_camera(scene: &Scene) -> FlyCameraController {
         controller.vfov_degrees = camera.vfov.as_degrees();
         controller.aperture = camera.aperture;
         controller.focus_distance = camera.focus_distance;
+    } else if !scene.mesh.triangles.is_empty() {
+        // Imported models without a preset view: no depth of field.
+        controller.aperture = 0.;
+    }
+    if let Some((position, direction, vfov)) = camera_argument() {
+        controller.position = position;
+        controller.yaw = raytracer::Angle::radians(direction.z.atan2(direction.x));
+        controller.pitch = raytracer::Angle::radians(direction.y.asin());
+        controller.vfov_degrees = vfov;
+        controller.aperture = 0.;
     }
     controller
 }
+
+/// `--camera x,y,z,dx,dy,dz,fov`: eye position, normalized view direction, vertical fov (degrees).
+pub(crate) fn camera_argument() -> Option<(glm::Vec3, glm::Vec3, f32)> {
+    let value = argument_value("--camera")?;
+    let v: Vec<f32> = value
+        .split(',')
+        .map(|v| v.parse().expect("--camera expects numbers"))
+        .collect();
+    assert_eq!(v.len(), 7, "--camera x,y,z,dx,dy,dz,fov");
+    Some((
+        glm::vec3(v[0], v[1], v[2]),
+        glm::normalize(&glm::vec3(v[3], v[4], v[5])),
+        v[6],
+    ))
+}
+
+/// `--move-speed`, else a fifteenth of the scene's bounding-box diagonal per
+/// second (about Sponza's historical 2 units/s), else 2 for the sphere scene.
+fn scene_move_speed(scene: &Scene) -> f32 {
+    if let Some(speed) = argument_value("--move-speed") {
+        return speed.parse().expect("--move-speed must be a number");
+    }
+    scene.mesh.nodes.first().map_or(2., |root| {
+        glm::distance(&glm::Vec3::from(root.min), &glm::Vec3::from(root.max)) / 15.
+    })
+}
+
+/// Exposure multiplier applied after automatic exposure maps the scene's
+/// log-average luminance to middle grey; 2 is Hable's usual Uncharted 2 bias.
+pub(crate) const AUTO_EXPOSURE_COMPENSATION: f32 = 2.;
 
 fn scene_exposure(scene: &Scene) -> f32 {
     if scene.mesh.triangles.is_empty() {

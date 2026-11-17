@@ -25,7 +25,7 @@ async fn render() {
         .await
         .unwrap();
     let info = adapter.get_info();
-    let limits = adapter.limits();
+    let required = crate::raytracer::gpu_textures::device_requirements(&adapter);
     let features =
         wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
     let timestamps = adapter.features().contains(features);
@@ -35,21 +35,28 @@ async fn render() {
                 features
             } else {
                 wgpu::Features::empty()
-            }) | crate::experiment_features(&adapter),
-            required_limits: wgpu::Limits {
-                max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
-                max_buffer_size: limits.max_buffer_size,
-                ..Default::default()
-            },
+            }) | crate::experiment_features(&adapter)
+                | required.0,
+            required_limits: required.1,
+            experimental_features: crate::raytracer::gpu_textures::experimental_features(),
             ..Default::default()
         })
         .await
         .unwrap();
     let mut params = RenderParams {
         camera: crate::scene_camera(&scene).renderer_camera(),
-        exposure: crate::argument_value("--exposure").map_or(crate::scene_exposure(&scene), |s| {
-            s.parse().expect("invalid exposure")
-        }),
+        // An explicit --exposure keeps the historical fixed exposure; otherwise
+        // automatic exposure (--exposure-compensation scales its result).
+        exposure: crate::argument_value("--exposure").map_or_else(
+            || {
+                crate::argument_value("--exposure-compensation")
+                    .map_or(crate::AUTO_EXPOSURE_COMPENSATION, |s| {
+                        s.parse().expect("invalid exposure compensation")
+                    })
+            },
+            |s| s.parse().expect("invalid exposure"),
+        ),
+        auto_exposure: crate::argument_value("--exposure").is_none(),
         sky: crate::scene_sky(&scene),
         sampling: SamplingParams {
             max_samples_per_pixel: samples,
@@ -59,15 +66,10 @@ async fn render() {
         viewport_size: (width, height),
     };
     params.sampling.denoising_enabled = !std::env::args().any(|a| a == "--no-denoise");
-    if let Some(value) = crate::argument_value("--camera") {
-        let v: Vec<f32> = value
-            .split(',')
-            .map(|v| v.parse().expect("camera numbers"))
-            .collect();
-        assert_eq!(v.len(), 7, "--camera x,y,z,dx,dy,dz,fov");
-        params.camera.eye_pos = nalgebra_glm::vec3(v[0], v[1], v[2]);
-        params.camera.eye_dir = nalgebra_glm::normalize(&nalgebra_glm::vec3(v[3], v[4], v[5]));
-        params.camera.vfov = crate::raytracer::Angle::degrees(v[6]);
+    if let Some((position, direction, vfov)) = crate::camera_argument() {
+        params.camera.eye_pos = position;
+        params.camera.eye_dir = direction;
+        params.camera.vfov = crate::raytracer::Angle::degrees(vfov);
     }
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -81,7 +83,8 @@ async fn render() {
         color_space: wgpu::SurfaceColorSpace::Auto,
     };
     let build = Instant::now();
-    let mut tracer = Raytracer::new(&device, &config, &scene, &params).unwrap();
+    let mut tracer = Raytracer::new(&device, &queue, &config, &scene, &params).unwrap();
+    tracer.calibrate(&device, &queue, &crate::adapter_key(&info));
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("offline image"),
         size: wgpu::Extent3d {
@@ -157,6 +160,7 @@ async fn render() {
             );
         }
         queue.submit([encoder.finish()]);
+        tracer.after_submit(&device);
         if let Some(timer) = &timer {
             timer
                 .slice(..)
@@ -187,6 +191,31 @@ async fn render() {
     }
     if let Some(raw) = crate::argument_value("--raw-output") {
         tracer.save_raw(&device, &queue, &raw, samples);
+    }
+    // Rasterized-visibility experiment: traced G-buffer first, then the raster one.
+    if let Some(path) = crate::argument_value("--gbuffer-output") {
+        std::fs::write(
+            path,
+            bytemuck::cast_slice(&tracer.read_gbuffer(&device, &queue)),
+        )
+        .unwrap();
+    }
+    if crate::has_flag("--visibility") {
+        let [raster, resolve] = tracer.benchmark_visibility(&device, &queue);
+        println!(
+            "visibility: raster {raster:.3} ms, resolve {resolve:.3} ms, total {:.3} ms",
+            raster + resolve
+        );
+        let mut encoder = device.create_command_encoder(&Default::default());
+        tracer.encode_visibility(&mut encoder);
+        queue.submit([encoder.finish()]);
+        if let Some(path) = crate::argument_value("--visibility-output") {
+            std::fs::write(
+                path,
+                bytemuck::cast_slice(&tracer.read_gbuffer(&device, &queue)),
+            )
+            .unwrap();
+        }
     }
     if let Some(report) = crate::argument_value("--filter-report") {
         let ms = tracer.benchmark_filter(&device, &queue);
@@ -247,6 +276,7 @@ async fn render() {
             gpu_ms.len(), gpu_ms[gpu_ms.len()/2], gpu_ms[(gpu_ms.len()*95/100).min(gpu_ms.len()-1)]
         )).unwrap();
     }
+    eprintln!("Auto-tune: ended on {}", tracer.trace_variant());
     eprintln!(
         "Rendered {width}x{height}, {samples} spp on {} ({:?}); setup {:.2}s, render {:.2}s; warmed median GPU {:?} ms/sample; saved {path}",
         info.name,

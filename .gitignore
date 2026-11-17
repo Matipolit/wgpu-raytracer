@@ -42,3 +42,6 @@ performance/vndf/results/
 
 # Local optimization sweep captures and machine-specific reports.
 performance/local-sweep/results/
+
+# Benchmark scenes downloaded/converted by scripts/convert_scene.py (see performance/scenes/README.md).
+assets/scenes/

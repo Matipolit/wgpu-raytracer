@@ -1,7 +1,11 @@
 // Mesh buffer header: node/triangle counts, triangle/vertex/material/texture
 // word offsets, logical sphere/light counts. BVH nodes begin at word 16.
 @group(3) @binding(4) var<storage, read> meshData: array<u32>;
-@group(3) @binding(5) var<storage, read> meshPixels: array<u32>;
+// Sampled glTF textures (one per texture and colour interpretation) and the 18
+// wrap/filter samplers; material slot word 7 holds the sampler index. Slot
+// word 0 is the texture index plus one; 0 means none (white placeholder).
+@group(3) @binding(5) var meshTextures: binding_array<texture_2d<f32>>;
+@group(3) @binding(6) var meshSamplers: binding_array<sampler>;
 
 fn meshFloat(offset: u32) -> f32 { return bitcast<f32>(meshData[offset]); }
 fn meshVec2(offset: u32) -> vec2<f32> { return vec2(meshFloat(offset), meshFloat(offset+1u)); }
@@ -9,59 +13,40 @@ fn meshVec3(offset: u32) -> vec3<f32> { return vec3(meshFloat(offset),meshFloat(
 fn meshVec4(offset: u32) -> vec4<f32> { return vec4(meshVec3(offset),meshFloat(offset+3u)); }
 fn meshMaterialOffset(index: u32) -> u32 { return meshData[4u]+48u*index; }
 
-// Integer address wrapping also wraps each bilinear footprint across seams.
-fn meshWrap(x: i32, size: i32, mode: u32) -> u32 {
-    if mode == 1u { return u32(clamp(x,0,size-1)); }
-    if mode == 2u {
-        let period = 2*size;
-        let p = ((x % period)+period)%period;
-        return u32(select(period-1-p,p,p<size));
-    }
-    return u32(((x % size)+size)%size);
-}
-fn meshTexel(desc: u32, point: vec2<i32>, srgb: bool) -> vec4<f32> {
-    let x=meshWrap(point.x,i32(meshData[desc+1u]),meshData[desc+3u]&3u);
-    let y=meshWrap(point.y,i32(meshData[desc+2u]),(meshData[desc+3u]>>2u)&3u);
-    var value=unpack4x8unorm(meshPixels[meshData[desc]+y*meshData[desc+1u]+x]);
-    if srgb {
-        let low=value.rgb/12.92;
-        let high=pow((value.rgb+vec3(0.055))/1.055,vec3(2.4));
-        value=vec4(select(high,low,value.rgb<=vec3(0.04045)),value.a);
-    }
-    return value;
-}
 fn meshUV(slot: u32, uv0: vec2<f32>, uv1: vec2<f32>) -> vec2<f32> {
     let uv=select(uv0,uv1,meshData[slot+1u]==1u)*meshVec2(slot+4u);
     let angle=meshFloat(slot+6u);
     return meshVec2(slot+2u)+vec2(cos(angle)*uv.x-sin(angle)*uv.y,sin(angle)*uv.x+cos(angle)*uv.y);
 }
-fn meshTexture(slot: u32, uv0: vec2<f32>, uv1: vec2<f32>, srgb: bool) -> vec4<f32> {
+// `color` marks colour lookups (base colour, emission); alpha tests pass false
+// for the base-colour slot. The GPU texture's format decides sRGB decoding.
+fn meshTexture(slot: u32, uv0: vec2<f32>, uv1: vec2<f32>, color: bool) -> vec4<f32> {
     let index=meshData[slot];
-    if index==0xffffffffu { return vec4(1.); }
-    var desc=meshData[5u]+index*4u;
-    if RAY_CONES && (srgb || (slot-meshData[4u])%48u!=16u) {
-        let header=meshData[12u]+(index*2u+select(0u,1u,srgb))*4u;
-        let levels=meshData[header+1u];
+    // Index 0 is a white placeholder: an empty slot is still a valid descriptor.
+    if index==0u { return vec4(1.); }
+    var uv=meshUV(slot,uv0,uv1);
+    var sampler=meshData[slot+7u];
+    var lod=0.;
+    // Alpha tests keep the base level so cutouts do not erode with distance, and so
+    // does the base colour of alpha-tested (MASK) materials: their mips average in
+    // the colour of transparent texels.
+    let materialSlot=(slot-meshData[4u])%48u;
+    let masked=materialSlot==16u && (meshData[slot-materialSlot+11u]&2u)!=0u;
+    if RAY_CONES && coneActive && (color || materialSlot!=16u) && !masked {
         let gradient=select(footprintUV0,footprintUV1,meshData[slot+1u]==1u)*abs(meshVec2(slot+4u));
         let angle=meshFloat(slot+6u);let c=abs(cos(angle));let s=abs(sin(angle));
         let rotated=vec2(c*gradient.x+s*gradient.y,s*gradient.x+c*gradient.y);
-        let size=vec2(f32(meshData[desc+1u]),f32(meshData[desc+2u]));
-        let lod=u32(clamp(floor(log2(max(max(rotated.x*size.x,rotated.y*size.y),1.))),0.,f32(levels-1u)));
-        desc=meshData[15u]+(meshData[header]+lod)*4u;
+        let size=vec2<f32>(textureDimensions(meshTextures[index]));
+        lod=log2(max(max(rotated.x*size.x,rotated.y*size.y),1.));
     }
-    let dimensions=vec2(f32(meshData[desc+1u]),f32(meshData[desc+2u]));
-    let uv=meshUV(slot,uv0,uv1);
-    // glTF image and UV origins are both top-left. No legacy sphere V flip.
-    if (meshData[desc+3u]&16u)!=0u { return meshTexel(desc,vec2<i32>(floor(uv*dimensions)),srgb); }
-    let coordinate=uv*dimensions-vec2(0.5);
-    let point=vec2<i32>(floor(coordinate));
-    let f=fract(coordinate);
-    if STOCHASTIC_TEXTURE==2u || (STOCHASTIC_TEXTURE==1u && srgb) {
-        let offset=vec2<i32>(select(0,1,textureRandom()<f.x),select(0,1,textureRandom()<f.y));
-        return meshTexel(desc,point+offset,srgb);
+    // Stochastic bilinear: a uniform one-texel jitter with nearest lookup selects
+    // each neighbour with its bilinear weight.
+    if STOCHASTIC_TEXTURE==2u || (STOCHASTIC_TEXTURE==1u && color) {
+        let size=vec2<f32>(textureDimensions(meshTextures[index],u32(lod)));
+        uv+=(vec2(textureRandom(),textureRandom())-vec2(0.5))/size;
+        sampler=sampler%9u+9u;
     }
-    return mix(mix(meshTexel(desc,point,srgb),meshTexel(desc,point+vec2(1,0),srgb),f.x),
-               mix(meshTexel(desc,point+vec2(0,1),srgb),meshTexel(desc,point+vec2(1,1),srgb),f.x),f.y);
+    return textureSampleLevel(meshTextures[index],meshSamplers[sampler],uv,lod);
 }
 
 // Reciprocal directions are invariant throughout traversal. Parallel slabs use
@@ -86,7 +71,7 @@ fn meshCandidate(ray: Ray, index: u32, tmax: f32, outHit: ptr<function, MeshCand
     let accel=meshData[8u]+index*12u;
     let a=meshVec3(accel); let e1=meshVec3(accel+4u); let e2=meshVec3(accel+8u);
     let crossD=cross(ray.direction,e2); let determinant=dot(e1,crossD);
-    if abs(determinant)<=meshFloat(accel+3u)*length(ray.direction) {return false;}
+    if abs(determinant)<=meshFloat(accel+3u)*select(length(ray.direction),rayLength,QUAD_BVH) {return false;}
     let flags=meshData[accel+11u];
     if (flags&1u)==0u && determinant<0. {return false;}
     let inv=1./determinant;let delta=ray.origin-a;
@@ -135,7 +120,7 @@ fn meshResolve(ray: Ray, candidate: MeshCandidate) -> Intersection {
     let weights=vec3(1.-candidate.u-candidate.v,candidate.u,candidate.v);
     let uv0=weights.x*vertexUV0(va)+weights.y*vertexUV0(vb)+weights.z*vertexUV0(vc);
     let uv1=weights.x*vertexUV1(va)+weights.y*vertexUV1(vb)+weights.z*vertexUV1(vc);
-    if RAY_CONES {
+    if RAY_CONES && coneActive {
         coneWidth+=coneSpread*candidate.t*length(ray.direction);
         let areaVector=cross(e1,e2);let inverseArea=1./max(dot(areaVector,areaVector),1e-20);
         let dual1=cross(e2,areaVector)*inverseArea;let dual2=cross(areaVector,e1)*inverseArea;
@@ -151,7 +136,7 @@ fn meshResolve(ray: Ray, candidate: MeshCandidate) -> Intersection {
     var n=weights.x*vertexNormal(va)+weights.y*vertexNormal(vb)+weights.z*vertexNormal(vc);
     if dot(n,n)<1e-12 {n=geo;} else {n=normalize(n);}
     if dot(n,geo)<0. {n=-n;}
-    if meshData[material+40u]!=0xffffffffu {
+    if meshData[material+40u]!=0u {
         let slot=material+40u;
         let tangent=weights.x*vertexTangent(va)+weights.y*vertexTangent(vb)+weights.z*vertexTangent(vc);
         var frame=pixarOnb(n);
@@ -175,8 +160,9 @@ fn meshResolve(ray: Ray, candidate: MeshCandidate) -> Intersection {
                 }
             }
         }
-        var normal=meshTexture(slot,uv0,uv1,false).xyz*2.-vec3(1.);
-        normal=vec3(normal.xy*meshFloat(material+9u),normal.z);
+        // Normal maps may be two-channel (BC5): rebuild z from the unit length.
+        let xy=meshTexture(slot,uv0,uv1,false).xy*2.-vec2(1.);
+        let normal=vec3(xy*meshFloat(material+9u),sqrt(max(0.,1.-dot(xy,xy))));
         let mapped=frame*normal;
         if dot(mapped,mapped)>1e-12 && dot(mapped,geo)>0. {n=normalize(mapped);}
     }
@@ -192,15 +178,32 @@ fn meshTriangle(ray: Ray, index: u32, tmax: f32, outHit: ptr<function, Intersect
     return true;
 }
 fn meshIntersection(ray: Ray, outHit: ptr<function, Intersection>, tmax: f32) -> bool {
+    if HW_RT {
+        var best=MeshCandidate();
+        if !meshHwCandidate(ray,tmax,false,&best) {return false;}
+        *outHit=meshResolve(ray,best);
+        return true;
+    }
+    if QUAD_BVH{
+        var best=MeshCandidate();var found:bool;
+        if VIS_PRIMARY && visibilityPending {visibilityPending=false;found=visibilityCandidate(ray,tmax,&best);}
+        else {found=meshQuadCandidate(ray,tmax,false,&best);}
+        if !found {return false;}
+        *outHit=meshResolve(ray,best);
+        return true;
+    }
+    if PAIR_BVH{return meshPairQuery(ray,outHit,tmax,false);}
     if WIDE_BVH>2u{return meshWideQuery(ray,outHit,tmax,false);}
     if meshData[0u]==0u {return false;}
     var closest=tmax;var found=false;var best=MeshCandidate();
     let parallel=abs(ray.direction)<vec3(1e-20);
     let inverse=vec3(1.)/select(ray.direction,vec3(1.),parallel);
     var stack:array<u32,64>;var size=0u;var index=0u;var needsBox=true;
+    if TRAVERSAL_STATS {statRays+=1u;}
     loop {
         if !needsBox || meshBox(ray,inverse,parallel,index,closest)<closest {
             let node=16u+index*8u;let first=meshData[node+3u];let count=meshData[node+7u];
+            if TRAVERSAL_STATS {statNodes+=1u;if count!=0u{statTriangles+=count;}}
             if count!=0u {
                 for(var i=0u;i<count;i+=1u) {
                     var hit=MeshCandidate();
@@ -225,12 +228,19 @@ fn meshIntersection(ray: Ray, outHit: ptr<function, Intersection>, tmax: f32) ->
 // glTF metallic/roughness: Lambert diffuse + GGX/Smith microfacets, Schlick Fresnel.
 // Sample the diffuse/specular mixture and divide by the complete mixture PDF.
 fn scatterPbr(inRay: Ray, hit: Intersection, rng: ptr<function,u32>) -> Scatter {
+    if COHERENCE_TEST {
+        // Upper-bound experiment only: every bounce ray in the frame shares one direction.
+        let wi=normalize(vec3(0.3,0.9,0.2)*select(1.,-1.,dot(hit.n,vec3(0.3,0.9,0.2))<0.));
+        _=rngNextFloat(rng);_=rngNextFloat(rng);_=rngNextFloat(rng);
+        return Scatter(Ray(hit.p+hit.geometricNormal*0.0001,wi),vec3(0.5));
+    }
     if GGX_VNDF || GGX_BOUNDED {return samplePbr(pbrSurface(inRay,hit),hit,rng).scatter;}
     let m=meshMaterialOffset(hit.materialIdx); let uv0=vec2(hit.u,hit.v);
     let base=(meshVec4(m)*meshTexture(m+16u,uv0,hit.uv1,true)).rgb;
     let mr=meshTexture(m+24u,uv0,hit.uv1,false);
     let metal=clamp(meshFloat(m+7u)*mr.b,0.,1.);
     let rough=clamp(meshFloat(m+8u)*mr.g,0.045,1.);
+    shadedBase=base;shadedRough=rough;shadedMetal=metal;
     let alpha=rough*rough;let alpha2=alpha*alpha;
     let view=normalize(-inRay.direction);let nv=max(dot(hit.n,view),1e-6);
     let f0=mix(vec3(0.04),base,metal);
@@ -260,6 +270,9 @@ fn scatterPbr(inRay: Ray, hit: Intersection, rng: ptr<function,u32>) -> Scatter 
 
 // Shadow queries stop on the first accepted surface; cutout tests stay in meshCandidate.
 fn meshOccluded(ray: Ray) -> bool {
+    if HW_RT{var ignored=MeshCandidate();return meshHwCandidate(ray,MAX_T,true,&ignored);}
+    if QUAD_BVH{var ignored=Intersection();return meshQuadQuery(ray,&ignored,MAX_T,true);}
+    if PAIR_BVH{var ignored=Intersection();return meshPairQuery(ray,&ignored,MAX_T,true);}
     if WIDE_BVH>2u{var ignored=Intersection();return meshWideQuery(ray,&ignored,MAX_T,true);}
     if meshData[0u]==0u {return false;}
     let parallel=abs(ray.direction)<vec3(1e-20);
@@ -297,6 +310,7 @@ fn pbrSurface(inRay: Ray,hit: Intersection) -> PbrSurface {
     let mr=meshTexture(m+24u,uv0,hit.uv1,false);
     let metal=clamp(meshFloat(m+7u)*mr.b,0.,1.);
     let rough=clamp(meshFloat(m+8u)*mr.g,0.045,1.);
+    shadedBase=base;shadedRough=rough;shadedMetal=metal;
     let alpha=rough*rough;
     let view=normalize(-inRay.direction);
     let f0=mix(vec3(0.04),base,metal);
@@ -438,3 +452,195 @@ fn wideSlab(ray:Ray,inverse:vec3<f32>,parallel:vec3<bool>,record:u32,limit:f32)-
     let a=unpack2x16float(meshData[record]);let b=unpack2x16float(meshData[record+1u]);let c=unpack2x16float(meshData[record+2u]);
     return meshBounds(ray,inverse,parallel,vec3(a,b.x),vec3(b.y,c),limit);
 }
+
+// Child-pair records (64 bytes, one cache line): both children's boxes and
+// references are fetched together. A reference with the high bit set names a
+// leaf's first triangle; its last triangle carries flag bit 2.
+const PAIR_LEAF=0x80000000u;
+// Per-query |direction| for the triangle test's degeneracy threshold (quad traversal).
+var<private> rayLength:f32;
+// Quad traversal stack entries; a full stack drops further pushes (RT_QUAD_STACK).
+const QUAD_STACK=64u;
+fn meshPairQuery(ray:Ray,outHit:ptr<function,Intersection>,limit:f32,anyHit:bool)->bool{
+    if meshData[0u]==0u{return false;}
+    let parallel=abs(ray.direction)<vec3(1e-20);let inverse=vec3(1.)/select(ray.direction,vec3(1.),parallel);
+    var closest=limit;var found=false;var best=MeshCandidate();
+    var stack:array<u32,64>;var size=0u;var current=0u;
+    if TRAVERSAL_STATS {statRays+=1u;}
+    loop{
+        if (current&PAIR_LEAF)==0u{
+            let base=16u+current*16u;
+            let leftMin=meshVec4(base);let leftMax=meshVec3(base+4u);
+            let rightMin=meshVec4(base+8u);let rightMax=meshVec3(base+12u);
+            if TRAVERSAL_STATS {statNodes+=1u;}
+            let a=meshBounds(ray,inverse,parallel,leftMin.xyz,leftMax,closest);
+            let b=meshBounds(ray,inverse,parallel,rightMin.xyz,rightMax,closest);
+            let left=bitcast<u32>(leftMin.w);let right=bitcast<u32>(rightMin.w);
+            if min(a,b)<closest{
+                if max(a,b)<closest{stack[size]=select(left,right,a<=b);size+=1u;}
+                current=select(right,left,a<=b);continue;
+            }
+        } else {
+            var index=current&~PAIR_LEAF;
+            loop{
+                if TRAVERSAL_STATS {statTriangles+=1u;}
+                var hit=MeshCandidate();
+                if meshCandidate(ray,index,closest,&hit){
+                    if anyHit{return true;}
+                    closest=hit.t;best=hit;found=true;
+                }
+                if (meshData[meshData[8u]+index*12u+11u]&4u)!=0u{break;}
+                index+=1u;
+            }
+        }
+        if size==0u{break;}
+        size-=1u;current=stack[size];
+    }
+    if found{*outHit=meshResolve(ray,best);}
+    return found;
+}
+
+// Four-wide records: SoA child bounds evaluated together, then a register
+// sorting network orders the hit children; only the stack is an array.
+fn quadSwap(t:ptr<function,vec4<f32>>,r:ptr<function,vec4<u32>>,i:u32,j:u32){
+    let a=(*t)[i];let b=(*t)[j];
+    if b<a{(*t)[i]=b;(*t)[j]=a;let ra=(*r)[i];(*r)[i]=(*r)[j];(*r)[j]=ra;}
+}
+fn meshQuadQuery(ray:Ray,outHit:ptr<function,Intersection>,limit:f32,anyHit:bool)->bool{
+    var best=MeshCandidate();
+    if !meshQuadCandidate(ray,limit,anyHit,&best){return false;}
+    *outHit=meshResolve(ray,best);
+    return true;
+}
+// Closest (or any) hit as a raw candidate; callers resolve attributes later.
+fn meshQuadCandidate(ray:Ray,limit:f32,anyHit:bool,outBest:ptr<function,MeshCandidate>)->bool{
+    if meshData[0u]==0u{return false;}
+    rayLength=length(ray.direction);
+    let parallel=abs(ray.direction)<vec3(1e-20);let inverse=vec3(1.)/select(ray.direction,vec3(1.),parallel);
+    var closest=limit;var found=false;var best=MeshCandidate();
+    var stack:array<u32,QUAD_STACK>;var stackT:array<f32,QUAD_CULL_SLOTS>;var size=0u;var current=0u;
+    if TRAVERSAL_STATS {statRays+=1u;}
+    loop{
+        if OCT_BVH && (current&PAIR_LEAF)==0u{
+            if TRAVERSAL_STATS {statNodes+=1u;}
+            let base=16u+current*64u;
+            var ot:array<f32,8>;var orf:array<u32,8>;
+            for(var half=0u;half<2u;half+=1u){
+                let o=base+half*4u;
+                let lo=array(meshVec4(o),meshVec4(o+16u),meshVec4(o+32u));
+                let hi=array(meshVec4(o+8u),meshVec4(o+24u),meshVec4(o+40u));
+                var lower=vec4(MIN_T);var upper=vec4(closest);var outside=vec4(false);
+                for(var axis=0u;axis<3u;axis+=1u){
+                    if parallel[axis]{
+                        outside=outside|(vec4(ray.origin[axis])<lo[axis])|(vec4(ray.origin[axis])>hi[axis]);
+                    } else {
+                        let a=(lo[axis]-vec4(ray.origin[axis]))*inverse[axis];
+                        let b=(hi[axis]-vec4(ray.origin[axis]))*inverse[axis];
+                        lower=max(lower,min(a,b));upper=min(upper,max(a,b));
+                    }
+                }
+                let t=select(vec4(MAX_T),lower,(lower<=upper)&!outside);
+                let r=vec4(meshData[o+48u],meshData[o+49u],meshData[o+50u],meshData[o+51u]);
+                for(var k=0u;k<4u;k+=1u){ot[half*4u+k]=t[k];orf[half*4u+k]=r[k];}
+            }
+            octSwap(&ot,&orf,0u,1u);octSwap(&ot,&orf,2u,3u);octSwap(&ot,&orf,4u,5u);octSwap(&ot,&orf,6u,7u);octSwap(&ot,&orf,0u,2u);octSwap(&ot,&orf,1u,3u);octSwap(&ot,&orf,4u,6u);octSwap(&ot,&orf,5u,7u);octSwap(&ot,&orf,1u,2u);octSwap(&ot,&orf,5u,6u);octSwap(&ot,&orf,0u,4u);octSwap(&ot,&orf,1u,5u);octSwap(&ot,&orf,2u,6u);octSwap(&ot,&orf,3u,7u);octSwap(&ot,&orf,2u,4u);octSwap(&ot,&orf,3u,5u);octSwap(&ot,&orf,1u,2u);octSwap(&ot,&orf,3u,4u);octSwap(&ot,&orf,5u,6u);
+            if ot[0]<closest{
+                for(var k=7u;k>=1u;k-=1u){
+                    if ot[k]<closest && size<QUAD_STACK{stack[size]=orf[k];size+=1u;}
+                }
+                current=orf[0];continue;
+            }
+        } else if (current&PAIR_LEAF)==0u{
+            if TRAVERSAL_STATS {statNodes+=1u;}
+            var lo:array<vec4<f32>,3>;var hi:array<vec4<f32>,3>;var refs:vec4<u32>;var empty=vec4(false);
+            if QUAD_Q8 {
+                let base=16u+current*16u;
+                let header=vec4(meshData[base],meshData[base+1u],meshData[base+2u],meshData[base+3u]);
+                let q=vec4(meshData[base+4u],meshData[base+5u],meshData[base+6u],meshData[base+7u]);
+                let r=vec2(meshData[base+8u],meshData[base+9u]);
+                refs=vec4(meshData[base+12u],meshData[base+13u],meshData[base+14u],meshData[base+15u]);
+                let packed=array(q.x,q.y,q.z,q.w,r.x,r.y);
+                for(var axis=0u;axis<3u;axis+=1u){
+                    let origin=bitcast<f32>(header[axis]);
+                    let step=bitcast<f32>(((header.w>>(8u*axis))&255u)<<23u);
+                    lo[axis]=vec4(origin)+vec4<f32>(unpack4xU8(packed[axis*2u]))*step;
+                    hi[axis]=vec4(origin)+vec4<f32>(unpack4xU8(packed[axis*2u+1u]))*step;
+                }
+                empty=refs==vec4(0xffffffffu);
+            } else {
+                let base=16u+current*32u;
+                lo=array(meshVec4(base),meshVec4(base+8u),meshVec4(base+16u));
+                hi=array(meshVec4(base+4u),meshVec4(base+12u),meshVec4(base+20u));
+                refs=vec4<u32>(meshData[base+24u],meshData[base+25u],meshData[base+26u],meshData[base+27u]);
+            }
+            var lower=vec4(MIN_T);var upper=vec4(closest);var outside=vec4(false);
+            for(var axis=0u;axis<3u;axis+=1u){
+                if parallel[axis]{
+                    outside=outside|(vec4(ray.origin[axis])<lo[axis])|(vec4(ray.origin[axis])>hi[axis]);
+                } else {
+                    let a=(lo[axis]-vec4(ray.origin[axis]))*inverse[axis];
+                    let b=(hi[axis]-vec4(ray.origin[axis]))*inverse[axis];
+                    lower=max(lower,min(a,b));upper=min(upper,max(a,b));
+                }
+            }
+            var t=select(vec4(MAX_T),lower,(lower<=upper)&!outside&!empty);
+            // Sort (t, ref) ascending; misses carry MAX_T and sort last.
+            quadSwap(&t,&refs,0u,1u);quadSwap(&t,&refs,2u,3u);
+            quadSwap(&t,&refs,0u,2u);quadSwap(&t,&refs,1u,3u);
+            quadSwap(&t,&refs,1u,2u);
+            if t.x<closest{
+                if t.w<closest && size<QUAD_STACK{stack[size]=refs.w;if QUAD_CULL{stackT[size]=t.w;}size+=1u;}
+                if t.z<closest && size<QUAD_STACK{stack[size]=refs.z;if QUAD_CULL{stackT[size]=t.z;}size+=1u;}
+                if t.y<closest && size<QUAD_STACK{stack[size]=refs.y;if QUAD_CULL{stackT[size]=t.y;}size+=1u;}
+                current=refs.x;continue;
+            }
+        } else if QUAD_LEAF_COUNT {
+            let first=current&0x3ffffffu;let end=first+((current>>26u)&31u)+1u;
+            for(var index=first;index<end;index+=1u){
+                if TRAVERSAL_STATS {statTriangles+=1u;}
+                var hit=MeshCandidate();
+                if meshCandidate(ray,index,closest,&hit){
+                    if anyHit{return true;}
+                    closest=hit.t;best=hit;found=true;
+                }
+            }
+        } else {
+            var index=current&~PAIR_LEAF;
+            loop{
+                if TRAVERSAL_STATS {statTriangles+=1u;}
+                var hit=MeshCandidate();
+                if meshCandidate(ray,index,closest,&hit){
+                    if anyHit{return true;}
+                    closest=hit.t;best=hit;found=true;
+                }
+                if (meshData[meshData[8u]+index*12u+11u]&4u)!=0u{break;}
+                index+=1u;
+            }
+        }
+        // Pop; with QUAD_CULL, skip entries now beyond the closest hit. Without it the
+        // pop is straight-line code (one guarded loop fewer in the hottest path).
+        if QUAD_CULL {
+            var popped=false;
+            loop{
+                if size==0u{break;}
+                size-=1u;
+                if stackT[size]<closest{current=stack[size];popped=true;break;}
+            }
+            if !popped{break;}
+        } else {
+            if size==0u{break;}
+            size-=1u;
+            current=stack[size];
+        }
+    }
+    if found{*outBest=best;}
+    return found;
+}
+
+fn octSwap(t:ptr<function,array<f32,8>>,r:ptr<function,array<u32,8>>,i:u32,j:u32){
+    let a=(*t)[i];let b=(*t)[j];
+    if b<a{(*t)[i]=b;(*t)[j]=a;let ra=(*r)[i];(*r)[i]=(*r)[j];(*r)[j]=ra;}
+}
+
+// Software builds: hardware ray queries absent (`--hw-rt` swaps in hwrt.wgsl).
+fn meshHwCandidate(ray: Ray, limit: f32, anyHit: bool, outBest: ptr<function, MeshCandidate>) -> bool { return false; }

@@ -48,8 +48,6 @@ pub struct Mesh {
     pub pixels: Vec<u32>,
     pub camera: Option<Camera>,
     pub depth: usize,
-    pub mip_headers: Vec<[u32; 4]>,
-    pub mip_levels: Vec<[u32; 4]>,
     pub opacity_cells: Vec<u32>,
 }
 
@@ -61,6 +59,294 @@ pub fn micro_opacity() -> bool {
 pub fn quantized_bvh() -> bool {
     option("--quantized-bvh") || std::env::var("RT_QUANTIZED_BVH").is_ok()
 }
+/// Aila-Laine style records: each 64-byte record holds both children's boxes.
+pub fn pair_bvh() -> bool {
+    option("--pair-bvh")
+}
+/// Child reference high bit: the low bits are the leaf's first triangle.
+const PAIR_LEAF: u32 = 0x8000_0000;
+/// Binary BVH -> child-pair records, depth-first so a parent's near child is close.
+/// Record words: left min.xyz, left ref, left max.xyz, 0, right min.xyz, right ref, right max.xyz, 0.
+fn pair_records(nodes: &[BvhNode]) -> Vec<u32> {
+    fn reference(nodes: &[BvhNode], node: usize, words: &mut Vec<u32>) -> u32 {
+        if nodes[node].count != 0 {
+            assert!(
+                nodes[node].first < PAIR_LEAF,
+                "too many triangles for pair BVH"
+            );
+            return PAIR_LEAF | nodes[node].first;
+        }
+        let record = words.len() / 16;
+        words.resize(words.len() + 16, 0);
+        for (side, child) in [node + 1, nodes[node].first as usize]
+            .into_iter()
+            .enumerate()
+        {
+            let link = reference(nodes, child, words);
+            let base = record * 16 + side * 8;
+            for axis in 0..3 {
+                words[base + axis] = nodes[child].min[axis].to_bits();
+                words[base + 4 + axis] = nodes[child].max[axis].to_bits();
+            }
+            words[base + 3] = link;
+        }
+        record as u32
+    }
+    let mut words = Vec::new();
+    if nodes[0].count != 0 {
+        // A single-leaf tree: the root record's left child is the leaf; the right
+        // child is a degenerate box beyond the ray interval that no ray can enter.
+        words.resize(16, 0);
+        for axis in 0..3 {
+            words[axis] = nodes[0].min[axis].to_bits();
+            words[4 + axis] = nodes[0].max[axis].to_bits();
+            words[8 + axis] = 1e30f32.to_bits();
+            words[12 + axis] = 1e30f32.to_bits();
+        }
+        words[3] = PAIR_LEAF | nodes[0].first;
+        words[11] = PAIR_LEAF;
+    } else {
+        reference(nodes, 0, &mut words);
+    }
+    words
+}
+
+/// Four-wide records (128 bytes): SoA child bounds and four child references.
+pub fn quad_bvh() -> bool {
+    option("--quad-bvh") || oct_bvh()
+}
+/// Leaf references carry (count - 1) in bits 26..31 instead of a last-triangle flag.
+pub fn quad_leaf_count() -> bool {
+    // Default for 4-wide records; RT_QUAD_LEAF_FLAG restores the flag encoding.
+    quad_bvh() && std::env::var("RT_QUAD_LEAF_FLAG").is_err()
+}
+fn leaf_reference(node: &BvhNode) -> u32 {
+    if quad_leaf_count() {
+        assert!(
+            node.first < (1 << 26) - 1 && (1..=32).contains(&node.count),
+            "leaf does not fit a quad reference"
+        );
+        PAIR_LEAF | ((node.count - 1) << 26) | node.first
+    } else {
+        PAIR_LEAF | node.first
+    }
+}
+/// Eight-wide records (`--oct-bvh`, implies the 4-wide traversal options):
+/// 256 bytes, SoA bounds for 8 children, then 8 child references.
+/// Hardware ray queries through wgpu acceleration structures (`--hw-rt`).
+pub fn hw_rt() -> bool {
+    option("--hw-rt")
+}
+pub fn oct_bvh() -> bool {
+    option("--oct-bvh")
+}
+/// Collapse the binary SAH tree into `WIDTH`-wide SoA records by repeatedly
+/// opening the largest-area interior child. Words per record: for each axis,
+/// min[WIDTH] then max[WIDTH]; then refs[WIDTH]; padded to 8*WIDTH words.
+fn wide_soa_records<const WIDTH: usize>(nodes: &[BvhNode]) -> Vec<u32> {
+    fn area(n: &BvhNode) -> f32 {
+        let e = [0, 1, 2].map(|a| n.max[a] - n.min[a]);
+        e[0] * e[1] + e[1] * e[2] + e[2] * e[0]
+    }
+    fn record<const WIDTH: usize>(nodes: &[BvhNode], node: usize, words: &mut Vec<u32>) -> u32 {
+        let stride = 8 * WIDTH;
+        let index = words.len() / stride;
+        words.resize(words.len() + stride, 0);
+        let mut children = vec![node + 1, nodes[node].first as usize];
+        while children.len() < WIDTH {
+            let Some(slot) = (0..children.len())
+                .filter(|&i| nodes[children[i]].count == 0)
+                .max_by(|&a, &b| area(&nodes[children[a]]).total_cmp(&area(&nodes[children[b]])))
+            else {
+                break;
+            };
+            let parent = children.remove(slot);
+            children.insert(slot, nodes[parent].first as usize);
+            children.insert(slot, parent + 1);
+        }
+        let base = index * stride;
+        for lane in 0..WIDTH {
+            let Some(&child) = children.get(lane) else {
+                for axis in 0..3 {
+                    words[base + axis * 2 * WIDTH + lane] = 1e30f32.to_bits();
+                    words[base + axis * 2 * WIDTH + WIDTH + lane] = 1e30f32.to_bits();
+                }
+                words[base + 6 * WIDTH + lane] = PAIR_LEAF;
+                continue;
+            };
+            for axis in 0..3 {
+                words[base + axis * 2 * WIDTH + lane] = nodes[child].min[axis].to_bits();
+                words[base + axis * 2 * WIDTH + WIDTH + lane] = nodes[child].max[axis].to_bits();
+            }
+            words[base + 6 * WIDTH + lane] = if nodes[child].count != 0 {
+                leaf_reference(&nodes[child])
+            } else {
+                record::<WIDTH>(nodes, child, words)
+            };
+        }
+        index as u32
+    }
+    let mut words = Vec::new();
+    if nodes[0].count != 0 {
+        words.resize(8 * WIDTH, 0);
+        for lane in 0..WIDTH {
+            for axis in 0..3 {
+                let (lo, hi) = if lane == 0 {
+                    (nodes[0].min[axis], nodes[0].max[axis])
+                } else {
+                    (1e30, 1e30)
+                };
+                words[axis * 2 * WIDTH + lane] = lo.to_bits();
+                words[axis * 2 * WIDTH + WIDTH + lane] = hi.to_bits();
+            }
+            words[6 * WIDTH + lane] = if lane == 0 {
+                leaf_reference(&nodes[0])
+            } else {
+                PAIR_LEAF
+            };
+        }
+    } else {
+        record::<WIDTH>(nodes, 0, &mut words);
+    }
+    words
+}
+
+/// Collapse the binary SAH tree: repeatedly open the largest-area interior child.
+/// Record words: min.x[4], max.x[4], min.y[4], max.y[4], min.z[4], max.z[4], refs[4], pad[4].
+fn quad_records(nodes: &[BvhNode]) -> Vec<u32> {
+    fn area(n: &BvhNode) -> f32 {
+        let e = [0, 1, 2].map(|a| n.max[a] - n.min[a]);
+        e[0] * e[1] + e[1] * e[2] + e[2] * e[0]
+    }
+    fn record(nodes: &[BvhNode], node: usize, words: &mut Vec<u32>) -> u32 {
+        let index = words.len() / 32;
+        words.resize(words.len() + 32, 0);
+        let mut children = vec![node + 1, nodes[node].first as usize];
+        while children.len() < 4 {
+            let Some(slot) = (0..children.len())
+                .filter(|&i| nodes[children[i]].count == 0)
+                .max_by(|&a, &b| area(&nodes[children[a]]).total_cmp(&area(&nodes[children[b]])))
+            else {
+                break;
+            };
+            let parent = children.remove(slot);
+            children.insert(slot, nodes[parent].first as usize);
+            children.insert(slot, parent + 1);
+        }
+        let base = index * 32;
+        for lane in 0..4 {
+            let Some(&child) = children.get(lane) else {
+                // Empty slot: a degenerate box beyond the ray interval.
+                for axis in 0..3 {
+                    words[base + axis * 8 + lane] = 1e30f32.to_bits();
+                    words[base + axis * 8 + 4 + lane] = 1e30f32.to_bits();
+                }
+                words[base + 24 + lane] = PAIR_LEAF;
+                continue;
+            };
+            for axis in 0..3 {
+                words[base + axis * 8 + lane] = nodes[child].min[axis].to_bits();
+                words[base + axis * 8 + 4 + lane] = nodes[child].max[axis].to_bits();
+            }
+            words[base + 24 + lane] = if nodes[child].count != 0 {
+                leaf_reference(&nodes[child])
+            } else {
+                record(nodes, child, words)
+            };
+        }
+        index as u32
+    }
+    let mut words = Vec::new();
+    if nodes[0].count != 0 {
+        words.resize(32, 0);
+        for lane in 0..4 {
+            for axis in 0..3 {
+                let (lo, hi) = if lane == 0 {
+                    (nodes[0].min[axis], nodes[0].max[axis])
+                } else {
+                    (1e30, 1e30)
+                };
+                words[axis * 8 + lane] = lo.to_bits();
+                words[axis * 8 + 4 + lane] = hi.to_bits();
+            }
+            words[24 + lane] = if lane == 0 {
+                leaf_reference(&nodes[0])
+            } else {
+                PAIR_LEAF
+            };
+        }
+    } else {
+        record(nodes, 0, &mut words);
+    }
+    words
+}
+
+/// Quad records quantized to 64 bytes: parent origin, power-of-two scales and
+/// outward-rounded 8-bit child bounds (experiment: RT_QUAD_Q8).
+pub fn quad_q8() -> bool {
+    std::env::var("RT_QUAD_Q8").is_ok()
+}
+/// Empty child slot reference for quantized quad records.
+const QUAD_EMPTY: u32 = u32::MAX;
+/// 128-byte float quad records -> 64-byte quantized records (same indices).
+/// Words: origin.xyz, packed biased exponents, lo.x hi.x lo.y hi.y lo.z hi.z (4 x u8 each), 0, 0, refs[4].
+fn quantize_quad(words: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(words.len() / 2);
+    for record in words.chunks_exact(32) {
+        let f = |i: usize| f32::from_bits(record[i]);
+        let live: Vec<usize> = (0..4).filter(|&l| f(l) < 1e29).collect();
+        let mut q = [0u32; 16];
+        let mut exponents = 0u32;
+        for axis in 0..3 {
+            let lo = live
+                .iter()
+                .map(|&l| f(axis * 8 + l))
+                .fold(f32::INFINITY, f32::min);
+            let hi = live
+                .iter()
+                .map(|&l| f(axis * 8 + 4 + l))
+                .fold(f32::NEG_INFINITY, f32::max);
+            let (lo, hi) = if live.is_empty() { (0., 0.) } else { (lo, hi) };
+            // Smallest power of two with 255 steps spanning the parent extent.
+            let mut exponent = ((hi - lo).max(1e-30) / 255.).log2().ceil() as i32;
+            let scale = |e: i32| f32::from_bits(((e + 127) as u32) << 23);
+            while lo + 255. * scale(exponent) < hi {
+                exponent += 1;
+            }
+            let step = scale(exponent);
+            q[axis] = lo.to_bits();
+            exponents |= ((exponent + 127) as u32) << (8 * axis);
+            for lane in 0..4 {
+                let (mut a, mut b) = (0u32, 0u32);
+                if live.contains(&lane) {
+                    let (cmin, cmax) = (f(axis * 8 + lane), f(axis * 8 + 4 + lane));
+                    a = (((cmin - lo) / step).floor().max(0.) as u32).min(255);
+                    // Decode exactly as the shader does and widen until conservative.
+                    while a > 0 && lo + a as f32 * step > cmin {
+                        a -= 1;
+                    }
+                    b = (((cmax - lo) / step).ceil().max(0.) as u32).min(255);
+                    while b < 255 && lo + b as f32 * step < cmax {
+                        b += 1;
+                    }
+                }
+                q[4 + axis * 2] |= a << (8 * lane);
+                q[5 + axis * 2] |= b << (8 * lane);
+            }
+        }
+        q[3] = exponents;
+        for lane in 0..4 {
+            q[12 + lane] = if live.contains(&lane) {
+                record[24 + lane]
+            } else {
+                QUAD_EMPTY
+            };
+        }
+        out.extend_from_slice(&q);
+    }
+    out
+}
+
 pub fn bvh_width() -> u32 {
     if quantized_bvh() {
         return 8;
@@ -74,7 +360,7 @@ pub fn bvh_width() -> u32 {
     }
 }
 fn option(name: &str) -> bool {
-    std::env::args().any(|a| a == name)
+    crate::has_flag(name)
 }
 fn pack_half(v: [f32; 2]) -> u32 {
     u32::from(half::f16::from_f32(v[0]).to_bits())
@@ -163,6 +449,7 @@ impl Mesh {
             crate::argument_value("--bvh-leaf").hash(&mut hash);
             option("--sah32").hash(&mut hash);
             option("--sah-stop").hash(&mut hash);
+            option("--sbvh").hash(&mut hash);
             option("--ray-cones").hash(&mut hash);
             micro_opacity().hash(&mut hash);
             option("--packed-shading").hash(&mut hash);
@@ -180,10 +467,7 @@ impl Mesh {
                 }
             }
         }
-        let mut mesh = Self::load_uncached(path)?;
-        if option("--ray-cones") {
-            mesh.build_mips();
-        }
+        let mesh = Self::load_uncached(path)?;
         if let Some(file) = cache {
             let temporary = file.with_extension("tmp");
             std::fs::write(&temporary, encode_scene_cache(&mesh))?;
@@ -474,7 +758,18 @@ impl Mesh {
         words[1] = self.triangles.len() as u32;
         words[6] = sphere_count;
         words[7] = light_count;
-        if bvh_width() > 2 && !self.nodes.is_empty() {
+        if oct_bvh() && !self.nodes.is_empty() {
+            words.extend(wide_soa_records::<8>(&self.nodes));
+        } else if quad_bvh() && !self.nodes.is_empty() {
+            let records = quad_records(&self.nodes);
+            if quad_q8() {
+                words.extend(quantize_quad(&records));
+            } else {
+                words.extend(records);
+            }
+        } else if pair_bvh() && !self.nodes.is_empty() {
+            words.extend(pair_records(&self.nodes));
+        } else if bvh_width() > 2 && !self.nodes.is_empty() {
             let mut wide = Vec::new();
             wide_node(self, 0, bvh_width() as usize, &mut wide);
             words[9] = 16;
@@ -528,11 +823,22 @@ impl Mesh {
             words.extend_from_slice(bytemuck::cast_slice(&self.vertices));
         }
         words[4] = words.len() as u32;
-        for material in &self.materials {
-            words.extend_from_slice(material);
+        // GPU materials name sampled GPU textures (see gpu_textures): slot word 0
+        // is the GPU texture index plus one (0 = none), word 7 the sampler index.
+        let (_, slots) = self.texture_plan();
+        for (material, indices) in self.materials.iter().zip(&slots) {
+            let mut material = *material;
+            for (slot, index) in super::gpu_textures::SLOTS.into_iter().zip(indices) {
+                if material[slot] == u32::MAX {
+                    material[slot] = 0;
+                } else {
+                    let flags = self.textures[material[slot] as usize][3];
+                    material[slot] = *index + 1;
+                    material[slot + 7] = super::gpu_textures::sampler_index(flags);
+                }
+            }
+            words.extend_from_slice(&material);
         }
-        words[5] = words.len() as u32;
-        words.extend_from_slice(bytemuck::cast_slice(&self.textures));
         // Traversal-only triangle records avoid dependent vertex/material reads.
         words[8] = words.len() as u32;
         let mut opaque = vec![false; self.materials.len()];
@@ -568,7 +874,12 @@ impl Mesh {
                 opaque.iter().filter(|&&v| v).count()
             );
         }
-        for tri in &self.triangles {
+        // Pair traversal walks a leaf's triangles until the one flagged last (bit 2).
+        let mut leaf_last = vec![false; self.triangles.len()];
+        for node in self.nodes.iter().filter(|n| n.count != 0) {
+            leaf_last[(node.first + node.count - 1) as usize] = true;
+        }
+        for (index, tri) in self.triangles.iter().enumerate() {
             let a = glm::make_vec3(&self.vertices[tri.vertices[0] as usize].position);
             let e1 = glm::make_vec3(&self.vertices[tri.vertices[1] as usize].position) - a;
             let e2 = glm::make_vec3(&self.vertices[tri.vertices[2] as usize].position) - a;
@@ -593,24 +904,27 @@ impl Mesh {
                         !2
                     } else {
                         u32::MAX
-                    },
+                    }
+                    | if leaf_last[index] { 4 } else { 0 },
             );
+        }
+        if hw_rt() {
+            // Triangle index lists for the two BLAS geometries (see hwrt.wgsl).
+            let [opaque, shaded] = self.hw_geometry_triangles();
+            words[11] = words.len() as u32;
+            words.extend(opaque);
+            words[5] = words.len() as u32;
+            words.extend(shaded);
         }
         if !self.opacity_cells.is_empty() {
             words[10] = words.len() as u32;
             words.extend_from_slice(&self.opacity_cells);
         }
-        if !self.mip_headers.is_empty() {
-            words[12] = words.len() as u32;
-            words.extend_from_slice(bytemuck::cast_slice(&self.mip_headers));
-            words[15] = words.len() as u32;
-            words.extend_from_slice(bytemuck::cast_slice(&self.mip_levels));
-        }
         if option("--approximate-alpha") {
             words[13] = words.len() as u32;
             words.extend(coverage.iter().map(|v| v.to_bits()));
         }
-        if option("--blue-noise-jitter") {
+        if option("--blue-noise-jitter") || option("--blue-noise-path") {
             words[14] = words.len() as u32;
             for b in include_bytes!("../../assets/sampling/blue-noise-64.bin").chunks_exact(4) {
                 words.push(u32::from_le_bytes(b.try_into().unwrap()));
@@ -731,91 +1045,37 @@ impl Mesh {
         eprintln!("Software opacity cells: {known}/{tested} conservatively classified");
     }
 
-    fn build_mips(&mut self) {
-        let mut used = vec![[false; 2]; self.textures.len()];
-        for m in &self.materials {
-            for (slot, color) in [(16, 1), (32, 1), (24, 0), (40, 0)] {
-                if m[slot] != u32::MAX {
-                    used[m[slot] as usize][color] = true;
-                }
+    /// Triangles for the hardware BLAS: [opaque double-sided, needs the shader
+    /// (alpha-tested or single-sided)], as indices into `triangles`.
+    /// Unique triangles for the visibility raster (spatial splits duplicate
+    /// references): [double-sided opaque, single-sided opaque, alpha-tested].
+    pub fn visibility_triangles(&self) -> [Vec<u32>; 3] {
+        let mut seen = std::collections::HashSet::new();
+        let mut lists = [Vec::new(), Vec::new(), Vec::new()];
+        for (index, tri) in self.triangles.iter().enumerate() {
+            if !seen.insert((tri.vertices, tri.material)) {
+                continue;
             }
-        }
-        let linear: [f32; 256] = std::array::from_fn(|i| {
-            let x = i as f32 / 255.0;
-            if x <= 0.04045 {
-                x / 12.92
+            let flags = self.materials[tri.material as usize][11];
+            let list = if flags & 2 != 0 {
+                2
+            } else if flags & 1 != 0 {
+                0
             } else {
-                ((x + 0.055) / 1.055).powf(2.4)
-            }
-        });
-        for (index, texture) in self.textures.clone().iter().enumerate() {
-            for color in 0..2 {
-                let first = self.mip_levels.len() as u32;
-                self.mip_levels.push(*texture);
-                let mut last = *texture;
-                if used[index][color] {
-                    while last[1] > 1 || last[2] > 1 {
-                        let w = (last[1] / 2).max(1);
-                        let h = (last[2] / 2).max(1);
-                        let offset = self.pixels.len() as u32;
-                        for y in 0..h {
-                            for x in 0..w {
-                                let mut sum = [0.0f32; 4];
-                                let x0 = x as f32 * last[1] as f32 / w as f32;
-                                let x1 = (x + 1) as f32 * last[1] as f32 / w as f32;
-                                let y0 = y as f32 * last[2] as f32 / h as f32;
-                                let y1 = (y + 1) as f32 * last[2] as f32 / h as f32;
-                                let area = (x1 - x0) * (y1 - y0);
-                                for sy in y0.floor() as u32..y1.ceil() as u32 {
-                                    for sx in x0.floor() as u32..x1.ceil() as u32 {
-                                        let weight = (((sx + 1) as f32).min(x1)
-                                            - (sx as f32).max(x0))
-                                            * (((sy + 1) as f32).min(y1) - (sy as f32).max(y0))
-                                            / area;
-                                        let p = self.pixels[(last[0]
-                                            + sy.min(last[2] - 1) * last[1]
-                                            + sx.min(last[1] - 1))
-                                            as usize];
-                                        for c in 0..4 {
-                                            let v = ((p >> (c * 8)) & 255) as usize;
-                                            sum[c] += weight
-                                                * if color == 1 && c < 3 {
-                                                    linear[v]
-                                                } else {
-                                                    v as f32 / 255.0
-                                                };
-                                        }
-                                    }
-                                }
-                                let mut pixel = 0u32;
-                                for c in 0..4 {
-                                    let mut v = sum[c];
-                                    if color == 1 && c < 3 {
-                                        v = if v <= 0.0031308 {
-                                            12.92 * v
-                                        } else {
-                                            1.055 * v.powf(1.0 / 2.4) - 0.055
-                                        };
-                                    }
-                                    pixel |=
-                                        ((v.clamp(0.0, 1.0) * 255.0).round() as u32) << (c * 8);
-                                }
-                                self.pixels.push(pixel);
-                            }
-                        }
-                        last = [offset, w, h, texture[3]];
-                        self.mip_levels.push(last);
-                    }
-                }
-                self.mip_headers
-                    .push([first, self.mip_levels.len() as u32 - first, 0, 0]);
-            }
+                1
+            };
+            lists[list].push(index as u32);
         }
-        eprintln!(
-            "Mip chains built: {} descriptors, {} MiB pixels",
-            self.mip_levels.len(),
-            self.pixels.len() * 4 / 1048576
-        );
+        lists
+    }
+
+    pub fn hw_geometry_triangles(&self) -> [Vec<u32>; 2] {
+        let mut lists = [Vec::new(), Vec::new()];
+        for (index, tri) in self.triangles.iter().enumerate() {
+            let flags = self.materials[tri.material as usize][11];
+            lists[usize::from(flags & 3 != 1)].push(index as u32);
+        }
+        lists
     }
 
     pub fn build_bvh(&mut self) {
@@ -824,14 +1084,35 @@ impl Mesh {
         if self.triangles.is_empty() {
             return;
         }
-        build(
-            &mut self.triangles,
-            &self.vertices,
-            &mut self.nodes,
-            0,
-            0,
-            &mut self.depth,
-        );
+        if option("--sbvh") {
+            let start = Instant::now();
+            let before = self.triangles.len();
+            let leaf = crate::argument_value("--bvh-leaf")
+                .map_or(default_leaf_size(), |v| v.parse::<usize>().unwrap());
+            (self.triangles, self.nodes, self.depth) = sbvh::build(
+                &self.triangles,
+                &self.vertices,
+                leaf,
+                traversal_cost(),
+                option("--sah-stop"),
+            );
+            eprintln!(
+                "SBVH: {} -> {} triangle references (+{:.1}%), {:.2}s",
+                before,
+                self.triangles.len(),
+                100. * (self.triangles.len() as f64 / before as f64 - 1.),
+                start.elapsed().as_secs_f64()
+            );
+        } else {
+            build(
+                &mut self.triangles,
+                &self.vertices,
+                &mut self.nodes,
+                0,
+                0,
+                &mut self.depth,
+            );
+        }
         if micro_opacity() {
             self.build_opacity_maps();
         }
@@ -1000,7 +1281,8 @@ fn build(
     });
     static LEAF: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let leaf_size = *LEAF.get_or_init(|| {
-        let n = crate::argument_value("--bvh-leaf").map_or(4, |v| v.parse::<usize>().unwrap());
+        let n = crate::argument_value("--bvh-leaf")
+            .map_or(default_leaf_size(), |v| v.parse::<usize>().unwrap());
         assert!(n > 0);
         n
     });
@@ -1051,7 +1333,7 @@ fn build(
     static STOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *STOP.get_or_init(|| option("--sah-stop"))
         && triangles.len() <= 32
-        && best.0 + bounds.area() >= bounds.area() * triangles.len() as f32
+        && best.0 + traversal_cost() * bounds.area() >= bounds.area() * triangles.len() as f32
     {
         return idx as u32;
     }
@@ -1090,8 +1372,20 @@ fn build(
     idx as u32
 }
 
+/// Minimum leaf size when `--bvh-leaf` is not given: 1 with `--fastest` (SAH
+/// stopping still forms larger leaves where they pay), else the historical 4.
+fn default_leaf_size() -> usize {
+    if crate::has_flag("--fastest") { 1 } else { 4 }
+}
+
+/// SAH node-traversal cost relative to one triangle test (experiment: RT_SAH_CT).
+fn traversal_cost() -> f32 {
+    static COST: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *COST.get_or_init(|| std::env::var("RT_SAH_CT").map_or(1., |v| v.parse().unwrap()))
+}
+
 fn encode_scene_cache(mesh: &Mesh) -> Vec<u8> {
-    let mut bytes = b"RTSCENE4".to_vec();
+    let mut bytes = b"RTSCENE5".to_vec();
     let camera = mesh.camera.unwrap();
     let values = [
         camera.eye_pos.x,
@@ -1116,8 +1410,6 @@ fn encode_scene_cache(mesh: &Mesh) -> Vec<u8> {
         bytemuck::cast_slice(mesh.materials.as_slice()),
         bytemuck::cast_slice(mesh.textures.as_slice()),
         bytemuck::cast_slice(mesh.pixels.as_slice()),
-        bytemuck::cast_slice(mesh.mip_headers.as_slice()),
-        bytemuck::cast_slice(mesh.mip_levels.as_slice()),
         bytemuck::cast_slice(mesh.opacity_cells.as_slice()),
     ] {
         bytes.extend((data.len() as u64).to_le_bytes());
@@ -1162,7 +1454,7 @@ fn decode_scene_cache(mut bytes: &[u8]) -> Option<Mesh> {
                 .collect(),
         )
     }
-    if take(&mut bytes, 8)? != b"RTSCENE4" {
+    if take(&mut bytes, 8)? != b"RTSCENE5" {
         return None;
     }
     let c: Vec<f32> = take(&mut bytes, 48)?
@@ -1178,8 +1470,6 @@ fn decode_scene_cache(mut bytes: &[u8]) -> Option<Mesh> {
         textures: array(&mut bytes)?,
         pixels: array(&mut bytes)?,
         depth,
-        mip_headers: array(&mut bytes)?,
-        mip_levels: array(&mut bytes)?,
         opacity_cells: array(&mut bytes)?,
         camera: Some(Camera {
             eye_pos: glm::vec3(c[0], c[1], c[2]),
@@ -1238,27 +1528,14 @@ mod local_tests {
     }
     #[test]
     fn mipmaps_include_odd_edges_and_decode_srgb_before_averaging() {
-        let mut material = [0u32; 48];
-        for slot in [16, 24, 32, 40] {
-            material[slot] = u32::MAX;
-        }
-        material[16] = 0;
-        material[24] = 0;
-        let mut mesh = Mesh {
-            textures: vec![[0, 3, 1, 0]],
-            pixels: vec![0xff0000ff, 0xff00ff00, 0xffff0000],
-            materials: vec![material],
-            ..Default::default()
-        };
-        mesh.build_mips();
-        for color in 0..2 {
-            let header = mesh.mip_headers[color];
-            let level = mesh.mip_levels[(header[0] + header[1] - 1) as usize];
-            let pixel = mesh.pixels[level[0] as usize];
+        let base = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+        for (srgb, expected) in [(false, 85), (true, 156)] {
+            let levels = super::super::gpu_textures::mip_chain(&base, 3, 1, srgb);
+            assert_eq!(levels.len(), 2);
+            let (w, h, last) = levels.last().unwrap();
+            assert_eq!((*w, *h), (1, 1));
             for c in 0..3 {
-                let v = ((pixel >> (c * 8)) & 255) as i32;
-                let expected = if color == 0 { 85 } else { 156 };
-                assert!((v - expected).abs() <= 1);
+                assert!((i32::from(last[0][c]) - expected).abs() <= 1);
             }
         }
     }
@@ -1270,5 +1547,323 @@ mod local_tests {
         assert_eq!(mesh.gpu_words(0, 0), decoded.gpu_words(0, 0));
         assert_eq!(mesh.pixels, decoded.pixels);
         assert!(decode_scene_cache(&bytes[..bytes.len() - 1]).is_none());
+    }
+}
+
+/// Spatial-split BVH (Stich, Friedrich, Dietrich 2009) over triangle references.
+/// A reference is a triangle clipped to a box; where the best object split's
+/// children overlap noticeably, binned spatial splits are also evaluated and
+/// straddling references are split into both children. Leaves list (possibly
+/// duplicated) triangles, so the output is an expanded triangle array in leaf order.
+mod sbvh {
+    use super::{Bounds, BvhNode, MeshVertex, Triangle};
+
+    /// Bin array capacity; the counts used come from `knob` (experiments only).
+    const MAX_BINS: usize = 64;
+    fn knob(name: &str, default: f32) -> f32 {
+        std::env::var(name).map_or(default, |v| v.parse().unwrap())
+    }
+    /// Extra references allowed, as a fraction of the triangle count.
+    const BUDGET: f32 = 0.3;
+
+    #[derive(Clone, Copy)]
+    struct Ref {
+        tri: u32,
+        bounds: Bounds,
+    }
+
+    struct Builder<'a> {
+        triangles: &'a [Triangle],
+        vertices: &'a [MeshVertex],
+        nodes: Vec<BvhNode>,
+        out: Vec<Triangle>,
+        root_area: f32,
+        budget: usize,
+        depth: usize,
+        leaf_size: usize,
+        traversal_cost: f32,
+        stop: bool,
+        object_bins: usize,
+        spatial_bins: usize,
+        /// Spatial splits are tried only when the object split's children overlap
+        /// by more than this fraction of the root's surface area (the paper's alpha).
+        overlap: f32,
+    }
+
+    fn positions(t: &Triangle, v: &[MeshVertex]) -> [glm::Vec3; 3] {
+        t.vertices.map(|i| glm::Vec3::from(v[i as usize].position))
+    }
+    fn intersect(a: Bounds, b: Bounds) -> Bounds {
+        Bounds {
+            min: a.min.zip_map(&b.min, f32::max),
+            max: a.max.zip_map(&b.max, f32::min),
+        }
+    }
+    fn centroid(b: &Bounds, axis: usize) -> f32 {
+        0.5 * (b.min[axis] + b.max[axis])
+    }
+
+    /// Bounds of the triangle restricted to lo <= x[axis] <= hi, within `within`.
+    fn clip(p: &[glm::Vec3; 3], axis: usize, lo: f32, hi: f32, within: Bounds) -> Bounds {
+        let mut b = Bounds::empty();
+        let mut add = |q: glm::Vec3| b = b.union(Bounds { min: q, max: q });
+        for i in 0..3 {
+            let (a, c) = (p[i], p[(i + 1) % 3]);
+            if a[axis] >= lo && a[axis] <= hi {
+                add(a);
+            }
+            for plane in [lo, hi] {
+                let (x0, x1) = (a[axis], c[axis]);
+                if (x0 < plane && x1 > plane) || (x0 > plane && x1 < plane) {
+                    let t = (plane - x0) / (x1 - x0);
+                    let mut q = a + (c - a) * t;
+                    q[axis] = plane;
+                    add(q);
+                }
+            }
+        }
+        intersect(b, within)
+    }
+
+    impl Builder<'_> {
+        fn leaf(&mut self, node: usize, refs: &[Ref]) {
+            self.nodes[node].first = self.out.len() as u32;
+            self.nodes[node].count = refs.len() as u32;
+            self.out
+                .extend(refs.iter().map(|r| self.triangles[r.tri as usize]));
+        }
+
+        fn build(&mut self, refs: Vec<Ref>, depth: usize) -> u32 {
+            self.depth = self.depth.max(depth);
+            let node = self.nodes.len();
+            let bounds = refs.iter().fold(Bounds::empty(), |b, r| b.union(r.bounds));
+            self.nodes.push(BvhNode {
+                min: bounds.min.into(),
+                first: 0,
+                max: bounds.max.into(),
+                count: 0,
+            });
+            let n = refs.len();
+            if n <= self.leaf_size || depth >= 48 {
+                self.leaf(node, &refs);
+                return node as u32;
+            }
+            // Object split: binned SAH over reference centroids.
+            let centroids = refs.iter().fold(Bounds::empty(), |b, r| {
+                let c = (r.bounds.min + r.bounds.max) * 0.5;
+                b.union(Bounds { min: c, max: c })
+            });
+            let mut best = (
+                f32::INFINITY,
+                0usize,
+                0usize,
+                Bounds::empty(),
+                Bounds::empty(),
+            );
+            for axis in 0..3 {
+                let extent = centroids.max[axis] - centroids.min[axis];
+                if extent <= 1e-9 {
+                    continue;
+                }
+                let object_bins = self.object_bins;
+                let bin = |r: &Ref| {
+                    (((centroid(&r.bounds, axis) - centroids.min[axis]) / extent
+                        * object_bins as f32) as usize)
+                        .min(object_bins - 1)
+                };
+                let mut bins = [(Bounds::empty(), 0usize); MAX_BINS];
+                for r in &refs {
+                    let b = &mut bins[bin(r)];
+                    b.0 = b.0.union(r.bounds);
+                    b.1 += 1;
+                }
+                let mut right = [(Bounds::empty(), 0usize); MAX_BINS];
+                for i in (0..object_bins - 1).rev() {
+                    right[i] = (
+                        right[i + 1].0.union(bins[i + 1].0),
+                        right[i + 1].1 + bins[i + 1].1,
+                    );
+                }
+                let mut left = (Bounds::empty(), 0usize);
+                for i in 0..object_bins - 1 {
+                    left = (left.0.union(bins[i].0), left.1 + bins[i].1);
+                    if left.1 == 0 || right[i].1 == 0 {
+                        continue;
+                    }
+                    let cost =
+                        left.0.area() * left.1 as f32 + right[i].0.area() * right[i].1 as f32;
+                    if cost < best.0 {
+                        best = (cost, axis, i, left.0, right[i].0);
+                    }
+                }
+            }
+            // Spatial split, only where object-split children overlap.
+            let mut spatial: Option<(f32, usize, f32)> = None;
+            let overlap = intersect(best.3, best.4);
+            let overlaps = (0..3).all(|a| overlap.min[a] <= overlap.max[a])
+                && overlap.area() > self.overlap * self.root_area;
+            if self.budget > 0 && (overlaps || !best.0.is_finite()) {
+                for axis in 0..3 {
+                    let (lo, hi) = (bounds.min[axis], bounds.max[axis]);
+                    let spatial_bins = self.spatial_bins;
+                    let width = (hi - lo) / spatial_bins as f32;
+                    if width <= 1e-9 {
+                        continue;
+                    }
+                    let mut bins = [(Bounds::empty(), 0usize, 0usize); MAX_BINS];
+                    let index = |x: f32| (((x - lo) / width) as usize).min(spatial_bins - 1);
+                    for r in &refs {
+                        let (first, last) = (index(r.bounds.min[axis]), index(r.bounds.max[axis]));
+                        bins[first].1 += 1;
+                        bins[last].2 += 1;
+                        if first == last {
+                            bins[first].0 = bins[first].0.union(r.bounds);
+                            continue;
+                        }
+                        let p = positions(&self.triangles[r.tri as usize], self.vertices);
+                        for b in first..=last {
+                            let piece = clip(
+                                &p,
+                                axis,
+                                lo + b as f32 * width,
+                                lo + (b + 1) as f32 * width,
+                                r.bounds,
+                            );
+                            bins[b].0 = bins[b].0.union(piece);
+                        }
+                    }
+                    let mut right = [(Bounds::empty(), 0usize); MAX_BINS];
+                    for i in (0..spatial_bins - 1).rev() {
+                        right[i] = (
+                            right[i + 1].0.union(bins[i + 1].0),
+                            right[i + 1].1 + bins[i + 1].2,
+                        );
+                    }
+                    let mut left = (Bounds::empty(), 0usize);
+                    for i in 0..spatial_bins - 1 {
+                        left = (left.0.union(bins[i].0), left.1 + bins[i].1);
+                        if left.1 == 0 || right[i].1 == 0 {
+                            continue;
+                        }
+                        let cost =
+                            left.0.area() * left.1 as f32 + right[i].0.area() * right[i].1 as f32;
+                        if cost < best.0 && spatial.is_none_or(|s| cost < s.0) {
+                            spatial = Some((cost, axis, lo + (i + 1) as f32 * width));
+                        }
+                    }
+                }
+            }
+            let split_cost = spatial.map_or(best.0, |s| s.0);
+            let area = bounds.area();
+            if self.stop && n <= 32 && split_cost + self.traversal_cost * area >= area * n as f32 {
+                self.leaf(node, &refs);
+                return node as u32;
+            }
+            let (mut left, mut right) = (Vec::new(), Vec::new());
+            if let Some((_, axis, plane)) = spatial {
+                for r in refs {
+                    if r.bounds.max[axis] <= plane {
+                        left.push(r);
+                    } else if r.bounds.min[axis] >= plane {
+                        right.push(r);
+                    } else {
+                        let p = positions(&self.triangles[r.tri as usize], self.vertices);
+                        let l = clip(&p, axis, f32::NEG_INFINITY, plane, r.bounds);
+                        let h = clip(&p, axis, plane, f32::INFINITY, r.bounds);
+                        let valid = |b: &Bounds| (0..3).all(|a| b.min[a] <= b.max[a]);
+                        match (valid(&l), valid(&h)) {
+                            (true, true) => {
+                                self.budget = self.budget.saturating_sub(1);
+                                left.push(Ref {
+                                    tri: r.tri,
+                                    bounds: l,
+                                });
+                                right.push(Ref {
+                                    tri: r.tri,
+                                    bounds: h,
+                                });
+                            }
+                            (true, false) => left.push(r),
+                            _ => right.push(r),
+                        }
+                    }
+                }
+            } else if best.0.is_finite() {
+                let (axis, split) = (best.1, best.2);
+                let extent = centroids.max[axis] - centroids.min[axis];
+                for r in refs {
+                    let b = (((centroid(&r.bounds, axis) - centroids.min[axis]) / extent
+                        * self.object_bins as f32) as usize)
+                        .min(self.object_bins - 1);
+                    if b <= split {
+                        left.push(r)
+                    } else {
+                        right.push(r)
+                    }
+                }
+            } else {
+                left = refs;
+            }
+            if left.is_empty() || right.is_empty() {
+                // Degenerate: split the list in half along the longest centroid axis.
+                let mut all: Vec<Ref> = left.into_iter().chain(right).collect();
+                let e = centroids.max - centroids.min;
+                let axis = if e.x > e.y && e.x > e.z {
+                    0
+                } else if e.y > e.z {
+                    1
+                } else {
+                    2
+                };
+                let mid = all.len() / 2;
+                all.select_nth_unstable_by(mid, |a, b| {
+                    centroid(&a.bounds, axis).total_cmp(&centroid(&b.bounds, axis))
+                });
+                right = all.split_off(mid);
+                left = all;
+            }
+            self.build(left, depth + 1);
+            let right = self.build(right, depth + 1);
+            self.nodes[node].first = right;
+            node as u32
+        }
+    }
+
+    /// Returns (expanded leaf-ordered triangles, nodes, depth).
+    pub fn build(
+        triangles: &[Triangle],
+        vertices: &[MeshVertex],
+        leaf_size: usize,
+        traversal_cost: f32,
+        stop: bool,
+    ) -> (Vec<Triangle>, Vec<BvhNode>, usize) {
+        let refs: Vec<Ref> = triangles
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Ref {
+                tri: i as u32,
+                bounds: super::triangle_bounds(t, vertices),
+            })
+            .collect();
+        let root = refs.iter().fold(Bounds::empty(), |b, r| b.union(r.bounds));
+        let mut builder = Builder {
+            triangles,
+            vertices,
+            nodes: Vec::with_capacity(triangles.len()),
+            out: Vec::with_capacity(triangles.len() * 13 / 10),
+            root_area: root.area(),
+            budget: (triangles.len() as f32
+                * std::env::var("RT_SBVH_BUDGET").map_or(BUDGET, |v| v.parse().unwrap()))
+                as usize,
+            depth: 0,
+            leaf_size,
+            traversal_cost,
+            stop,
+            object_bins: (knob("RT_SBVH_OBJECT_BINS", 16.) as usize).clamp(2, MAX_BINS),
+            spatial_bins: (knob("RT_SBVH_SPATIAL_BINS", 32.) as usize).clamp(2, MAX_BINS),
+            overlap: knob("RT_SBVH_ALPHA", 1e-5),
+        };
+        builder.build(refs, 0);
+        (builder.out, builder.nodes, builder.depth)
     }
 }

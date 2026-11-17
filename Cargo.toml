@@ -19,3 +19,4 @@ winit = "0.30.13"
 gltf = { version = "1.4.1", features = ["KHR_materials_emissive_strength", "KHR_texture_transform", "extensions"] }
 
 half = "2.7.1"
+texpresso = "2.0.2"

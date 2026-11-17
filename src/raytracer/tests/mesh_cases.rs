@@ -179,9 +179,10 @@ fn csCompare(@builtin(global_invocation_id) id:vec3<u32>) {
 fn csTextures(@builtin(global_invocation_id) id:vec3<u32>) {
     if id.x>=arrayLength(&queries) {return;}
     let uv0=queries[id.x].origin.xy;let uv1=queries[id.x].origin.zw;
+    // Base colour (sRGB texture) and metallic/roughness (linear copy of the same image).
     let slot=meshMaterialOffset(0u)+16u;
     queries[id.x].hit=meshTexture(slot,uv0,uv1,true);
-    queries[id.x].brute=meshTexture(slot,uv0,uv1,false);
+    queries[id.x].brute=meshTexture(slot+8u,uv0,uv1,false);
 }
 @compute @workgroup_size(64)
 fn csLight(@builtin(global_invocation_id) id:vec3<u32>) {
@@ -207,8 +208,14 @@ fn run_queries(mesh: Mesh, queries: &[Query], entry: &str) -> Vec<Query> {
 }
 fn run_scene_queries(scene: Scene, queries: &[Query], entry: &str) -> Vec<Query> {
     let (device, queue) = gpu();
-    let tracer =
-        Raytracer::new(&device, &config(params().viewport_size), &scene, &params()).unwrap();
+    let tracer = Raytracer::new(
+        &device,
+        &queue,
+        &config(params().viewport_size),
+        &scene,
+        &params(),
+    )
+    .unwrap();
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("BVH differential test"),
         source: wgpu::ShaderSource::Wgsl(
@@ -250,8 +257,8 @@ fn run_scene_queries(scene: Scene, queries: &[Query], entry: &str) -> Vec<Query>
         label: None,
         entries: &[],
     });
-    let sky_layout = tracer.accumulation_pipeline.get_bind_group_layout(2);
-    let scene_layout = tracer.accumulation_pipeline.get_bind_group_layout(3);
+    let sky_layout = tracer.trace_pipelines[0].get_bind_group_layout(2);
+    let scene_layout = tracer.trace_pipelines[0].get_bind_group_layout(3);
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
         bind_group_layouts: &[
@@ -435,8 +442,14 @@ fn imported_emissive_triangle_renders_with_zero_sphere_lights() {
     let mut params = params();
     params.camera.vfov = Angle::degrees(20.);
     params.sampling.num_bounces = 1;
-    let mut tracer =
-        Raytracer::new(&device, &config(params.viewport_size), &scene, &params).unwrap();
+    let mut tracer = Raytracer::new(
+        &device,
+        &queue,
+        &config(params.viewport_size),
+        &scene,
+        &params,
+    )
+    .unwrap();
     let pixels = render(&device, &queue, &mut tracer);
     let center = (params.viewport_size.0 as usize * (params.viewport_size.1 as usize / 2)
         + params.viewport_size.0 as usize / 2)
@@ -494,7 +507,16 @@ fn gltf_reports_unsupported_required_extensions_and_blended_materials() {
 #[test]
 #[ignore = "requires a GPU"]
 fn gltf_texture_filtering_decodes_srgb_before_interpolation_and_wraps() {
-    let mut mesh = Mesh::load(Path::new("tests/assets/masked.gltf")).unwrap();
+    // The metallic/roughness slot reuses the base-colour image, so the same
+    // pixels are uploaded once as an sRGB texture and once as a linear one.
+    fn load() -> Mesh {
+        let mut mesh = Mesh::load(Path::new("tests/assets/masked.gltf")).unwrap();
+        let material = &mut mesh.materials[0];
+        let base: [u32; 8] = material[16..24].try_into().unwrap();
+        material[24..32].copy_from_slice(&base);
+        mesh
+    }
+    let mut mesh = load();
     mesh.pixels[1] = u32::from_le_bytes([0, 128, 0, 255]);
     mesh.textures[0][3] = 16; // repeat, nearest
     let result = run_queries(
@@ -506,10 +528,12 @@ fn gltf_texture_filtering_decodes_srgb_before_interpolation_and_wraps() {
         "csTextures",
     );
     for q in result {
-        assert!((q.hit[1] - 0.215_860_5).abs() < 1e-5);
+        // Hardware sRGB decoding may differ from the exact curve by ~1e-3
+        // (Vulkan permits approximate conversion); linear data stays exact.
+        assert!((q.hit[1] - 0.215_860_5).abs() < 1e-3);
         assert!((q.brute[1] - 128. / 255.).abs() < 1e-6);
     }
-    let mut mesh = Mesh::load(Path::new("tests/assets/masked.gltf")).unwrap();
+    let mut mesh = load();
     mesh.pixels[1] = u32::from_le_bytes([0, 128, 0, 255]);
     mesh.textures[0][3] = 0;
     let result = run_queries(mesh, &[ray([0.5, 0.5, 0.], [0., 0., 0.])], "csTextures");
@@ -518,9 +542,9 @@ fn gltf_texture_filtering_decodes_srgb_before_interpolation_and_wraps() {
         .iter()
         .zip([0.5, (1. + 0.215_860_5) / 4., 0.5, 0.5])
     {
-        assert!((a - b).abs() < 1e-5);
+        assert!((a - b).abs() < 1e-3);
     }
-    let mut mesh = Mesh::load(Path::new("tests/assets/masked.gltf")).unwrap();
+    let mut mesh = load();
     mesh.textures[0][3] = 16 | 2 | (2 << 2); // mirrored repeat, nearest
     let result = run_queries(
         mesh,

@@ -1,0 +1,68 @@
+{
+ "args": {
+  "out": "/tmp/claude-1001/-home-m-polito-Personal-projects-wgpu-raytracer/42caa484-3b50-4c61-a43d-0b04d34681df/scratchpad/runs/report-textured",
+  "config": [
+   "current=/tmp/claude-1001/-home-m-polito-Personal-projects-wgpu-raytracer/42caa484-3b50-4c61-a43d-0b04d34681df/scratchpad/bin/hwtex-rs16:--sah-stop,--skip-final-scatter,--quad-bvh",
+   "hwtex-binary=/tmp/claude-1001/-home-m-polito-Personal-projects-wgpu-raytracer/42caa484-3b50-4c61-a43d-0b04d34681df/scratchpad/bin/hwtex:--sah-stop,--skip-final-scatter"
+  ],
+  "reps": 3,
+  "samples": 32,
+  "size": "640x400",
+  "scenes": "bistro-street-textured"
+ },
+ "rows": [
+  {
+   "scene": "bistro-street-textured",
+   "config": "current",
+   "ms": 66.4373942113266,
+   "runs": [
+    66.4373942113266,
+    66.47369629377366,
+    65.91848797399521
+   ],
+   "speedup": 1.0,
+   "identical": true,
+   "differing_fraction": 0.0,
+   "relative_rmse": 0.0,
+   "nan": 0,
+   "visible_fraction": 0.0,
+   "display_mean_abs": 0.0
+  },
+  {
+   "scene": "bistro-street-textured",
+   "config": "hwtex-binary",
+   "ms": 98.23218510175323,
+   "runs": [
+    97.8511955277214,
+    98.97796633354568,
+    98.23218510175323
+   ],
+   "speedup": 0.6763302082968817,
+   "identical": false,
+   "differing_fraction": 0.00494921875,
+   "relative_rmse": 0.0072672322366078256,
+   "nan": 0,
+   "visible_fraction": 0.00247265625,
+   "display_mean_abs": 0.00010654484248067964
+  }
+ ],
+ "summary": {
+  "current": {
+   "flags": [
+    "--sah-stop",
+    "--skip-final-scatter",
+    "--quad-bvh"
+   ],
+   "geomean_speedup": 1.0,
+   "total_ms": 66.4373942113266
+  },
+  "hwtex-binary": {
+   "flags": [
+    "--sah-stop",
+    "--skip-final-scatter"
+   ],
+   "geomean_speedup": 0.6763302082968817,
+   "total_ms": 98.23218510175323
+  }
+ }
+}

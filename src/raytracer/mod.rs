@@ -6,9 +6,15 @@ use thiserror::Error;
 
 mod angle;
 mod gpu_buffer;
+pub mod gpu_textures;
+mod hwrt;
 mod image_buffers;
 pub mod mesh;
+mod temporal;
 mod texture;
+mod tuner;
+mod visibility;
+mod wavefront;
 
 #[cfg(test)]
 mod tests;
@@ -44,12 +50,38 @@ pub struct Raytracer {
     frame_data_buffer: UniformBuffer,
     images: image_buffers::ImageBuffers,
     camera_buffer: UniformBuffer,
+    prev_camera_buffer: UniformBuffer,
+    /// Camera of the frame most recently traced (becomes the previous camera).
+    last_camera: GpuCamera,
+    sphere_buffer: wgpu::Buffer,
+    sphere_prev_buffer: StorageBuffer,
+    last_sphere_centers: Vec<[f32; 4]>,
     sampling_parameter_buffer: UniformBuffer,
     hw_sky_state_buffer: StorageBuffer,
     parameter_bind_group: wgpu::BindGroup,
     scene_bind_group: wgpu::BindGroup,
-    accumulation_pipeline: wgpu::ComputePipeline,
+    /// Trace pipelines, one per tuner variant.
+    trace_pipelines: Vec<wgpu::ComputePipeline>,
+    /// Startup-level configuration of the trace kernel and what is needed to rebuild it.
+    module_config: tuner::ModuleConfig,
+    source_prefix: String,
+    source_suffix: String,
+    trace_layout: wgpu::PipelineLayout,
+    trace_constants: Vec<(&'static str, f64)>,
+    /// Identifies the scene in the calibration cache.
+    scene_key: String,
+    tuner: tuner::AutoTuner,
+    timer: Option<tuner::FrameTimer>,
     denoising_pipeline: wgpu::ComputePipeline,
+    exposure_pipeline: wgpu::ComputePipeline,
+    wavefront: Option<wavefront::Wavefront>,
+    temporal: Option<temporal::TemporalDenoiser>,
+    visibility: Option<visibility::Visibility>,
+    visibility_rastered: bool,
+    /// Trace only this (x, y, width, height) rectangle; None traces the whole frame.
+    trace_region: Option<(u32, u32, u32, u32)>,
+    /// Skip the per-frame filter pass (offline captures read raw radiance only).
+    skip_filter: bool,
     filter_dirty: bool,
     display_pipeline: wgpu::RenderPipeline,
     latest_render_params: RenderParams,
@@ -60,6 +92,7 @@ pub struct Raytracer {
 impl Raytracer {
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         surface_config: &wgpu::SurfaceConfiguration,
         scene: &Scene,
         render_params: &RenderParams,
@@ -68,6 +101,10 @@ impl Raytracer {
             Ok(_) => {}
             Err(err) => return Err(err),
         }
+        let variants = trace_variants(device, scene);
+        // The visibility raster: G-buffer experiments, or a variant starting paths from it.
+        let vis_on = device.features().contains(wgpu::Features::PRIMITIVE_INDEX)
+            && (crate::has_flag("--visibility") || variants.iter().any(|v| v.visibility_primary));
 
         let uniforms = VertexUniforms {
             view_projection_matrix: unit_quad_projection_matrix(),
@@ -97,6 +134,7 @@ impl Raytracer {
             device,
             &frame_data_buffer,
             image_buffer_size(device, render_params.viewport_size)?,
+            render_params.auto_exposure,
         );
         let camera_buffer = {
             let camera = GpuCamera::new(&render_params.camera, render_params.viewport_size);
@@ -108,6 +146,15 @@ impl Raytracer {
                 Some("camera buffer"),
             )
         };
+
+        // Previous-frame camera for motion vectors; starts equal to the current one.
+        let initial_camera = GpuCamera::new(&render_params.camera, render_params.viewport_size);
+        let prev_camera_buffer = UniformBuffer::new_from_bytes(
+            device,
+            bytemuck::bytes_of(&initial_camera),
+            3_u32,
+            Some("previous camera buffer"),
+        );
 
         let sampling_parameter_buffer = UniformBuffer::new(
             device,
@@ -130,9 +177,10 @@ impl Raytracer {
         let parameter_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
-                    camera_buffer.layout(tracing_stages()),
-                    sampling_parameter_buffer.layout(tracing_stages()),
-                    hw_sky_state_buffer.layout(tracing_stages(), true),
+                    camera_buffer.layout(scene_stages(vis_on)),
+                    sampling_parameter_buffer.layout(scene_stages(vis_on)),
+                    hw_sky_state_buffer.layout(scene_stages(vis_on), true),
+                    prev_camera_buffer.layout(scene_stages(vis_on)),
                 ],
                 label: Some("parameter layout"),
             });
@@ -143,11 +191,24 @@ impl Raytracer {
                 camera_buffer.binding(),
                 sampling_parameter_buffer.binding(),
                 hw_sky_state_buffer.binding(),
+                prev_camera_buffer.binding(),
             ],
             label: Some("parameter bind group"),
         });
 
-        let (scene_bind_group_layout, scene_bind_group, light_count) = {
+        let sphere_prev_centers: Vec<[f32; 4]> = scene
+            .spheres
+            .iter()
+            .map(|s| s.center.into())
+            .chain(std::iter::once([0.; 4]))
+            .collect();
+        let sphere_prev_buffer = StorageBuffer::new_from_bytes(
+            device,
+            bytemuck::cast_slice(&sphere_prev_centers),
+            7_u32,
+            Some("previous sphere centres"),
+        );
+        let (scene_bind_group_layout, scene_bind_group, light_count, sphere_handle) = {
             let sphere_buffer = StorageBuffer::new_from_bytes(
                 device,
                 bytemuck::cast_slice(scene.spheres.as_slice()),
@@ -217,10 +278,9 @@ impl Raytracer {
             let mesh_words = scene
                 .mesh
                 .gpu_words(scene.spheres.len() as u32, light_indices.len() as u32);
-            for size in [mesh_words.len() * 4, scene.mesh.pixels.len() * 4] {
-                if size as u64 > u64::from(device.limits().max_storage_buffer_binding_size) {
-                    return Err(RenderParamsValidationError::SceneBufferTooLarge(size));
-                }
+            let size = mesh_words.len() * 4;
+            if size as u64 > u64::from(device.limits().max_storage_buffer_binding_size) {
+                return Err(RenderParamsValidationError::SceneBufferTooLarge(size));
             }
             let mesh_buffer = StorageBuffer::new_from_bytes(
                 device,
@@ -228,35 +288,53 @@ impl Raytracer {
                 4,
                 Some("mesh geometry and BVH"),
             );
-            let mesh_texture_buffer = StorageBuffer::new_from_bytes(
-                device,
-                bytemuck::cast_slice(&scene.mesh.pixels),
-                5,
-                Some("packed glTF texture pixels"),
-            );
+            let mesh_textures = gpu_textures::GpuTextures::new(device, queue, &scene.mesh);
+            let [texture_layout, sampler_layout] =
+                mesh_textures.layout_entries(scene_stages(vis_on));
+            let texture_views = mesh_textures.views();
+            let samplers = mesh_textures.samplers();
 
+            let hw_accel = mesh::hw_rt().then(|| hwrt::HwAccel::new(device, queue, &scene.mesh));
             let scene_bind_group_layout =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     entries: &[
-                        sphere_buffer.layout(tracing_stages(), true),
-                        material_buffer.layout(tracing_stages(), true),
-                        texture_buffer.layout(tracing_stages(), true),
-                        light_buffer.layout(tracing_stages(), true),
-                        mesh_buffer.layout(tracing_stages(), true),
-                        mesh_texture_buffer.layout(tracing_stages(), true),
-                    ],
+                        hwrt::HwAccel::layout_entry(scene_stages(vis_on)),
+                        sphere_buffer.layout(scene_stages(vis_on), true),
+                        material_buffer.layout(scene_stages(vis_on), true),
+                        texture_buffer.layout(scene_stages(vis_on), true),
+                        light_buffer.layout(scene_stages(vis_on), true),
+                        mesh_buffer.layout(scene_stages(vis_on), true),
+                        texture_layout,
+                        sampler_layout,
+                        sphere_prev_buffer.layout(scene_stages(vis_on), true),
+                    ][usize::from(hw_accel.is_none())..],
                     label: Some("scene layout"),
                 });
+            let mut scene_entries = vec![
+                sphere_buffer.binding(),
+                material_buffer.binding(),
+                texture_buffer.binding(),
+                light_buffer.binding(),
+                mesh_buffer.binding(),
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureViewArray(&texture_views),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::SamplerArray(&samplers),
+                },
+                sphere_prev_buffer.binding(),
+            ];
+            if let Some(accel) = &hw_accel {
+                scene_entries.push(wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::AccelerationStructure(&accel.tlas),
+                });
+            }
             let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 layout: &scene_bind_group_layout,
-                entries: &[
-                    sphere_buffer.binding(),
-                    material_buffer.binding(),
-                    texture_buffer.binding(),
-                    light_buffer.binding(),
-                    mesh_buffer.binding(),
-                    mesh_texture_buffer.binding(),
-                ],
+                entries: &scene_entries,
                 label: Some("scene bind group"),
             });
 
@@ -264,9 +342,11 @@ impl Raytracer {
                 scene_bind_group_layout,
                 scene_bind_group,
                 light_indices.len() as f64,
+                sphere_buffer.handle().clone(),
             )
         };
 
+        let temporal_source = temporal::model_source();
         let neural = crate::argument_value("--neural-model")
             .map(|path| std::fs::read_to_string(path).expect("cannot read neural WGSL model"));
         let mut trace_source = include_str!("raytracer.wgsl").to_owned();
@@ -304,23 +384,58 @@ impl Raytracer {
             trace_source.replace_range(start..end, &result);
             trace_source = format!("enable f16;\n{trace_source}");
         }
+        // Hardware ray queries need the WGSL extension and the real implementation;
+        // otherwise a stub keeps the (dead) HW_RT branches compiling.
+        if vis_on {
+            let start = trace_source.find("// VISIBILITY STUBS").unwrap();
+            let end = trace_source.find("// END VISIBILITY STUBS").unwrap();
+            trace_source.replace_range(start..end, "");
+            trace_source = format!("enable primitive_index;\n{trace_source}");
+        }
+        let hw_source = if mesh::hw_rt() {
+            trace_source = format!("enable wgpu_ray_query;\n{trace_source}");
+            include_str!("hwrt.wgsl").to_owned()
+        } else {
+            String::new()
+        };
+        // The module is trace source + mesh source (varies with the module configuration)
+        // + the rest; the parts are kept so calibration can rebuild the trace kernel.
+        let module_config = default_module_config();
+        let source_suffix = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            hw_source,
+            include_str!("wavefront.wgsl"),
+            neural.as_deref().unwrap_or(""),
+            temporal_source.as_deref().unwrap_or(""),
+            if vis_on {
+                include_str!("visibility.wgsl")
+            } else {
+                ""
+            }
+        );
         let source = format!(
             "{}\n{}\n{}",
             trace_source,
-            include_str!("mesh.wgsl"),
-            neural.as_deref().unwrap_or("")
+            mesh_source(module_config),
+            source_suffix
         );
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("raytracer shader"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
+        // naga guards every loop with an iteration counter. Our loops all terminate, and a
+        // runaway loop would hang the GPU with or without the guard, so the guards only
+        // cost time: 3.9% geomean over the benchmark views (up to 8%), bit-identical
+        // output, tests and denoiser parity unchanged. `--loop-guards` restores them.
+        // (The 4-wide pop loop was miscompiled without its guard; it is straight-line code now.)
+        let shader = create_module(device, source);
 
+        let vis_resolve_layout = vis_on.then(|| visibility::resolve_layout(device));
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             bind_group_layouts: &[
                 Some(&vertex_uniform_bind_group_layout),
                 Some(&images.trace_layout),
                 Some(&parameter_bind_group_layout),
                 Some(&scene_bind_group_layout),
+                None,
+                None,
+                vis_resolve_layout.as_ref(),
             ],
             immediate_size: 0,
             label: Some("raytracer layout"),
@@ -404,73 +519,120 @@ impl Raytracer {
                     cache: None,
                 })
             };
-        let accumulation_pipeline = create_compute(
+        let trace_constants = [
+            ("SPHERE_COUNT", scene.spheres.len() as f64),
+            ("LIGHT_COUNT", light_count),
+            ("TRACE_MESHES", f64::from(!scene.mesh.triangles.is_empty())),
+            ("TRACE_SPHERES", f64::from(!scene.spheres.is_empty())),
+            (
+                "RUSSIAN_ROULETTE",
+                f64::from(!std::env::args().any(|a| a == "--no-russian-roulette")),
+            ),
+            (
+                "SKY_IMPORTANCE",
+                f64::from(std::env::args().any(|a| a == "--sky-importance")),
+            ),
+            (
+                "GGX_VNDF",
+                f64::from(std::env::args().any(|a| a == "--ggx-vndf")),
+            ),
+            (
+                "GGX_BOUNDED",
+                f64::from(
+                    crate::has_flag("--bounded-vndf") || std::env::var("RT_BOUNDED_GGX").is_ok(),
+                ),
+            ),
+            (
+                "BLUE_NOISE_JITTER",
+                f64::from(crate::has_flag("--blue-noise-jitter")),
+            ),
+            (
+                "CENTER_JITTER",
+                f64::from(crate::has_flag("--center-jitter")),
+            ),
+            (
+                "CONES_PRIMARY_ONLY",
+                f64::from(crate::has_flag("--cones-primary-only")),
+            ),
+            ("VIS_PRIMARY", 0.),
+            (
+                "BLUE_NOISE_PATH",
+                f64::from(crate::has_flag("--blue-noise-path")),
+            ),
+            ("QUANTIZED_BVH", f64::from(mesh::quantized_bvh())),
+            (
+                "OPACITY_APPROX",
+                f64::from(crate::has_flag("--approximate-alpha")),
+            ),
+            ("RAY_CONES", f64::from(crate::has_flag("--ray-cones"))),
+            ("ALPHA_CAP", f64::from(crate::has_flag("--alpha-cap4"))),
+            ("SOFTWARE_OPACITY", f64::from(mesh::micro_opacity())),
+            ("WIDE_BVH", f64::from(mesh::bvh_width())),
+            ("PAIR_BVH", f64::from(mesh::pair_bvh())),
+            ("QUAD_BVH", f64::from(mesh::quad_bvh())),
+            ("OCT_BVH", f64::from(mesh::oct_bvh())),
+            ("HW_RT", f64::from(mesh::hw_rt())),
+            (
+                "HW_FLIP_FACING",
+                f64::from(std::env::var("RT_HW_FLIP").is_ok()),
+            ),
+            (
+                "QUAD_CULL",
+                f64::from(std::env::var("RT_QUAD_CULL").is_ok()),
+            ),
+            ("QUAD_LEAF_COUNT", f64::from(mesh::quad_leaf_count())),
+            ("QUAD_Q8", f64::from(mesh::quad_q8())),
+            (
+                "PACKED_SHADING",
+                f64::from(crate::has_flag("--packed-shading")),
+            ),
+            (
+                "STOCHASTIC_TEXTURE",
+                if crate::has_flag("--stochastic-all") {
+                    2.0
+                } else if crate::has_flag("--stochastic-color") {
+                    1.0
+                } else {
+                    0.0
+                },
+            ),
+            (
+                "PACKED_DIRECTIONS",
+                f64::from(crate::has_flag("--packed-directions")),
+            ),
+            (
+                "SKIP_FINAL_SCATTER",
+                f64::from(crate::has_flag("--skip-final-scatter")),
+            ),
+            (
+                "TRAVERSAL_STATS",
+                f64::from(std::env::var("RT_STATS").is_ok()),
+            ),
+            ("GBUFFER", f64::from(gbuffer_enabled())),
+            (
+                "COHERENCE_TEST",
+                f64::from(std::env::var("RT_COHERENCE_TEST").is_ok()),
+            ),
+            ("TRACE_WIDTH", f64::from(module_config.workgroup[0])),
+            ("TRACE_HEIGHT", f64::from(module_config.workgroup[1])),
+        ];
+        // One trace pipeline per variant; the auto-tuner picks one per frame.
+        let trace_constants: Vec<(&'static str, f64)> = trace_constants.to_vec();
+        let trace_pipelines = build_trace_pipelines(
+            device,
+            &shader,
             &pipeline_layout,
-            "csAccumulate",
-            "path tracing compute",
-            &[
-                ("SPHERE_COUNT", scene.spheres.len() as f64),
-                ("LIGHT_COUNT", light_count),
-                ("TRACE_MESHES", f64::from(!scene.mesh.triangles.is_empty())),
-                ("TRACE_SPHERES", f64::from(!scene.spheres.is_empty())),
-                (
-                    "RUSSIAN_ROULETTE",
-                    f64::from(!std::env::args().any(|a| a == "--no-russian-roulette")),
-                ),
-                (
-                    "SKY_IMPORTANCE",
-                    f64::from(std::env::args().any(|a| a == "--sky-importance")),
-                ),
-                (
-                    "GGX_VNDF",
-                    f64::from(std::env::args().any(|a| a == "--ggx-vndf")),
-                ),
-                (
-                    "GGX_BOUNDED",
-                    f64::from(
-                        crate::has_flag("--bounded-vndf")
-                            || std::env::var("RT_BOUNDED_GGX").is_ok(),
-                    ),
-                ),
-                (
-                    "BLUE_NOISE_JITTER",
-                    f64::from(crate::has_flag("--blue-noise-jitter")),
-                ),
-                ("QUANTIZED_BVH", f64::from(mesh::quantized_bvh())),
-                (
-                    "OPACITY_APPROX",
-                    f64::from(crate::has_flag("--approximate-alpha")),
-                ),
-                ("RAY_CONES", f64::from(crate::has_flag("--ray-cones"))),
-                ("ALPHA_CAP", f64::from(crate::has_flag("--alpha-cap4"))),
-                ("SOFTWARE_OPACITY", f64::from(mesh::micro_opacity())),
-                ("WIDE_BVH", f64::from(mesh::bvh_width())),
-                (
-                    "PACKED_SHADING",
-                    f64::from(crate::has_flag("--packed-shading")),
-                ),
-                (
-                    "STOCHASTIC_TEXTURE",
-                    if crate::has_flag("--stochastic-all") {
-                        2.0
-                    } else if crate::has_flag("--stochastic-color") {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                ),
-                (
-                    "PACKED_DIRECTIONS",
-                    f64::from(crate::has_flag("--packed-directions")),
-                ),
-                (
-                    "SKIP_FINAL_SCATTER",
-                    f64::from(crate::has_flag("--skip-final-scatter")),
-                ),
-                ("TRACE_WIDTH", f64::from(trace_workgroup_size()[0])),
-                ("TRACE_HEIGHT", f64::from(trace_workgroup_size()[1])),
-            ],
+            &trace_constants,
+            &variants,
+            module_config,
         );
+        if variants.len() > 1 {
+            eprintln!(
+                "Auto-tune: {} trace variants {:?}",
+                variants.len(),
+                variants
+            );
+        }
         let denoising_pipeline = create_compute(
             &filter_pipeline_layout,
             if neural.is_some() {
@@ -483,6 +645,148 @@ impl Raytracer {
                 "SPARSE_DENOISE",
                 f64::from(crate::has_flag("--sparse-denoise")),
             )],
+        );
+        let wavefront = (wavefront::enabled()).then(|| {
+            assert!(
+                !scene.mesh.triangles.is_empty() && scene.spheres.is_empty() && mesh::quad_bvh(),
+                "--wavefront currently needs a mesh-only scene and --quad-bvh"
+            );
+            let layouts = wavefront::Wavefront::layouts(device);
+            let pipeline_layouts = layouts.each_ref().map(|layout| {
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    bind_group_layouts: &[
+                        Some(&vertex_uniform_bind_group_layout),
+                        Some(&images.trace_layout),
+                        Some(&parameter_bind_group_layout),
+                        Some(&scene_bind_group_layout),
+                        Some(layout),
+                    ],
+                    immediate_size: 0,
+                    label: Some("wavefront layout"),
+                })
+            });
+            let pipelines = [
+                "csWfGenerate",
+                "csWfArgs",
+                "csWfTrace",
+                "csWfShade",
+                "csWfAccumulate",
+            ]
+            .map(|entry| {
+                let layout = &pipeline_layouts[usize::from(entry == "csWfArgs")];
+                create_compute(layout, entry, entry, &trace_constants)
+            });
+            let (width, height) = render_params.viewport_size;
+            wavefront::Wavefront::new(device, layouts, pipelines, width * height)
+        });
+        let temporal = temporal_source.is_some().then(|| {
+            let layout = temporal::TemporalDenoiser::layout(device);
+            let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[],
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                bind_group_layouts: &[
+                    Some(&vertex_uniform_bind_group_layout),
+                    Some(&images.trace_layout),
+                    Some(&parameter_bind_group_layout),
+                    Some(&scene_bind_group_layout),
+                    Some(&empty),
+                    Some(&layout),
+                ],
+                immediate_size: 0,
+                label: Some("temporal denoiser layout"),
+            });
+            let model = temporal_source.as_deref().unwrap();
+            // Entry names are built once per process; the pipeline helper takes &'static str.
+            let pipelines = temporal::kernels(model)
+                .into_iter()
+                .map(|entry| {
+                    let entry: &'static str = Box::leak(entry.into_boxed_str());
+                    create_compute(&pipeline_layout, entry, entry, &trace_constants)
+                })
+                .collect();
+            let (width, height) = render_params.viewport_size;
+            temporal::TemporalDenoiser::new(
+                device,
+                layout,
+                &empty,
+                pipelines,
+                images.filtered.handle(),
+                width * height,
+                model,
+            )
+        });
+        let visibility = vis_on.then(|| {
+            let raster_layout = visibility::raster_layout(device);
+            let resolve_layout = vis_resolve_layout.clone().unwrap();
+            let raster_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    bind_group_layouts: &[
+                        None,
+                        None,
+                        Some(&parameter_bind_group_layout),
+                        Some(&scene_bind_group_layout),
+                        None,
+                        None,
+                        Some(&raster_layout),
+                    ],
+                    immediate_size: 0,
+                    label: Some("visibility raster layout"),
+                });
+            let resolve_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    bind_group_layouts: &[
+                        Some(&vertex_uniform_bind_group_layout),
+                        Some(&images.trace_layout),
+                        Some(&parameter_bind_group_layout),
+                        Some(&scene_bind_group_layout),
+                        None,
+                        None,
+                        Some(&resolve_layout),
+                    ],
+                    immediate_size: 0,
+                    label: Some("visibility resolve layout"),
+                });
+            // RT_VIS_CONES=0 keeps the tracer's base-level texture sampling.
+            let cones = std::env::var("RT_VIS_CONES").map_or(true, |v| v != "0");
+            let resolve_constants: Vec<(&str, f64)> = trace_constants
+                .iter()
+                .map(|&(name, value)| {
+                    (
+                        name,
+                        if name == "RAY_CONES" && cones {
+                            1.
+                        } else {
+                            value
+                        },
+                    )
+                })
+                .collect();
+            let resolve = create_compute(
+                &resolve_pipeline_layout,
+                "csVisibilityResolve",
+                "visibility resolve",
+                &resolve_constants,
+            );
+            visibility::Visibility::new(
+                device,
+                &scene.mesh,
+                &shader,
+                &raster_pipeline_layout,
+                &raster_layout,
+                resolve_layout,
+                resolve,
+                &trace_constants,
+                render_params.viewport_size,
+                &parameter_bind_group_layout,
+            )
+        });
+        let exposure_pipeline = create_compute(
+            &filter_pipeline_layout,
+            "csExposure",
+            "automatic exposure compute",
+            &[],
         );
         let display_pipeline = create_pipeline(
             &display_pipeline_layout,
@@ -511,13 +815,39 @@ impl Raytracer {
             frame_data_buffer,
             images,
             camera_buffer,
+            prev_camera_buffer,
+            last_camera: initial_camera,
+            sphere_buffer: sphere_handle,
+            sphere_prev_buffer,
+            last_sphere_centers: sphere_prev_centers,
             sampling_parameter_buffer,
             hw_sky_state_buffer,
             parameter_bind_group,
             scene_bind_group,
             vertex_buffer,
-            accumulation_pipeline,
+            trace_pipelines,
+            module_config,
+            source_prefix: trace_source,
+            source_suffix,
+            trace_layout: pipeline_layout,
+            trace_constants,
+            scene_key: format!(
+                "{}t{}v{}m{}s",
+                scene.mesh.triangles.len(),
+                scene.mesh.vertices.len(),
+                scene.mesh.materials.len(),
+                scene.spheres.len()
+            ),
+            tuner: tuner::AutoTuner::new(variants),
+            timer: tuner::FrameTimer::new(device, queue),
             denoising_pipeline,
+            exposure_pipeline,
+            wavefront,
+            temporal,
+            visibility,
+            visibility_rastered: false,
+            trace_region: None,
+            skip_filter: false,
             filter_dirty: true,
             display_pipeline,
             latest_render_params: *render_params,
@@ -526,8 +856,219 @@ impl Raytracer {
         })
     }
 
+    /// Startup level of the auto-tuner: choose the trace kernel's traversal stack and
+    /// workgroup shape for this GPU, driver and scene by timing the current view, and
+    /// cache the choice (later runs apply it without measuring). `adapter` identifies
+    /// the GPU and driver. Coordinate search: stacks at the default shape, then shapes.
+    pub fn calibrate(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, adapter: &str) {
+        if !auto_tune()
+            || self.wavefront.is_some()
+            || self.timer.is_none()
+            || crate::has_flag("--no-calibrate")
+        {
+            return;
+        }
+        let key = format!("{adapter}|{}|{}", self.scene_key, env!("CARGO_PKG_VERSION"));
+        let fresh = crate::has_flag("--recalibrate");
+        let chosen = match tuner::load_cached(&key).filter(|_| !fresh) {
+            Some(config) => config,
+            None => {
+                let start = std::time::Instant::now();
+                let saved = (self.frame_number, self.last_camera);
+                let mut best = (
+                    self.module_config,
+                    self.measure_config(device, queue, self.module_config),
+                );
+                if crate::has_flag("--tuner-log") {
+                    eprintln!("calibrate: {:?} {:.2} ms (default)", best.0, best.1);
+                }
+                let consider =
+                    |this: &mut Self,
+                     config: tuner::ModuleConfig,
+                     best: &mut (tuner::ModuleConfig, f64)| {
+                        if config != best.0 {
+                            let ms = this.measure_config(device, queue, config);
+                            if crate::has_flag("--tuner-log") {
+                                eprintln!("calibrate: {config:?} {ms:.2} ms");
+                            }
+                            if ms < best.1 * 0.98 {
+                                *best = (config, ms);
+                            }
+                        }
+                    };
+                if self.module_config.stack.is_some() && !stack_override() {
+                    for stack in [
+                        tuner::Stack::Shared32,
+                        tuner::Stack::Registers16,
+                        tuner::Stack::Private64,
+                    ] {
+                        consider(
+                            self,
+                            tuner::ModuleConfig {
+                                stack: Some(stack),
+                                ..best.0
+                            },
+                            &mut best,
+                        );
+                    }
+                }
+                if std::env::var("RAYTRACER_WORKGROUP").is_err() {
+                    for workgroup in [[8, 8], [16, 4], [32, 2], [64, 1]] {
+                        consider(
+                            self,
+                            tuner::ModuleConfig {
+                                workgroup,
+                                ..best.0
+                            },
+                            &mut best,
+                        );
+                    }
+                }
+                (self.frame_number, self.last_camera) = saved;
+                self.render_progress.reset();
+                eprintln!(
+                    "Calibrated trace kernel: {:?} ({:.2} ms), {:.1}s",
+                    best.0,
+                    best.1,
+                    start.elapsed().as_secs_f64()
+                );
+                tuner::store_cached(&key, best.0);
+                best.0
+            }
+        };
+        if chosen != self.module_config {
+            self.trace_pipelines =
+                self.trace_pipelines_for(device, chosen, &self.tuner.variants.clone());
+            self.module_config = chosen;
+        }
+        if crate::has_flag("--tuner-log") {
+            eprintln!("calibrate: using {chosen:?}");
+        }
+    }
+
+    fn trace_pipelines_for(
+        &self,
+        device: &wgpu::Device,
+        config: tuner::ModuleConfig,
+        variants: &[tuner::Variant],
+    ) -> Vec<wgpu::ComputePipeline> {
+        let module = create_module(
+            device,
+            format!(
+                "{}\n{}\n{}",
+                self.source_prefix,
+                mesh_source(config),
+                self.source_suffix
+            ),
+        );
+        build_trace_pipelines(
+            device,
+            &module,
+            &self.trace_layout,
+            &self.trace_constants,
+            variants,
+            config,
+        )
+    }
+
+    /// Median GPU ms of the trace pass (first tuner variant) with `config`.
+    fn measure_config(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: tuner::ModuleConfig,
+    ) -> f64 {
+        let pipeline = self
+            .trace_pipelines_for(device, config, &self.tuner.variants[..1])
+            .remove(0);
+        let query = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: None,
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        });
+        let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let (width, height) = self.latest_render_params.viewport_size;
+        let mut times = Vec::new();
+        for frame in 0..12 {
+            // Keep tracing one sample per frame: never reach the sample target.
+            self.render_progress.reset();
+            self.prepare_frame(queue);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.write_timestamp(&query, 0);
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("calibration"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &self.vertex_uniform_bind_group, &[]);
+                pass.set_bind_group(1, &self.images.trace, &[]);
+                pass.set_bind_group(2, &self.parameter_bind_group, &[]);
+                pass.set_bind_group(3, &self.scene_bind_group, &[]);
+                if let Some(visibility) = &self.visibility {
+                    pass.set_bind_group(6, visibility.trace_group(), &[]);
+                }
+                pass.dispatch_workgroups(
+                    width.div_ceil(config.workgroup[0]),
+                    height.div_ceil(config.workgroup[1]),
+                    1,
+                );
+            }
+            encoder.write_timestamp(&query, 1);
+            encoder.resolve_query_set(&query, 0..2, &resolve, 0);
+            encoder.copy_buffer_to_buffer(&resolve, 0, &read, 0, 16);
+            queue.submit([encoder.finish()]);
+            read.slice(..)
+                .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            {
+                let data = read.slice(..).get_mapped_range().unwrap();
+                let ticks: &[u64] = bytemuck::cast_slice(&data);
+                if frame >= 2 {
+                    times.push(
+                        ticks[1].wrapping_sub(ticks[0]) as f64
+                            * f64::from(queue.get_timestamp_period())
+                            / 1e6,
+                    );
+                }
+            }
+            read.unmap();
+        }
+        times.sort_by(f64::total_cmp);
+        times[times.len() / 2]
+    }
+
+    /// Call after submitting a frame: starts reading back its timing for the auto-tuner.
+    pub fn after_submit(&mut self, device: &wgpu::Device) {
+        if let Some(timer) = &mut self.timer {
+            timer.after_submit();
+            let _ = device.poll(wgpu::PollType::Poll);
+        }
+    }
+
+    /// The trace variant the auto-tuner currently runs.
+    pub fn trace_variant(&self) -> String {
+        format!("{:?}", self.tuner.current())
+    }
+
     /// Dispatch tracing, then filtering; presentation only reads the completed result.
     pub fn accumulate_frame(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
+        if let Some(temporal) = &mut self.temporal {
+            // Real-time mode: one fresh sample per frame; history lives in the denoiser.
+            self.render_progress.reset();
+            temporal.prepare(queue);
+        }
         if !self.filter_dirty
             && self.render_progress.accumulated_samples()
                 >= self.latest_render_params.sampling.max_samples_per_pixel
@@ -537,27 +1078,121 @@ impl Raytracer {
             self.frame_number = self.frame_number.wrapping_add(1);
             return;
         }
-        let params = self.prepare_frame(queue);
+        let mut params = self.prepare_frame(queue);
+        if let Some((x, y, _, _)) = self.trace_region {
+            params.trace_origin = x | (y << 16);
+            queue.write_buffer(
+                self.sampling_parameter_buffer.handle(),
+                0,
+                bytemuck::cast_slice(&[params]),
+            );
+        }
         let (width, height) = self.latest_render_params.viewport_size;
         let groups = (width.div_ceil(8), height.div_ceil(8));
+        for (variant, ms, switched) in self
+            .timer
+            .as_mut()
+            .map(tuner::FrameTimer::collect)
+            .unwrap_or_default()
+        {
+            self.tuner.record(variant, ms, switched);
+        }
+        let variant = if params.num_samples_per_pixel != 0 {
+            self.tuner.next()
+        } else {
+            0
+        };
+        let timing = if params.num_samples_per_pixel != 0 {
+            let switched = self.tuner.switched(variant);
+            self.timer
+                .as_mut()
+                .and_then(|timer| timer.begin(encoder, variant, switched))
+        } else {
+            None
+        };
+        if let Some(visibility) = self
+            .visibility
+            .as_ref()
+            .filter(|_| self.tuner.variants[variant].visibility_primary)
+        {
+            // RT_VIS_RASTER_ONCE: keep the first frame's visibility buffer (static camera,
+            // profiling the tracing pass alone).
+            let once = std::env::var("RT_VIS_RASTER_ONCE").is_ok();
+            if params.num_samples_per_pixel != 0 && (!once || !self.visibility_rastered) {
+                self.visibility_rastered = true;
+                visibility.set_frame(
+                    queue,
+                    self.frame_number,
+                    !crate::has_flag("--center-jitter") && !once,
+                );
+                let planes = GpuCamera::new(
+                    &self.latest_render_params.camera,
+                    self.latest_render_params.viewport_size,
+                )
+                .frustum_planes();
+                visibility.raster(
+                    encoder,
+                    &self.parameter_bind_group,
+                    &self.scene_bind_group,
+                    &planes,
+                );
+            }
+        }
         if params.num_samples_per_pixel != 0 {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("path tracing pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.accumulation_pipeline);
+            pass.set_pipeline(&self.trace_pipelines[variant]);
             pass.set_bind_group(0, &self.vertex_uniform_bind_group, &[]);
             pass.set_bind_group(1, &self.images.trace, &[]);
             pass.set_bind_group(2, &self.parameter_bind_group, &[]);
             pass.set_bind_group(3, &self.scene_bind_group, &[]);
-            pass.dispatch_workgroups(
-                width.div_ceil(trace_workgroup_size()[0]),
-                height.div_ceil(trace_workgroup_size()[1]),
-                1,
-            );
+            if let Some(visibility) = &self.visibility {
+                pass.set_bind_group(6, visibility.trace_group(), &[]);
+            }
+            if let Some(wavefront) = &self.wavefront {
+                assert_eq!(
+                    params.num_samples_per_pixel, 1,
+                    "wavefront traces one sample per frame"
+                );
+                wavefront.record(
+                    &mut pass,
+                    (width, height),
+                    trace_workgroup_size(),
+                    self.latest_render_params.sampling.num_bounces,
+                );
+            } else {
+                let (w, h) = self.trace_region.map_or((width, height), |r| (r.2, r.3));
+                pass.dispatch_workgroups(
+                    w.div_ceil(self.module_config.workgroup[0]),
+                    h.div_ceil(self.module_config.workgroup[1]),
+                    1,
+                );
+            }
             self.filter_dirty = true;
         }
-        if self.filter_dirty {
+        if let (Some(timer), Some(slot)) = (&self.timer, timing) {
+            timer.end(encoder, slot);
+        }
+        if let Some(temporal) = &self.temporal {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("temporal denoiser pass"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, &self.vertex_uniform_bind_group, &[]);
+            pass.set_bind_group(1, &self.images.trace, &[]);
+            pass.set_bind_group(2, &self.parameter_bind_group, &[]);
+            pass.set_bind_group(3, &self.scene_bind_group, &[]);
+            temporal.record(&mut pass, (width, height));
+            if self.latest_render_params.auto_exposure {
+                pass.set_pipeline(&self.exposure_pipeline);
+                pass.set_bind_group(1, &self.images.filter, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            self.filter_dirty = false;
+        }
+        if self.filter_dirty && !self.skip_filter {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("denoising pass"),
                 timestamp_writes: None,
@@ -567,6 +1202,10 @@ impl Raytracer {
             pass.set_bind_group(1, &self.images.filter, &[]);
             pass.set_bind_group(2, &self.parameter_bind_group, &[]);
             pass.dispatch_workgroups(groups.0, groups.1, 1);
+            if self.latest_render_params.auto_exposure {
+                pass.set_pipeline(&self.exposure_pipeline);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
             self.filter_dirty = false;
         }
     }
@@ -594,6 +1233,103 @@ impl Raytracer {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Fill the G-buffer by rasterized visibility (`--visibility`); call after a traced
+    /// frame so frame data and camera are uploaded.
+    pub fn encode_visibility(&self, encoder: &mut wgpu::CommandEncoder) {
+        let visibility = self.visibility.as_ref().expect("--visibility");
+        let planes = GpuCamera::new(
+            &self.latest_render_params.camera,
+            self.latest_render_params.viewport_size,
+        )
+        .frustum_planes();
+        visibility.raster(
+            encoder,
+            &self.parameter_bind_group,
+            &self.scene_bind_group,
+            &planes,
+        );
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("visibility resolve pass"),
+            timestamp_writes: None,
+        });
+        pass.set_bind_group(0, &self.vertex_uniform_bind_group, &[]);
+        pass.set_bind_group(1, &self.images.trace, &[]);
+        pass.set_bind_group(2, &self.parameter_bind_group, &[]);
+        pass.set_bind_group(3, &self.scene_bind_group, &[]);
+        visibility.resolve(&mut pass);
+    }
+
+    /// Median GPU ms of [raster, resolve] over 100 warmed repetitions.
+    pub fn benchmark_visibility(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> [f64; 2] {
+        let query = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: None,
+            ty: wgpu::QueryType::Timestamp,
+            count: 3,
+        });
+        let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 24,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 24,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let visibility = self.visibility.as_ref().expect("--visibility");
+        let planes = GpuCamera::new(
+            &self.latest_render_params.camera,
+            self.latest_render_params.viewport_size,
+        )
+        .frustum_planes();
+        let mut times = [Vec::new(), Vec::new()];
+        for i in 0..110 {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.write_timestamp(&query, 0);
+            visibility.raster(
+                &mut encoder,
+                &self.parameter_bind_group,
+                &self.scene_bind_group,
+                &planes,
+            );
+            encoder.write_timestamp(&query, 1);
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+                pass.set_bind_group(0, &self.vertex_uniform_bind_group, &[]);
+                pass.set_bind_group(1, &self.images.trace, &[]);
+                pass.set_bind_group(2, &self.parameter_bind_group, &[]);
+                pass.set_bind_group(3, &self.scene_bind_group, &[]);
+                visibility.resolve(&mut pass);
+            }
+            encoder.write_timestamp(&query, 2);
+            encoder.resolve_query_set(&query, 0..3, &resolve, 0);
+            encoder.copy_buffer_to_buffer(&resolve, 0, &read, 0, 24);
+            queue.submit([encoder.finish()]);
+            read.slice(..)
+                .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            {
+                let data = read.slice(..).get_mapped_range().unwrap();
+                let ticks: &[u64] = bytemuck::cast_slice(&data);
+                let period = f64::from(queue.get_timestamp_period()) / 1e6;
+                if i >= 10 {
+                    times[0].push((ticks[1] - ticks[0]) as f64 * period);
+                    times[1].push((ticks[2] - ticks[1]) as f64 * period);
+                }
+            }
+            read.unmap();
+        }
+        times.map(|mut t| {
+            t.sort_by(f64::total_cmp);
+            t[t.len() / 2]
+        })
     }
 
     /// Isolated filter GPU time, including warmup; p95 of 100 warmed dispatches.
@@ -648,7 +1384,71 @@ impl Raytracer {
         times[94]
     }
 
+    /// Move the scene's spheres; their previous positions feed motion vectors.
+    /// Restarts accumulation, as the image content changed.
+    pub fn set_spheres(&mut self, queue: &wgpu::Queue, spheres: &[Sphere]) {
+        queue.write_buffer(&self.sphere_buffer, 0, bytemuck::cast_slice(spheres));
+        queue.write_buffer(
+            self.sphere_prev_buffer.handle(),
+            0,
+            bytemuck::cast_slice(&self.last_sphere_centers),
+        );
+        for (last, sphere) in self.last_sphere_centers.iter_mut().zip(spheres) {
+            *last = sphere.center.into();
+        }
+        self.render_progress.reset();
+        self.filter_dirty = true;
+    }
+
+    /// Trace only a rectangle of the frame (training captures); other pixels keep
+    /// stale values. The wavefront tracer ignores this.
+    pub fn set_trace_region(&mut self, region: Option<(u32, u32, u32, u32)>) {
+        assert!(region.is_none_or(|r| r.0 < 65536 && r.1 < 65536));
+        self.trace_region = region;
+    }
+
+    /// Skip the filter pass after tracing (captures that only read raw buffers).
+    pub fn set_skip_filter(&mut self, skip: bool) {
+        self.skip_filter = skip;
+    }
+
+    /// Restart progressive accumulation without changing parameters.
+    pub fn reset_accumulation(&mut self) {
+        self.render_progress.reset();
+        self.filter_dirty = true;
+    }
+
+    /// Primary-hit guides of the last traced frame, 12 floats per pixel.
+    pub fn read_gbuffer(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
+        read_buffer(device, queue, &self.images.gbuffer)
+    }
+
+    /// The displayed (filtered or denoised) radiance, 3 floats per pixel.
+    pub fn read_filtered(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
+        read_buffer(device, queue, self.images.filtered.handle())
+    }
+
+    /// Mean radiance per pixel accumulated so far, 3 floats per pixel.
+    pub fn read_radiance(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
+        let samples = self.render_progress.accumulated_samples().max(1) as f32;
+        read_buffer(device, queue, self.images.accumulation.handle())
+            .into_iter()
+            .map(|v| v / samples)
+            .collect()
+    }
+
     fn prepare_frame(&mut self, queue: &wgpu::Queue) -> GpuSamplingParams {
+        // Motion vectors compare against the camera traced in the previous frame.
+        let camera = GpuCamera::new(
+            &self.latest_render_params.camera,
+            self.latest_render_params.viewport_size,
+        );
+        queue.write_buffer(
+            self.prev_camera_buffer.handle(),
+            0,
+            bytemuck::bytes_of(&self.last_camera),
+        );
+        self.last_camera = camera;
         let gpu_sampling_params = self
             .render_progress
             .next_frame(&self.latest_render_params.sampling);
@@ -710,8 +1510,14 @@ impl Raytracer {
             12,
             bytemuck::bytes_of(&render_params.exposure),
         );
+        if render_params.auto_exposure != self.latest_render_params.auto_exposure {
+            set_auto_exposure(queue, &self.images, render_params.auto_exposure);
+            // Recompute the key luminance from the current image.
+            self.filter_dirty |= render_params.auto_exposure;
+        }
         let mut previous = self.latest_render_params;
         previous.exposure = render_params.exposure;
+        previous.auto_exposure = render_params.auto_exposure;
         if previous == *render_params {
             self.latest_render_params = *render_params;
             return Ok(());
@@ -724,6 +1530,26 @@ impl Raytracer {
         };
         self.images
             .resize(device, &self.frame_data_buffer, buffer_size);
+        if let Some(wavefront) = &mut self.wavefront {
+            wavefront.resize(
+                device,
+                render_params.viewport_size.0 * render_params.viewport_size.1,
+            );
+        }
+        if let Some(visibility) = &mut self.visibility {
+            if render_params.viewport_size != self.latest_render_params.viewport_size {
+                visibility.resize(device, render_params.viewport_size);
+            }
+        }
+        if let Some(temporal) = &mut self.temporal {
+            if render_params.viewport_size != self.latest_render_params.viewport_size {
+                temporal.resize(
+                    device,
+                    self.images.filtered.handle(),
+                    render_params.viewport_size.0 * render_params.viewport_size.1,
+                );
+            }
+        }
 
         if let Some(sky_state) = sky_state {
             queue.write_buffer(
@@ -769,6 +1595,261 @@ fn image_buffer_size(
             height,
             max_bytes,
         })
+}
+
+fn set_auto_exposure(queue: &wgpu::Queue, images: &image_buffers::ImageBuffers, enabled: bool) {
+    queue.write_buffer(
+        images.exposure.handle(),
+        4,
+        bytemuck::bytes_of(&f32::from(u8::from(enabled))),
+    );
+}
+
+/// Mesh traversal source with experiment substitutions (RT_STACK=N stack entries).
+/// Trace pipelines (one per tuner variant) from `module` for a module configuration.
+fn build_trace_pipelines(
+    device: &wgpu::Device,
+    module: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    trace_constants: &[(&'static str, f64)],
+    variants: &[tuner::Variant],
+    config: tuner::ModuleConfig,
+) -> Vec<wgpu::ComputePipeline> {
+    variants
+        .iter()
+        .map(|variant| {
+            let constants: Vec<(&str, f64)> = trace_constants
+                .iter()
+                .map(|&(name, value)| match name {
+                    "RAY_CONES" => (name, f64::from(variant.cones != tuner::Cones::Off)),
+                    "CONES_PRIMARY_ONLY" => {
+                        (name, f64::from(variant.cones == tuner::Cones::Primary))
+                    }
+                    "VIS_PRIMARY" => (name, f64::from(variant.visibility_primary)),
+                    "TRACE_WIDTH" => (name, f64::from(config.workgroup[0])),
+                    "TRACE_HEIGHT" => (name, f64::from(config.workgroup[1])),
+                    _ => (name, value),
+                })
+                .collect();
+            // RT_SPIRV_TRACE=FILE.spv: the trace kernel from raw SPIR-V (constants already
+            // specialized), for comparing naga's output against other compilers/optimizers.
+            if let Ok(path) = std::env::var("RT_SPIRV_TRACE") {
+                let bytes = std::fs::read(&path).expect("RT_SPIRV_TRACE file");
+                let words: Vec<u32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                let module = unsafe {
+                    device.create_shader_module_passthrough(
+                        wgpu::ShaderModuleDescriptorPassthrough {
+                            label: Some("trace kernel (SPIR-V)"),
+                            entry_points: std::borrow::Cow::Owned(vec![
+                                wgpu::PassthroughShaderEntryPoint {
+                                    name: std::borrow::Cow::Borrowed("csAccumulate"),
+                                    workgroup_size: (config.workgroup[0], config.workgroup[1], 1),
+                                },
+                            ]),
+                            spirv: Some(std::borrow::Cow::Owned(words)),
+                            ..Default::default()
+                        },
+                    )
+                };
+                eprintln!("Trace kernel from {path}");
+                return device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("path tracing compute (SPIR-V)"),
+                    layout: Some(layout),
+                    module: &module,
+                    entry_point: Some("csAccumulate"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+            }
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("path tracing compute"),
+                layout: Some(layout),
+                module,
+                entry_point: Some("csAccumulate"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &constants,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+        })
+        .collect()
+}
+
+/// RT_* stack experiments choose the traversal stack themselves (no calibration).
+fn stack_override() -> bool {
+    [
+        "RT_STACK",
+        "RT_QUAD_STACK",
+        "RT_PRIVATE_STACK",
+        "RT_QUAD_SLM",
+    ]
+    .iter()
+    .any(|v| std::env::var(v).is_ok())
+}
+
+/// The trace kernel's module configuration before calibration.
+fn default_module_config() -> tuner::ModuleConfig {
+    let workgroup = trace_workgroup_size();
+    let stack = (mesh::quad_bvh() && !stack_override() && workgroup[0] * workgroup[1] == 64)
+        .then_some(tuner::Stack::Shared32);
+    tuner::ModuleConfig { stack, workgroup }
+}
+
+fn mesh_source(config: tuner::ModuleConfig) -> String {
+    use tuner::Stack;
+    let mut source = include_str!("mesh.wgsl").to_owned();
+    if mesh::hw_rt() {
+        source = source.replace(
+            "fn meshHwCandidate(ray: Ray, limit: f32, anyHit: bool, outBest: ptr<function, MeshCandidate>) -> bool { return false; }",
+            "",
+        );
+    }
+    let mut source = match std::env::var("RT_STACK") {
+        Ok(n) => source.replace("array<u32,64>", &format!("array<u32,{n}>")),
+        Err(_) => source,
+    };
+    if let Ok(n) = std::env::var("RT_QUAD_STACK") {
+        source = source.replace("const QUAD_STACK=64u;", &format!("const QUAD_STACK={n}u;"));
+    }
+    let lanes = config.workgroup[0] * config.workgroup[1];
+    // 4-wide traversal stack: workgroup memory (exact, 32 entries; 64-lane workgroups),
+    // registers (16 entries) or a module-scope array (64 entries), as configured.
+    let slm = std::env::var("RT_QUAD_SLM").ok().or_else(|| {
+        (config.stack == Some(Stack::Shared32))
+            .then(|| if mesh::oct_bvh() { "64" } else { "32" }.to_owned())
+    });
+    if let Some(n) = slm {
+        assert_eq!(
+            lanes, 64,
+            "the shared-memory traversal stack needs 64-invocation workgroups"
+        );
+        let start = source.find("fn meshQuadCandidate(").unwrap();
+        let end = start + source[start..].find("\n}\n").unwrap();
+        let body = source[start..end]
+            .replace("var stack:array<u32,QUAD_STACK>;", "")
+            .replace("stack[size]", "quadStack[size*64u+quadLane]");
+        source.replace_range(start..end, &body);
+        source = source.replace("const QUAD_STACK=64u;", &format!("const QUAD_STACK={n}u;"));
+        source.push_str(&format!(
+            "var<workgroup> quadStack: array<u32,{}>;\n",
+            64 * n.parse::<u32>().unwrap()
+        ));
+    }
+    if config.stack == Some(Stack::Registers16) {
+        source = source.replace("const QUAD_STACK=64u;", "const QUAD_STACK=16u;");
+    }
+    // Module-scope stack: zero-initialized once per invocation, not per ray.
+    if std::env::var("RT_PRIVATE_STACK").is_ok() || config.stack == Some(Stack::Private64) {
+        source = source.replace("var stack:array<u32,64>;", "");
+        source = source.replace("var stack:array<u32,QUAD_STACK>;", "");
+        source.push_str("var<private> stack:array<u32,64>;\n");
+    }
+    source
+}
+
+/// The renderer's shader module (loop guards off unless `--loop-guards`, see Raytracer::new).
+fn create_module(device: &wgpu::Device, source: String) -> wgpu::ShaderModule {
+    let descriptor = wgpu::ShaderModuleDescriptor {
+        label: Some("raytracer shader"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    };
+    if crate::has_flag("--loop-guards") {
+        device.create_shader_module(descriptor)
+    } else {
+        let checks = wgpu::ShaderRuntimeChecks {
+            force_loop_bounding: false,
+            ..wgpu::ShaderRuntimeChecks::checked()
+        };
+        unsafe { device.create_shader_module_trusted(descriptor, checks) }
+    }
+}
+
+/// Primary-hit guide output (`--gbuffer`; implied by capture and temporal denoising).
+pub fn gbuffer_enabled() -> bool {
+    crate::has_flag("--gbuffer")
+        || crate::has_flag("--capture")
+        || crate::has_flag("--temporal-model")
+}
+
+fn read_buffer(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Buffer) -> Vec<f32> {
+    let size = source.size();
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_buffer_to_buffer(source, 0, &buffer, 0, size);
+    queue.submit([encoder.finish()]);
+    buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    let data = buffer.slice(..).get_mapped_range().unwrap();
+    bytemuck::cast_slice(&data).to_vec()
+}
+
+/// Parameter and scene groups: tracing stages plus the visibility raster's.
+fn scene_stages(visibility: bool) -> wgpu::ShaderStages {
+    tracing_stages() | visibility::stages(visibility)
+}
+
+/// Auto-tuning is on unless disabled, in captures (reproducible training data) and tests.
+fn auto_tune() -> bool {
+    !crate::has_flag("--no-auto-tune") && !crate::has_flag("--capture") && !cfg!(test)
+}
+
+/// Trace-pass variants worth trying for this scene and device. Explicit flags force a
+/// setting: --ray-cones / --no-ray-cones, --visibility-primary / --no-visibility-primary.
+fn trace_variants(device: &wgpu::Device, scene: &Scene) -> Vec<tuner::Variant> {
+    let auto = auto_tune() && !crate::has_flag("--wavefront");
+    // Textured scenes: mips at the primary hit were never slower than none (1-2% faster,
+    // 1.15x on textured Bistro); cones along the whole path win when bounce rays also
+    // thrash the texture cache (1.37x on Bistro) and lose 1-6% elsewhere.
+    use tuner::Cones;
+    let cones: &[Cones] = if crate::has_flag("--no-ray-cones") || scene.mesh.textures.is_empty() {
+        &[Cones::Off]
+    } else if crate::has_flag("--cones-primary-only") {
+        &[Cones::Primary]
+    } else if crate::has_flag("--ray-cones") {
+        &[Cones::All]
+    } else if !auto {
+        &[Cones::Off]
+    } else {
+        &[Cones::Primary, Cones::All]
+    };
+    // The visibility hook is in the 4-wide BVH query; hardware ray queries bypass it.
+    let available = device.features().contains(wgpu::Features::PRIMITIVE_INDEX)
+        && !scene.mesh.triangles.is_empty()
+        && mesh::quad_bvh()
+        && !mesh::hw_rt();
+    let primary: &[bool] = if crate::has_flag("--visibility-primary") {
+        assert!(
+            available,
+            "--visibility-primary needs primitive_index, a mesh, --quad-bvh and no --hw-rt"
+        );
+        &[true]
+    } else if !auto || crate::has_flag("--no-visibility-primary") || !available {
+        &[false]
+    } else {
+        &[false, true]
+    };
+    cones
+        .iter()
+        .flat_map(|&cones| {
+            primary
+                .iter()
+                .map(move |&visibility_primary| tuner::Variant {
+                    cones,
+                    visibility_primary,
+                })
+        })
+        .collect()
 }
 
 fn tracing_stages() -> wgpu::ShaderStages {
@@ -826,6 +1907,16 @@ pub struct Sphere {
 }
 
 impl Sphere {
+    pub fn center(&self) -> glm::Vec3 {
+        self.center.xyz()
+    }
+    pub fn set_center(&mut self, center: glm::Vec3) {
+        self.center = glm::vec4(center.x, center.y, center.z, 0.);
+    }
+    pub fn material_index(&self) -> u32 {
+        self.material_idx
+    }
+
     pub fn new(center: glm::Vec3, radius: f32, material_idx: u32) -> Self {
         Self {
             center: glm::vec3_to_vec4(&center),
@@ -850,8 +1941,10 @@ pub struct RenderParams {
     pub sky: SkyParams,
     pub sampling: SamplingParams,
     pub viewport_size: (u32, u32),
-    /// Linear multiplier before tone mapping.
+    /// Linear multiplier before tone mapping; compensation when `auto_exposure` is set.
     pub exposure: f32,
+    /// Normalize the image's log-average luminance to middle grey before `exposure`.
+    pub auto_exposure: bool,
 }
 
 impl RenderParams {
@@ -1016,7 +2109,7 @@ impl RenderProgress {
                 denoising_enabled: denoising_enabled_gpu,
                 denoising_radius: sampling_params.denoising_radius,
                 denoising_sigma_color: sampling_params.denoising_sigma_color,
-                _padding_denoiser: 0,
+                trace_origin: 0,
             }
         }
         // Progressive render
@@ -1030,7 +2123,7 @@ impl RenderProgress {
                 denoising_enabled: denoising_enabled_gpu,
                 denoising_radius: sampling_params.denoising_radius,
                 denoising_sigma_color: sampling_params.denoising_sigma_color,
-                _padding_denoiser: 0,
+                trace_origin: 0,
             }
         }
         // Completed render
@@ -1043,7 +2136,7 @@ impl RenderProgress {
                 denoising_enabled: denoising_enabled_gpu,
                 denoising_radius: sampling_params.denoising_radius,
                 denoising_sigma_color: sampling_params.denoising_sigma_color,
-                _padding_denoiser: 0,
+                trace_origin: 0,
             }
         }
     }
@@ -1075,6 +2168,24 @@ pub struct GpuCamera {
 }
 
 impl GpuCamera {
+    /// Inward-facing frustum side planes (normal, offset): dot(n, p) + d >= 0 inside.
+    pub fn frustum_planes(&self) -> [[f32; 4]; 4] {
+        let corners = [
+            self.lower_left_corner,
+            self.lower_left_corner + self.horizontal,
+            self.lower_left_corner + self.horizontal + self.vertical,
+            self.lower_left_corner + self.vertical,
+        ];
+        let center = self.lower_left_corner + 0.5 * (self.horizontal + self.vertical);
+        std::array::from_fn(|i| {
+            let mut n = glm::cross(&(corners[i] - self.eye), &(corners[(i + 1) % 4] - self.eye));
+            if glm::dot(&n, &(center - self.eye)) < 0. {
+                n = -n;
+            }
+            [n.x, n.y, n.z, -glm::dot(&n, &self.eye)]
+        })
+    }
+
     pub fn new(camera: &Camera, viewport_size: (u32, u32)) -> Self {
         let lens_radius = 0.5_f32 * camera.aperture;
         let aspect = viewport_size.0 as f32 / viewport_size.1 as f32;
@@ -1268,7 +2379,8 @@ struct GpuSamplingParams {
     denoising_enabled: u32, // 0 for false, 1 for true
     denoising_radius: u32,
     denoising_sigma_color: f32,
-    _padding_denoiser: u32, // To make struct size 32 bytes (8 * 4 bytes)
+    /// Origin of the traced region, x | y << 16 (see `Raytracer::set_trace_region`).
+    trace_origin: u32,
 }
 
 #[repr(C)]

@@ -167,10 +167,15 @@ fn draw_controls(
             }
             ui.separator();
             ui.label("Camera parameters");
+            ui.checkbox(&mut params.auto_exposure, "auto exposure");
             ui.add(
                 egui::Slider::new(&mut params.exposure, 0.01..=32.)
                     .logarithmic(true)
-                    .text("exposure"),
+                    .text(if params.auto_exposure {
+                        "exposure compensation"
+                    } else {
+                        "exposure"
+                    }),
             );
             ui.add(egui::Slider::new(&mut camera.vfov_degrees, 10.0..=90.0).text("vfov"));
             ui.add(egui::Slider::new(&mut camera.aperture, 0.0..=1.0).text("aperture"));
@@ -204,6 +209,7 @@ mod tests {
             camera: camera.renderer_camera(),
             sampling: crate::SamplingParams::default(),
             exposure: 0.246,
+            auto_exposure: true,
             sky: crate::SkyParams::default(),
             viewport_size: (640, 480),
         };
