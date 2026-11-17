@@ -643,6 +643,7 @@ impl Raytracer {
             ("LAMPS", f64::from(scene.mesh.lamp_count() > 0)),
             ("DENOISER_INPUT", f64::from(temporal_source.is_some())),
             ("RESTIR", f64::from(scene.mesh.lamp_count() > 0)),
+            ("RESTIR_BLOCKS", f64::from(restir_blocks())),
             (
                 "RESTIR_GI",
                 f64::from(!scene.mesh.triangles.is_empty() && !crate::has_flag("--no-restir-gi")),
@@ -1471,7 +1472,13 @@ impl Raytracer {
             if let Some(visibility) = &self.visibility {
                 pass.set_bind_group(6, visibility.trace_group(), &[]);
             }
-            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+            // One pixel per 2x2 block (raytracer.wgsl RESTIR_BLOCKS) unless RT_RESTIR_FULL.
+            let (w, h) = if restir_blocks() {
+                (width.div_ceil(2), height.div_ceil(2))
+            } else {
+                (width, height)
+            };
+            pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
         }
         self.mark(encoder, "restir");
         if params.num_samples_per_pixel != 0 {
@@ -2278,6 +2285,13 @@ fn scene_stages(visibility: bool) -> wgpu::ShaderStages {
 }
 
 /// Auto-tuning is on unless disabled, in captures (reproducible training data) and tests.
+/// ReSTIR DI's first pass for one pixel per 2x2 block (`--restir-full` or
+/// RT_RESTIR_FULL: every pixel). Night Bistro on the Steam Deck: 60.2 -> 45.3 ms per
+/// frame, inputs 0.2 dB (per pixel) / 1 dB (4x4 averages) noisier.
+fn restir_blocks() -> bool {
+    std::env::var_os("RT_RESTIR_FULL").is_none() && !crate::has_flag("--restir-full")
+}
+
 fn auto_tune() -> bool {
     !crate::has_flag("--no-auto-tune") && !crate::has_flag("--capture") && !cfg!(test)
 }

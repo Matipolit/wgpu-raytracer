@@ -1388,6 +1388,13 @@ fn storeReservoir(slot: u32, r: Reservoir) {
 // M-capped, 1/M-normalised weights (biased, the usual real-time variant), one shadow
 // ray for the winner, stored as the final reservoir for the next frame.
 const RESTIR_INITIAL = 2u;
+// Fresh candidates for one pixel per 2x2 block (rotating each frame); the spatial pass
+// reads a pixel's block. Off (RT_RESTIR_FULL): every pixel.
+override RESTIR_BLOCKS: bool = true;
+fn restirBlock(x: u32, y: u32) -> u32 {
+    if !RESTIR_BLOCKS {return frameData.x*y+x;}
+    return (frameData.x+1u)/2u*(y/2u)+x/2u;
+}
 fn reservoirSet(group: u32, pixel: u32) -> u32 {return reservoirSlot(group,pixel);}
 struct RestirMerge {chosen: LampPoint, score: f32, sum: f32, m: f32}
 fn restirAdd(merge: ptr<function,RestirMerge>, r: Reservoir, origin: vec3<f32>, n: vec3<f32>, cap: f32, rng: ptr<function,u32>) {
@@ -1410,14 +1417,18 @@ fn restirResolve(merge: RestirMerge, hit: Intersection, cap: f32, depth: f32) ->
 fn csRestirInitial(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
     // Traversal with the workgroup-memory stack indexes its slots by lane (64 lanes).
     quadLane = lane;
-    if !RESTIR || id.x>=frameData.x || id.y>=frameData.y {return;}
-    let pixel=frameData.x*id.y+id.x;
-    var rng=initRng(id.xy,frameData.xy,frameData.z^0x5bd1e995u);
+    // With blocks, thread (x, y) samples block (x, y)'s pixel for this frame.
+    let turn=samplingParams.restir&3u;
+    let at=select(id.xy,id.xy*2u+vec2(turn&1u,turn>>1u),RESTIR_BLOCKS);
+    if !RESTIR || at.x>=frameData.x || at.y>=frameData.y {return;}
+    let pixel=frameData.x*at.y+at.x;
+    let slot=select(pixel,restirBlock(at.x,at.y),RESTIR_BLOCKS);
+    var rng=initRng(at,frameData.xy,frameData.z^0x5bd1e995u);
     var jitter=vec2(0.5);
     if SHARED_JITTER {jitter=frameJitter(frameData.z);}
     // With the visibility raster, the primary hit comes from it (same jitter).
     if VIS_PRIMARY {jitter=visibilityJitter();gbufferPixel=pixel;visibilityPending=true;}
-    let u=(f32(id.x)+jitter.x)/f32(frameData.x);let v=(f32(id.y)+jitter.y)/f32(frameData.y);
+    let u=(f32(at.x)+jitter.x)/f32(frameData.x);let v=(f32(at.y)+jitter.y)/f32(frameData.y);
     if RAY_CONES {coneActive=false;}
     let ray=cameraMakeRay(camera,&rng,u,1.-v);
     var hit=Intersection();
@@ -1446,7 +1457,7 @@ fn csRestirInitial(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_
         }
         stored=restirResolve(merge,hit,cap,distance(camera.eye,hit.p));
     }
-    storeReservoir(reservoirSet(RESTIR_INITIAL,pixel),stored);
+    storeReservoir(reservoirSet(RESTIR_INITIAL,slot),stored);
 }
 fn restirLamps(hit: Intersection, surface: PbrSurface, rng: ptr<function,u32>) -> vec3<f32> {
     let n=hit.n;
@@ -1461,7 +1472,7 @@ fn restirLamps(hit: Intersection, surface: PbrSurface, rng: ptr<function,u32>) -
             at+=RESTIR_RADIUS*sqrt(rngNextFloat(rng))*vec2(cos(angle),sin(angle));
         }
         if at.x<0. || at.y<0. || at.x>=f32(frameData.x) || at.y>=f32(frameData.y) {continue;}
-        let r=loadReservoir(reservoirSet(RESTIR_INITIAL,u32(at.y)*frameData.x+u32(at.x)));
+        let r=loadReservoir(reservoirSet(RESTIR_INITIAL,restirBlock(u32(at.x),u32(at.y))));
         if r.m<=0. || abs(r.depth-seenFrom)>0.1*seenFrom || dot(r.normal,n)<0.9 {continue;}
         restirAdd(&merge,r,hit.p,n,cap,rng);
     }

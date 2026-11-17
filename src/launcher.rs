@@ -178,6 +178,10 @@ impl Settings {
         if !self.gi {
             push("--no-restir-gi", None);
         }
+        // High: fresh lamp candidates for every pixel (cheaper presets share them per 2x2).
+        if self.preset == Preset::High {
+            push("--restir-full", None);
+        }
         if self.max_samples > 1 {
             push("--max-samples", Some(self.max_samples.to_string()));
         }
