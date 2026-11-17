@@ -372,7 +372,80 @@ fn fsMain(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4(0f, 0f, 0f, 1f);
     }
     let color = displayImage[frameData.x * y + x];
-    return vec4(uncharted2(vec3(color[0], color[1], color[2])), 1f);
+    var c = vec3(color[0], color[1], color[2]);
+    if displaySettings.strength > 0. {
+        c = mix(c, bloomAt(x, y), displaySettings.strength);
+    }
+    return vec4(tonemap(c), 1f);
+}
+
+// Display settings and the bloom pyramid's half-resolution sum (bloom.rs).
+struct DisplaySettings {tonemapper: u32, strength: f32, levels: u32, pad: u32}
+@group(2) @binding(10) var bloomTexture: texture_2d<f32>;
+@group(2) @binding(11) var<uniform> displaySettings: DisplaySettings;
+@group(2) @binding(12) var bloomSampler: sampler;
+// It sums `levels` levels: their mean.
+fn bloomAt(x: u32, y: u32) -> vec3<f32> {
+    let uv = (vec2(f32(x), f32(y)) + vec2(0.5)) / vec2(f32(frameData.x), f32(frameData.y));
+    return textureSampleLevel(bloomTexture, bloomSampler, uv, 0.).rgb / f32(max(displaySettings.levels, 1u));
+}
+
+// Exposure, then the selected display transform; linear output (sRGB surface).
+fn tonemap(x: vec3<f32>) -> vec3<f32> {
+    let automatic = select(1f, 0.18 / exp(max(displayExposure[0], log(0.005))), displayExposure[1] != 0f);
+    // The default compensation (2) offsets Hable's dark curve; the other transforms
+    // map middle grey to a mid display value by design, so they take half.
+    let exposed = 0.5 * bitcast<f32>(frameData.w) * automatic * max(x, vec3(0.));
+    switch displaySettings.tonemapper {
+        case 0u: {return agx(exposed);}
+        case 1u: {return acesFitted(exposed);}
+        case 2u: {return pbrNeutral(exposed);}
+        default: {return uncharted2(x);}
+    }
+}
+
+// AgX (Troy Sobotka), the minimal fit by Benjamin Wrensch (iolite engine): inset to
+// the AgX space, log2 encoding over [-12.47, 4.03] EV, a polynomial sigmoid, outset,
+// then the 2.2 display EOTF back to linear.
+fn agx(color: vec3<f32>) -> vec3<f32> {
+    let inset = mat3x3(0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+                       0.0784335999999992, 0.878468636469772, 0.0784336,
+                       0.0792237451477643, 0.0791661274605434, 0.879142973793104);
+    let outset = mat3x3(1.19687900512017, -0.0528968517574562, -0.0529716355144438,
+                        -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
+                        -0.0990297440797205, -0.0989611768448433, 1.15107367264116);
+    let minEv = -12.47393;let maxEv = 4.026069;
+    var v = inset * color;
+    v = clamp(log2(max(v, vec3(1e-10))), vec3(minEv), vec3(maxEv));
+    v = (v - minEv) / (maxEv - minEv);
+    let v2 = v * v;let v4 = v2 * v2;
+    v = 15.5 * v4 * v2 - 40.14 * v4 * v + 31.96 * v4 - 6.868 * v2 * v + 0.4298 * v2 + 0.1191 * v - 0.00232;
+    v = outset * v;
+    return pow(clamp(v, vec3(0.), vec3(1.)), vec3(2.2));
+}
+
+// ACES filmic: Stephen Hill's fit of the RRT + sRGB ODT.
+fn acesFitted(color: vec3<f32>) -> vec3<f32> {
+    let input = mat3x3(0.59719, 0.07600, 0.02840, 0.35458, 0.90834, 0.13383, 0.04823, 0.01566, 0.83777);
+    let output = mat3x3(1.60475, -0.10208, -0.00327, -0.53108, 1.10813, -0.07276, -0.07367, -0.00605, 1.07602);
+    let v = input * color;
+    let rrt = (v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.4329510) + 0.238081);
+    return clamp(output * rrt, vec3(0.), vec3(1.));
+}
+
+// Khronos PBR Neutral (https://github.com/KhronosGroup/ToneMapping).
+fn pbrNeutral(color: vec3<f32>) -> vec3<f32> {
+    let start = 0.8 - 0.04;let desaturation = 0.15;
+    let low = min(color.r, min(color.g, color.b));
+    let offset = select(0.04, low - 6.25 * low * low, low < 0.08);
+    var c = color - offset;
+    let peak = max(c.r, max(c.g, c.b));
+    if peak < start {return clamp(c, vec3(0.), vec3(1.));}
+    let d = 1. - start;
+    let newPeak = 1. - d * d / (peak + d - start);
+    c *= newPeak / peak;
+    let g = 1. - 1. / (desaturation * (peak - newPeak) + 1.);
+    return clamp(mix(c, vec3(newPeak), g), vec3(0.), vec3(1.));
 }
 
 fn uncharted2(x: vec3<f32>) -> vec3<f32> {

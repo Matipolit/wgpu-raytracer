@@ -1,10 +1,15 @@
 use gpu_buffer::{StorageBuffer, UniformBuffer};
 use wgpu::util::DeviceExt;
-pub use {angle::Angle, texture::Texture};
+pub use {
+    angle::Angle,
+    bloom::{DEFAULT_STRENGTH as DEFAULT_BLOOM, Tonemapper},
+    texture::Texture,
+};
 
 use thiserror::Error;
 
 mod angle;
+mod bloom;
 mod gpu_buffer;
 pub mod gpu_textures;
 mod hwrt;
@@ -127,6 +132,7 @@ pub struct Raytracer {
     trace_layout: wgpu::PipelineLayout,
     /// ReSTIR's first pass (raytracer.wgsl csRestirInitial), when the scene has lamps.
     restir_pipeline: Option<wgpu::ComputePipeline>,
+    bloom: bloom::Bloom,
     trace_constants: Vec<(&'static str, f64)>,
     /// Identifies the scene in the calibration cache.
     scene_key: String,
@@ -545,11 +551,13 @@ impl Raytracer {
                 immediate_size: 0,
                 label: Some("filter pipeline layout"),
             });
+        let bloom_display_layout = bloom::Bloom::display_layout(device);
         let display_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 bind_group_layouts: &[
                     Some(&vertex_uniform_bind_group_layout),
                     Some(&images.display_layout),
+                    Some(&bloom_display_layout),
                 ],
                 immediate_size: 0,
                 label: Some("display pipeline layout"),
@@ -936,6 +944,22 @@ impl Raytracer {
                 temporal_source.is_some(),
             )
         });
+        // Bloom works on the image the display pass shows (the upscaler's output-size
+        // image, or the render-size one).
+        let bloom = bloom::Bloom::new(
+            device,
+            bloom_display_layout,
+            upscaler
+                .as_ref()
+                .map_or(images.filtered.handle(), upscale::Upscaler::output),
+            if upscaler.is_some() {
+                output_size
+            } else {
+                render_params.viewport_size
+            },
+            render_params.tonemapper,
+            render_params.bloom,
+        );
         let display_pipeline = create_pipeline(
             &display_pipeline_layout,
             "fsMain",
@@ -978,6 +1002,7 @@ impl Raytracer {
             vertex_buffer,
             trace_pipelines,
             restir_pipeline,
+            bloom,
             module_config,
             source_prefix: trace_source,
             source_suffix,
@@ -1227,6 +1252,12 @@ impl Raytracer {
 
     /// Dispatch tracing, then filtering; presentation only reads the completed result.
     pub fn accumulate_frame(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
+        self.bloom.upload(queue);
+        self.accumulate(queue, encoder);
+        self.bloom.record(encoder);
+    }
+
+    fn accumulate(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
         if self.temporal.is_some() || self.upscaler.is_some() {
             // Real-time mode: one fresh sample per frame; history lives in the denoiser
             // and/or the upscaler.
@@ -1721,6 +1752,7 @@ impl Raytracer {
             .as_ref()
             .map_or(&self.images.display, |u| &u.display);
         render_pass.set_bind_group(1, display, &[]);
+        render_pass.set_bind_group(2, &self.bloom.display_group, &[]);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.draw(0..VERTICES.len() as u32, 0..1);
     }
@@ -1738,6 +1770,11 @@ impl Raytracer {
             ..*render_params
         };
         let render_params = &scaled_params;
+        // Display settings apply without restarting accumulation.
+        self.bloom
+            .set(render_params.tonemapper, render_params.bloom);
+        self.latest_render_params.tonemapper = render_params.tonemapper;
+        self.latest_render_params.bloom = render_params.bloom;
         if *render_params == self.latest_render_params && output_size == self.output_size {
             return Ok(());
         }
@@ -1802,6 +1839,15 @@ impl Raytracer {
                     render_params.viewport_size,
                 );
             }
+        }
+        if render_params.viewport_size != self.latest_render_params.viewport_size
+            || output_size != self.output_size
+        {
+            let (source, size) = self.upscaler.as_ref().map_or(
+                (self.images.filtered.handle(), render_params.viewport_size),
+                |u| (u.output(), output_size),
+            );
+            self.bloom.resize(device, source, size);
         }
         self.output_size = output_size;
         if let Some(temporal) = &mut self.temporal {
@@ -2209,6 +2255,10 @@ pub struct RenderParams {
     pub exposure: f32,
     /// Normalize the image's log-average luminance to middle grey before `exposure`.
     pub auto_exposure: bool,
+    /// Display transform (a display setting: changing it keeps accumulated samples).
+    pub tonemapper: Tonemapper,
+    /// Bloom strength, 0 = off (a display setting).
+    pub bloom: f32,
 }
 
 impl RenderParams {

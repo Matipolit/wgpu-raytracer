@@ -210,6 +210,14 @@ fn draw_controls(
                         "exposure"
                     }),
             );
+            egui::ComboBox::from_label("tonemapper")
+                .selected_text(params.tonemapper.label())
+                .show_ui(ui, |ui| {
+                    for t in crate::raytracer::Tonemapper::ALL {
+                        ui.selectable_value(&mut params.tonemapper, t, t.label());
+                    }
+                });
+            ui.add(egui::Slider::new(&mut params.bloom, 0.0..=0.3).text("bloom"));
             ui.add(egui::Slider::new(&mut camera.vfov_degrees, 10.0..=90.0).text("vfov"));
             ui.add(egui::Slider::new(&mut camera.aperture, 0.0..=1.0).text("aperture"));
             ui.add(
@@ -246,6 +254,8 @@ mod tests {
             auto_exposure: true,
             sky: crate::SkyParams::default(),
             viewport_size: (640, 480),
+            tonemapper: crate::raytracer::Tonemapper::default(),
+            bloom: 0.04,
         };
         let output = context.run_ui(egui::RawInput::default(), |ui| {
             draw_controls(ui.ctx(), &mut params, &mut camera, 60., 0.5);

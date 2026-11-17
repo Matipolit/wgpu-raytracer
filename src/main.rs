@@ -298,6 +298,8 @@ impl AppState {
                 ..Default::default()
             },
             viewport_size: (size.width.max(1), size.height.max(1)),
+            tonemapper: display_settings().0,
+            bloom: display_settings().1,
         };
         let mut raytracer = Raytracer::new(
             &context.device,
@@ -674,6 +676,21 @@ fn argument_value(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// `--tonemapper agx|aces|neutral|hable` (default AgX) and `--bloom STRENGTH`
+/// (default 0.04, 0 = off).
+pub(crate) fn display_settings() -> (raytracer::Tonemapper, f32) {
+    let tonemapper = argument_value("--tonemapper").map_or(raytracer::Tonemapper::default(), |v| {
+        raytracer::Tonemapper::parse(&v).unwrap_or_else(|| {
+            eprintln!("--tonemapper must be agx, aces, neutral or hable");
+            std::process::exit(2)
+        })
+    });
+    let bloom = argument_value("--bloom").map_or(raytracer::DEFAULT_BLOOM, |v| {
+        v.parse().expect("--bloom must be a number")
+    });
+    (tonemapper, bloom)
 }
 
 /// `--size WxH`: the initial window size of the interactive renderer.

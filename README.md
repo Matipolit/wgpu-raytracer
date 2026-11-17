@@ -31,6 +31,12 @@ still view converges: raw frames are averaged and the display fades from the den
 frame to that mean (halfway after 64 still frames). Auto exposure stops adapting at a
 log-average luminance of 0.005, so night scenes stay dark.
 
+Display: AgX tonemapping by default (`--tonemapper agx|aces|neutral|hable`, also in the
+parameter panel) and dual Kawase bloom (`--bloom STRENGTH`, default 0.04, 0 = off;
+about 1 ms at 1280x800 on Iris Xe). glTF glass (KHR_materials_transmission, _ior,
+_specular, _volume) is supported; broken material data in converted scenes is fixed at
+load time by `performance/scenes/material_overrides.txt`.
+
 The renderer uses wgpu 30, winit 0.30, and egui 0.37. `Cargo.lock` records the
 complete dependency set.
 

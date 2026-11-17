@@ -172,6 +172,8 @@ async fn capture() {
         color_space: wgpu::SurfaceColorSpace::Auto,
     };
     let mut params = RenderParams {
+        tonemapper: crate::display_settings().0,
+        bloom: crate::display_settings().1,
         camera: crate::scene_camera(&scene).renderer_camera(),
         exposure: 2.,
         auto_exposure: false,

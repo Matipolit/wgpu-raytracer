@@ -52,6 +52,9 @@ fn params() -> RenderParams {
             sun: false,
             ..SkyParams::default()
         },
+        // The fragment reference tonemaps with the original curve, no bloom.
+        tonemapper: crate::raytracer::Tonemapper::Hable,
+        bloom: 0.,
         sampling: SamplingParams {
             max_samples_per_pixel: 8,
             ..Default::default()

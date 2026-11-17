@@ -46,6 +46,8 @@ async fn run_async() {
         for converged in [false, true] {
             let mut camera = crate::scene_camera(&scene);
             let mut params = RenderParams {
+                tonemapper: crate::display_settings().0,
+                bloom: crate::display_settings().1,
                 camera: camera.renderer_camera(),
                 exposure: crate::scene_exposure(&scene),
                 auto_exposure: false,

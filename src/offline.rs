@@ -44,6 +44,8 @@ async fn render() {
         .await
         .unwrap();
     let mut params = RenderParams {
+        tonemapper: crate::display_settings().0,
+        bloom: crate::display_settings().1,
         camera: crate::scene_camera(&scene).renderer_camera(),
         // An explicit --exposure keeps the historical fixed exposure; otherwise
         // automatic exposure (--exposure-compensation scales its result).
