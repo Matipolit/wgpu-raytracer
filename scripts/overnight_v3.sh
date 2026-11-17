@@ -49,7 +49,8 @@ cargo build --release --locked 2>&1 | tail -1 || exit 1
 
 # --- 2. data ---
 HWRT=""
-nvidia-smi > /dev/null 2>&1 && HWRT="--hw-rt"
+# NO_HWRT=1: compute only (an RT-core capture of night Bistro once hung the GPU, Xid 62).
+nvidia-smi > /dev/null 2>&1 && [ "${NO_HWRT:-0}" != 1 ] && HWRT="--hw-rt"
 FLAGS="--restir --bounces 2 --reference-bounces 4"
 SCALES=0.5,0.67,0.77
 TRAIN=$R/v3-train EVAL=$R/v3-eval VIDEO=$R/v3-video
@@ -85,6 +86,10 @@ for spec in "bistro-night assets/scenes/exterior.glb -10,2,0,1,0,0.3,65 1.2 7101
 done
 
 # --- 3. training ---
+# A GPU fault during capture leaves CUDA unusable: stop rather than train on the CPU.
+if nvidia-smi > /dev/null 2>&1 && ! $PY -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    stamp "CUDA unavailable (GPU fault?), not training"; exit 1
+fi
 HRS=$(left_hours 0.75)
 STEPS=0
 [ $SMOKE = 1 ] && HRS=0.05 && STEPS=20
