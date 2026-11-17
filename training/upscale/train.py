@@ -41,6 +41,7 @@ p.add_argument("--dilations", default="1,2,4")
 p.add_argument("--init", help="start from these weights (same architecture)")
 p.add_argument("--max-steps", type=int, default=0, help="stop after this many steps (smoke tests)")
 p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+p.add_argument("--amp", action="store_true", help="bf16 mixed precision (tensor cores on CUDA)")
 a = p.parse_args()
 torch.set_num_threads(a.threads)
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -154,7 +155,11 @@ while time.time() - start < budget and (not a.max_steps or step < a.max_steps):
     for group in opt.param_groups:
         group["lr"] = a.lr * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
     frames, coords, origin, scale = batch()
-    loss, _ = run(net, frames, coords, origin, scale)
+    # bf16 autocast runs the convolutions on tensor cores; weights and the optimizer
+    # stay f32 (no loss scaling needed for bf16).
+    with torch.autocast(device_type=a.device.split(":")[0], dtype=torch.bfloat16, enabled=a.amp):
+        loss, _ = run(net, frames, coords, origin, scale)
+    loss = loss.float()
     opt.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)

@@ -28,7 +28,11 @@ SCALES = {
     "living-room": 0.4,
     "rungholt-aerial": 6.0,
     "chess": 0.04,
+    # Bistro lit only by its lamps (--night): the textured street view.
+    "bistro-night": 1.2,
 }
+# Scenes that are another scene's view plus renderer flags.
+VARIANTS = {"bistro-night": ("bistro-street-textured", ["--night"])}
 p = argparse.ArgumentParser()
 p.add_argument("out")
 p.add_argument("--sequences", type=int, default=24)
@@ -38,6 +42,7 @@ p.add_argument("--size", default="320x200")
 p.add_argument("--crop", type=int, default=0, help="trace and store only an N x N window per sequence")
 p.add_argument("--scenes", default=",".join(SCALES))
 p.add_argument("--extra", nargs="*", default=[], help="extra renderer flags, e.g. --hw-rt")
+p.add_argument("--flags", default="", help='more renderer flags as one string, e.g. "--restir --bounces 2"')
 p.add_argument("--motion-range", help="LO,HI per-sequence motion multiplier (log-uniform)")
 p.add_argument("--render-scale", help="S1,S2,...: also capture 1-spp inputs at these render scales (denoise + upscale training)")
 p.add_argument("--low-only", action="store_true", help="add the --render-scale inputs to an existing capture (same arguments and seeds)")
@@ -46,6 +51,8 @@ p.add_argument("--fast-fraction", type=float, default=0.0, help="share of fast-m
 p.add_argument("--seed-base", type=int, default=1000, help="use a different base for evaluation sets")
 a = p.parse_args()
 scenes = json.loads((ROOT / "performance/scenes/scenes.json").read_text())
+for variant, (base, _) in VARIANTS.items():
+    scenes[variant] = scenes[base]
 env = dict(os.environ, RT_QUAD_SLM="32", RT_QUAD_LEAF_COUNT="1")
 for index, name in enumerate(a.scenes.split(",")):
     out = pathlib.Path(a.out) / name
@@ -63,7 +70,8 @@ for index, name in enumerate(a.scenes.split(",")):
          *(["--low-only"] if a.low_only else []),
          *(["--objects", str(a.objects)] if a.objects else []),
          *(["--fast-fraction", str(a.fast_fraction)] if a.fast_fraction else []),
-         "--sah-stop", "--skip-final-scatter", "--quad-bvh", "--sbvh", *a.extra],
+         "--sah-stop", "--skip-final-scatter", "--quad-bvh", "--sbvh",
+         *VARIANTS.get(name, (None, []))[1], *a.extra, *a.flags.split()],
         cwd=ROOT, env=env, check=True,
     )
     print(f"{name}: {time.time() - start:.0f}s", flush=True)

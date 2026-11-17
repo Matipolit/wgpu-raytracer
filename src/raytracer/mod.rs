@@ -1078,7 +1078,8 @@ impl Raytracer {
     /// cache the choice (later runs apply it without measuring). `adapter` identifies
     /// the GPU and driver. Coordinate search: stacks at the default shape, then shapes.
     pub fn calibrate(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, adapter: &str) {
-        if !auto_tune()
+        // Captures keep the per-frame tuner off (fixed variants) but calibrate the kernel.
+        if (!auto_tune() && !crate::has_flag("--capture"))
             || self.wavefront.is_some()
             || self.timer.is_none()
             || crate::has_flag("--no-calibrate")

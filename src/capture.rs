@@ -69,6 +69,8 @@ async fn capture() {
     });
     let digits = frames.saturating_sub(1).to_string().len().max(2);
     let reference_spp: u32 = number("--reference-spp", 128);
+    // References may trace more bounces than the 1-spp inputs (closer to the truth).
+    let reference_bounces: u32 = number("--reference-bounces", crate::selected_bounces());
     let seed: u64 = number("--seed", 1);
     let size = crate::argument_value("--size").unwrap_or_else(|| "320x200".into());
     let (w, h) = size.split_once('x').expect("--size WxH");
@@ -189,6 +191,9 @@ async fn capture() {
     params.camera.aperture = 0.;
     let mut tracer = Raytracer::new(&device, &queue, &config, &scene, &params).unwrap();
     tracer.set_skip_filter(!crate::has_flag("--temporal-model"));
+    // Per-scene kernel calibration (with --hw-rt: RT cores or compute, whichever wins).
+    let adapter_key = crate::adapter_key(&adapter.get_info());
+    tracer.calibrate(&device, &queue, &adapter_key);
     let (out_w, out_h) = crop.map_or((width, height), |n| (n.min(width), n.min(height)));
     // One low-resolution tracer per scale (same scene, camera and spheres; separate
     // tracers keep each scale's previous camera for its motion vectors). A low crop
@@ -207,6 +212,7 @@ async fn capture() {
             let crop_h = ((out_h as f32 * sy).ceil() as u32 + 1).min(lh);
             let mut tracer = Raytracer::new(&device, &queue, &config, &scene, &low_params).unwrap();
             tracer.set_skip_filter(true);
+            tracer.calibrate(&device, &queue, &adapter_key);
             LowCapture {
                 params: low_params,
                 tracer,
@@ -357,6 +363,7 @@ async fn capture() {
                 // Noisy 1-spp frame and its guides (`--restir`: as the real-time renderer
                 // traces it, with lamp reservoirs carried over from the previous frame).
                 params.sampling.num_samples_per_pixel = 1;
+                params.sampling.num_bounces = crate::selected_bounces();
                 params.sampling.restir = crate::has_flag("--restir");
                 tracer.set_render_params(&device, &queue, &params).unwrap();
                 render(&device, &queue, &mut tracer, 1);
@@ -382,6 +389,7 @@ async fn capture() {
                         .find(|k| reference_spp % k == 0)
                         .unwrap();
                     params.sampling.num_samples_per_pixel = per_dispatch;
+                    params.sampling.num_bounces = reference_bounces;
                     params.sampling.restir = false;
                     tracer.set_render_params(&device, &queue, &params).unwrap();
                     tracer.reset_accumulation();
