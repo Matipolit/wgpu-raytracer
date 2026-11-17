@@ -20,7 +20,7 @@ if config.exists():
     c = json.loads(config.read_text())
     M.configure(c["channels"], c["dilations"], c.get("half", False))
 net = M.Net()
-net.load_state_dict(torch.load(weights))
+net.load_state_dict(torch.load(weights, map_location="cpu"))
 history = prev = None
 worst = 0.0
 for t, f in enumerate(sorted(seq.glob("frame_*.f16"))):
