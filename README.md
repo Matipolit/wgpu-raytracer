@@ -25,6 +25,11 @@ sky, `--night` dims the sky to moonlight so emissive materials light the scene.
 Renderer window options: `--size WxH`, `--fullscreen`, `--max-samples N` (progressive
 budget), `--no-denoise`. Temporal neural denoisers ship in `models/`
 (`--temporal-model models/td2-half24.wgsl`).
+With a neural denoiser, directly visible emission (lamps, emissive spheres) bypasses
+the network and is added back afterwards, the input is the frame's mean sample, and a
+still view converges: raw frames are averaged and the display fades from the denoised
+frame to that mean (halfway after 64 still frames). Auto exposure stops adapting at a
+log-average luminance of 0.005, so night scenes stay dark.
 
 The renderer uses wgpu 30, winit 0.30, and egui 0.37. `Cargo.lock` records the
 complete dependency set.

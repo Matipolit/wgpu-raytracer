@@ -623,6 +623,7 @@ impl Raytracer {
                 f64::from(render_params.sky.sun && !render_params.sky.night),
             ),
             ("LAMPS", f64::from(scene.mesh.lamp_count() > 0)),
+            ("DENOISER_INPUT", f64::from(temporal_source.is_some())),
             (
                 "LAMP_CANDIDATES",
                 std::env::var("RT_LAMP_CANDIDATES").map_or(8., |v| v.parse().unwrap()),
@@ -1590,8 +1591,11 @@ impl Raytracer {
     }
 
     /// Primary-hit guides of the last traced frame, 12 floats per pixel.
+    /// The primary-hit guides, 12 floats per pixel (without the emission slot).
     pub fn read_gbuffer(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
-        read_buffer(device, queue, &self.images.gbuffer)
+        let mut guides = read_buffer(device, queue, &self.images.gbuffer);
+        guides.truncate(guides.len() / 16 * 12);
+        guides
     }
 
     /// The displayed (filtered or denoised) radiance, 3 floats per pixel.
@@ -1683,6 +1687,9 @@ impl Raytracer {
         match render_params.validate() {
             Ok(_) => {}
             Err(err) => return Err(err),
+        }
+        if let Some(temporal) = &mut self.temporal {
+            temporal.moved();
         }
 
         // Exposure is a display setting: update it even after convergence,

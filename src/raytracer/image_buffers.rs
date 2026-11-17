@@ -6,7 +6,8 @@ pub(super) struct ImageBuffers {
     pub filtered: StorageBuffer,
     /// Automatic exposure state; survives resizes so the image does not flash.
     pub exposure: StorageBuffer,
-    /// Primary-hit guides, 48 bytes per pixel (see raytracer.wgsl `gbuffer`).
+    /// Primary-hit guides, 48 bytes per pixel, then 16 per pixel of emission (see
+    /// raytracer.wgsl `gbuffer`, `DENOISER_INPUT`).
     pub gbuffer: wgpu::Buffer,
     pub trace_layout: wgpu::BindGroupLayout,
     pub filter_layout: wgpu::BindGroupLayout,
@@ -125,10 +126,11 @@ impl ImageBuffers {
     ) {
         let accumulation = StorageBuffer::new(device, bytes, 1, Some("accumulated radiance"));
         let filtered = StorageBuffer::new(device, bytes, 3, Some("filtered radiance"));
-        // `bytes` holds 12 per pixel; the guides need 48.
+        // `bytes` holds 12 per pixel; the guides need 48, then 16 for the emission
+        // kept out of a temporal denoiser's input.
         let gbuffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("primary-hit guides"),
-            size: bytes * 4,
+            size: bytes / 12 * 64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });

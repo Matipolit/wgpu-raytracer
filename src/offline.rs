@@ -276,6 +276,20 @@ async fn render() {
             gpu_ms.len(), gpu_ms[gpu_ms.len()/2], gpu_ms[(gpu_ms.len()*95/100).min(gpu_ms.len()-1)]
         )).unwrap();
     }
+    // Scene key: log-average luminance of the displayed radiance (as auto exposure sees it).
+    let shown = tracer.read_filtered(&device, &queue);
+    let logs: Vec<f64> = shown
+        .chunks_exact(3)
+        .map(|c| {
+            (0.2126 * f64::from(c[0]) + 0.7152 * f64::from(c[1]) + 0.0722 * f64::from(c[2]))
+                .max(1e-4)
+                .ln()
+        })
+        .collect();
+    eprintln!(
+        "Scene key (log-average luminance): {:.4}",
+        (logs.iter().sum::<f64>() / logs.len().max(1) as f64).exp()
+    );
     eprintln!("Auto-tune: ended on {}", tracer.trace_variant());
     eprintln!(
         "Rendered {width}x{height}, {samples} spp on {} ({:?}); setup {:.2}s, render {:.2}s; warmed median GPU {:?} ms/sample; saved {path}",

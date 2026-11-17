@@ -14,8 +14,37 @@ pub fn kernels(source: &str) -> Vec<String> {
     names.extend(["csTdConv1", "csTdConv2", "csTdBlend"].map(str::to_owned));
     let levels = source.matches("fn csTdFilter").count();
     names.extend((0..levels).map(|l| format!("csTdFilter{l}")));
+    if source.contains("fn csTdEmission") {
+        names.push("csTdEmission".to_owned());
+    }
     names
 }
+
+/// Runs after the model: adds back the directly visible emission (kept out of the
+/// denoiser's input, see raytracer.wgsl `DENOISER_INPUT`), and converges while the
+/// view is still: the raw frames (noisy input + emission) are averaged from the first
+/// still frame (`tdParams.pad1` counts them) and the display fades from the denoised
+/// frame to that unbiased mean, half way after `TD_CONVERGE_FRAMES` frames.
+const EMISSION_KERNEL: &str = "
+const TD_CONVERGE_FRAMES = 64.;
+@group(5) @binding(10) var<storage, read_write> tdAccumulated: array<vec4<f32>>;
+@compute @workgroup_size(8, 8)
+fn csTdEmission(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= frameData.x || id.y >= frameData.y { return; }
+    let i = frameData.x * id.y + id.x;
+    let e = gbuffer[frameData.x * frameData.y * 3u + i].xyz;
+    let o = tdOutput[i];
+    let denoised = vec3(o[0], o[1], o[2]) + e;
+    let still = tdParams.pad1;
+    let raw = vec3(imageBuffer[i][0], imageBuffer[i][1], imageBuffer[i][2]) + e;
+    let sum = select(vec3(0.), tdAccumulated[i].xyz, still > 1u) + raw;
+    tdAccumulated[i] = vec4(sum, 0.);
+    // The first few still frames show the denoiser alone (no single-sample fireflies).
+    let n = f32(max(still, 4u) - 4u);
+    let result = mix(denoised, sum / f32(max(still, 1u)), n / (n + TD_CONVERGE_FRAMES));
+    tdOutput[i] = array<f32, 3>(result.r, result.g, result.b);
+}
+";
 
 /// A `const NAME = Nu;` declared by a generated model.
 fn constant(source: &str, name: &str, default: u32) -> u32 {
@@ -34,6 +63,8 @@ pub struct TemporalDenoiser {
     pub empty_group: wgpu::BindGroup,
     pipelines: Vec<wgpu::ComputePipeline>,
     history_valid: bool,
+    /// Frames since the view last changed (1 = the first frame of a new view).
+    still: u32,
     /// Frame counter: selects which half of the guide buffer is this frame's.
     frame: u32,
     /// Bytes per pixel of each hidden layer.
@@ -45,8 +76,9 @@ pub struct TemporalDenoiser {
 }
 
 pub fn model_source() -> Option<String> {
-    crate::argument_value("--temporal-model")
-        .map(|path| std::fs::read_to_string(path).expect("cannot read temporal model WGSL"))
+    crate::argument_value("--temporal-model").map(|path| {
+        std::fs::read_to_string(path).expect("cannot read temporal model WGSL") + EMISSION_KERNEL
+    })
 }
 
 /// The model's weights: little-endian f32 vec4s next to the WGSL (same stem, `.bin`).
@@ -58,7 +90,9 @@ fn model_weights() -> Vec<u8> {
 
 impl TemporalDenoiser {
     pub fn layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        // 0-7 model state and output, 10 the still-view accumulation.
         let mut entries: Vec<_> = (0..8)
+            .chain([10])
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -134,6 +168,7 @@ impl TemporalDenoiser {
             empty_group,
             pipelines,
             history_valid: false,
+            still: 0,
             frame: 0,
             hidden,
             conv_pixels,
@@ -151,7 +186,8 @@ impl TemporalDenoiser {
         hidden: u64,
     ) -> wgpu::BindGroup {
         let n = u64::from(pixels.max(1));
-        // history, previous guides, features, conv1, conv2, filter ping-pong, warp
+        // history, previous guides, features, conv1, conv2, filter ping-pong, warp,
+        // then the still-view accumulation (binding 10)
         let sizes = [
             16 * n,
             32 * n,
@@ -159,6 +195,7 @@ impl TemporalDenoiser {
             hidden * n,
             hidden * n,
             32 * n,
+            16 * n,
             16 * n,
         ];
         let buffers: Vec<_> = sizes
@@ -176,7 +213,7 @@ impl TemporalDenoiser {
             .iter()
             .enumerate()
             .map(|(i, b)| wgpu::BindGroupEntry {
-                binding: i as u32,
+                binding: if i == 7 { 10 } else { i as u32 },
                 resource: b.as_entire_binding(),
             })
             .collect();
@@ -211,12 +248,19 @@ impl TemporalDenoiser {
             self.hidden,
         );
         self.history_valid = false;
+        self.still = 0;
+    }
+
+    /// The camera or render parameters changed: restart the still-view accumulation.
+    pub fn moved(&mut self) {
+        self.still = 0;
     }
 
     /// Upload per-frame parameters; call before encoding the frame.
     pub fn prepare(&mut self, queue: &wgpu::Queue) {
         self.frame = self.frame.wrapping_add(1);
-        let params = [u32::from(self.history_valid), self.frame & 1, 0, 0];
+        self.still = self.still.saturating_add(1);
+        let params = [u32::from(self.history_valid), self.frame & 1, self.still, 0];
         queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&params));
         self.history_valid = true;
     }

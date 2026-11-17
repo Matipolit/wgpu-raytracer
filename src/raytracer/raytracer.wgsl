@@ -80,6 +80,11 @@ override SKY_IMPORTANCE: bool = false;
 override SUN: bool = false;
 // Mesh surfaces sample emissive scene triangles (the lamp table) directly.
 override LAMPS: bool = false;
+// Input for a temporal neural denoiser: the frame's mean (not sum) of samples, with
+// directly visible emission removed and stored after the guides (gbuffer[3N + i]);
+// csTdEmission adds it back after denoising, so emitters are never filtered.
+override DENOISER_INPUT: bool = false;
+var<private> primaryEmission: vec3<f32>;
 // Share of light samples given to the sun when lamps are sampled too.
 const SUN_SHARE = 0.75;
 // Lamp candidates per light sample (resampled importance sampling, the first stage
@@ -355,8 +360,10 @@ fn uncharted2(x: vec3<f32>) -> vec3<f32> {
     // Based on uncharted2 tonemapping function
     // https://dmnsgn.github.io/glsl-tone-map/
     // Automatic exposure maps the log-average luminance to middle grey (0.18);
-    // the user exposure then acts as compensation on top of it.
-    let automatic = select(1f, 0.18 / exp(displayExposure[0]), displayExposure[1] != 0f);
+    // the user exposure then acts as compensation on top of it. Adaptation stops at
+    // a key of 0.005 (daylight scenes measure 0.1-0.7, night Bistro 0.0008), so night
+    // stays dark instead of being brightened to dusk, noise included.
+    let automatic = select(1f, 0.18 / exp(max(displayExposure[0], log(0.005))), displayExposure[1] != 0f);
     let exposureBias = bitcast<f32>(frameData.w) * automatic;
     let curr = uncharted2Tonemap(exposureBias * x);
 
@@ -384,6 +391,7 @@ fn samplePixel(x: u32, y: u32, rngState: ptr<function, u32>) -> vec3<f32> {
 
     let numSamples = samplingParams.numSamplesPerPixel;
     var color = vec3(0f);
+    var emission = vec3(0f);
     for (var i = 0u; i < numSamples; i += 1u) {
         if BLUE_NOISE_PATH {
             blueNoiseDim = 0u;
@@ -408,7 +416,14 @@ fn samplePixel(x: u32, y: u32, rngState: ptr<function, u32>) -> vec3<f32> {
         }
         let primaryRay = cameraMakeRay(camera, rngState, u, 1f - v);
         gbufferSample = vec2(u * f32(imageWidth), v * f32(imageHeight));
+        primaryEmission = vec3(0.);
         color += rayColor(primaryRay, rngState);
+        if DENOISER_INPUT {color -= primaryEmission;emission += primaryEmission;}
+    }
+    if DENOISER_INPUT && numSamples > 0u {
+        let n = 1. / f32(numSamples);
+        gbuffer[frameData.x * frameData.y * 3u + gbufferPixel] = vec4(emission * n, 0.);
+        color *= n;
     }
     if TRAVERSAL_STATS {return vec3(f32(statNodes),f32(statTriangles),f32(statRays));}
     return color;
@@ -461,7 +476,9 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                         let lampPdf = (1.-sunShare)*lampPdfAt(hit.materialIdx,hit.t*length(ray.direction),abs(dot(hit.geometricNormal,d)));
                         weight = misWeight(lastBsdfPdf,lampPdf);
                     }
-                    color += throughput * emission * meshTexture(m+32u,vec2(hit.u,hit.v),hit.uv1,true).rgb * weight;
+                    let emitted = throughput * emission * meshTexture(m+32u,vec2(hit.u,hit.v),hit.uv1,true).rgb * weight;
+                    color += emitted;
+                    if bounce == 0u {primaryEmission = emitted;}
                 }
                 let last = bounce+1u==samplingParams.numBounces;
                 if sunOn || LAMPS {
@@ -532,6 +549,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                     let emissionTexture = material.desc1;
                     let emissionColor = textureLookup(emissionTexture, hit.u, hit.v);
                     color += throughput * emissionColor;
+                    if bounce == 0u {primaryEmission = throughput * emissionColor;}
                     break;
                 }
 
