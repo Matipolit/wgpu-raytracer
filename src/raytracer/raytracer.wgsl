@@ -78,6 +78,14 @@ override RUSSIAN_ROULETTE: bool = true;
 override SKY_IMPORTANCE: bool = false;
 // Mesh surfaces sample the sun disk directly (shadow ray), MIS with BSDF hits.
 override SUN: bool = false;
+// Mesh surfaces sample emissive scene triangles (the lamp table) directly.
+override LAMPS: bool = false;
+// Share of light samples given to the sun when lamps are sampled too.
+const SUN_SHARE = 0.75;
+// Lamp candidates per light sample (resampled importance sampling, the first stage
+// of ReSTIR DI): one shadow ray goes to the candidate chosen by unshadowed
+// contribution, so nearby, facing lamps win over distant bright ones.
+override LAMP_CANDIDATES: u32 = 8u;
 override GGX_VNDF: bool = false;
 override GGX_BOUNDED:bool=false;
 
@@ -420,6 +428,10 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
     var throughput = vec3(1f);
     var skyMisWeight = 1.;
     var sunMisWeight = 1.;
+    // Pdf of the BSDF sample that continued the path (< 0: no light sampling there).
+    var lastBsdfPdf = -1.;
+    let sunOn = SUN && skyState.sunRadiance.g > 0.;
+    let sunShare = select(0.,select(1.,SUN_SHARE,LAMPS),sunOn);
     if OPACITY_APPROX {pathDiffuse=false;}
     var packedDirection=0u;var packedValid=false;
 
@@ -441,18 +453,38 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
             }
             if TRACE_MESHES && hit.sphereIdx == 0xffffffffu {
                 let m = meshMaterialOffset(hit.materialIdx);
-                color += throughput * meshVec3(m+4u) * meshTexture(m+32u,vec2(hit.u,hit.v),hit.uv1,true).rgb;
+                let emission = meshVec3(m+4u);
+                if any(emission > vec3(0.)) {
+                    var weight = 1.;
+                    if LAMPS && lastBsdfPdf >= 0. {
+                        let d = normalize(ray.direction);
+                        let lampPdf = (1.-sunShare)*lampPdfAt(hit.materialIdx,hit.t*length(ray.direction),abs(dot(hit.geometricNormal,d)));
+                        weight = misWeight(lastBsdfPdf,lampPdf);
+                    }
+                    color += throughput * emission * meshTexture(m+32u,vec2(hit.u,hit.v),hit.uv1,true).rgb * weight;
+                }
                 let last = bounce+1u==samplingParams.numBounces;
-                if SUN && skyState.sunRadiance.g > 0. {
-                    // Direct sun at every surface; MIS against the BSDF continuation,
-                    // which is never traced from the last surface.
+                if sunOn || LAMPS {
+                    // One light sample (sun or lamp) at every surface; MIS against the
+                    // BSDF continuation, which is never traced from the last surface.
                     let surface = pbrSurface(ray,hit);
-                    let direction = sampleSun(rngState);
+                    var direction = vec3(0.);var radiance = vec3(0.);var pdf = 0.;var scale = 0.;var limit = MAX_T;
+                    if rngNextFloat(rngState) < sunShare {
+                        direction = sampleSun(rngState);
+                        radiance = skyState.sunRadiance.rgb;
+                        pdf = sunShare/skyState.sunRadiance.w; // inside the cone by construction
+                        scale = 1./pdf;
+                    } else {
+                        let lamp = lampRis(hit.p,hit.n,rngState);
+                        direction = lamp.direction;radiance = lamp.radiance;limit = lamp.distance*0.999;
+                        // MIS uses the source pdf; RIS supplies the estimator's weight.
+                        pdf = (1.-sunShare)*lamp.pdf;
+                        scale = lamp.scale/(1.-sunShare);
+                    }
                     let eval = evaluatePbr(surface,hit,direction);
-                    if any(eval.rgb > vec3(0.)) && !skyOccluded(Ray(hit.p+hit.geometricNormal*0.0001,direction)) {
-                        let pdf = 1./skyState.sunRadiance.w; // inside the cone by construction
+                    if scale > 0. && any(eval.rgb*radiance > vec3(0.)) && !occludedWithin(Ray(hit.p+hit.geometricNormal*0.0001,direction),limit) {
                         let weight = select(misWeight(pdf,eval.a),1.,last);
-                        color += throughput * skyState.sunRadiance.rgb * eval.rgb * weight/pdf;
+                        color += throughput * radiance * eval.rgb * weight*scale;
                     }
                 }
                 if SKIP_FINAL_SCATTER && last {
@@ -474,11 +506,13 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                     let sampled = samplePbr(surface,hit,rngState);
                     scatter = sampled.scatter;
                     skyMisWeight = misWeight(sampled.pdf,skyPdf(scatter.ray.direction));
-                    if SUN {sunMisWeight = misWeight(sampled.pdf,sunPdf(normalize(scatter.ray.direction)));}
-                } else if SUN {
+                    if sunOn {sunMisWeight = misWeight(sampled.pdf,sunShare*sunPdf(normalize(scatter.ray.direction)));}
+                    lastBsdfPdf = sampled.pdf;
+                } else if sunOn || LAMPS {
                     let sampled = samplePbr(pbrSurface(ray,hit),hit,rngState);
                     scatter = sampled.scatter;
-                    sunMisWeight = misWeight(sampled.pdf,sunPdf(normalize(scatter.ray.direction)));
+                    if sunOn {sunMisWeight = misWeight(sampled.pdf,sunShare*sunPdf(normalize(scatter.ray.direction)));}
+                    lastBsdfPdf = sampled.pdf;
                 } else {scatter = scatterPbr(ray,hit,rngState);}
                 if GBUFFER && gbufferPending {
                     gbufferPending = false;
@@ -501,7 +535,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                     break;
                 }
 
-                skyMisWeight = 1.;sunMisWeight = 1.;packedValid=false;if OPACITY_APPROX {pathDiffuse=false;}
+                skyMisWeight = 1.;sunMisWeight = 1.;lastBsdfPdf = -1.;packedValid=false;if OPACITY_APPROX {pathDiffuse=false;}
                 var scatter = scatterRay(ray, hit, material, rngState);
                 ray = scatter.ray;
                 throughput *= scatter.throughput;
@@ -1045,19 +1079,81 @@ fn sampleSky(rng: ptr<function,u32>) -> vec3<f32> {
     let r=sqrt(max(0.,1.-y*y));
     return vec3(r*cos(phi),y,r*sin(phi));
 }
-fn skyOccluded(ray: Ray) -> bool {
+fn skyOccluded(ray: Ray) -> bool {return occludedWithin(ray,MAX_T);}
+// Any blocker along a unit-direction ray before distance `limit`.
+fn occludedWithin(ray: Ray, limit: f32) -> bool {
     let diffuse=pathDiffuse;if OPACITY_APPROX {pathDiffuse=false;}
-    let blocked=skyOccludedExact(ray);
+    let blocked=skyOccludedExact(ray,limit);
     if OPACITY_APPROX {pathDiffuse=diffuse;}
     return blocked;
 }
-fn skyOccludedExact(ray: Ray) -> bool {
+fn skyOccludedExact(ray: Ray, limit: f32) -> bool {
     if ALPHA_CAP {alphaQueries=0u;}
     for(var i=0u;i<SPHERE_COUNT;i+=1u) {
         var hit=Intersection();
-        if rayIntersectSphere(ray,i,MIN_T,MAX_T,&hit) {return true;}
+        if rayIntersectSphere(ray,i,MIN_T,limit,&hit) {return true;}
     }
-    return TRACE_MESHES && meshOccluded(ray);
+    return TRACE_MESHES && meshOccluded(ray,limit);
+}
+
+// Lamps: emissive scene triangles, chosen by an alias table over weight × area
+// (mesh.rs lamp_table); a uniform point on the chosen triangle.
+struct LampSample {direction: vec3<f32>, distance: f32, radiance: vec3<f32>, pdf: f32}
+// Solid-angle pdf of reaching a lamp point: selection (weight × area / total) times
+// the uniform area pdf (1 / area) times the area-to-solid-angle factor. Area cancels.
+fn lampPdfAt(material: u32, distance: f32, cosLight: f32) -> f32 {
+    let table=meshData[12u];
+    if table==0u {return 0.;}
+    let weight=meshFloat(meshMaterialOffset(material)+12u);
+    return weight/meshFloat(table+1u)*distance*distance/max(cosLight,1e-8);
+}
+// A lamp chosen among LAMP_CANDIDATES by target = weight × max(n·ω, 0) (cheap: no
+// texture, no BSDF, no visibility). `pdf` is the chosen point's source pdf (for MIS),
+// `scale` the RIS estimator weight (1/pdf when there is one candidate); 0 = none.
+struct LampChoice {direction: vec3<f32>, distance: f32, radiance: vec3<f32>, pdf: f32, scale: f32}
+fn lampRis(origin: vec3<f32>, normal: vec3<f32>, rng: ptr<function,u32>) -> LampChoice {
+    var chosen=LampPoint();var chosenTarget=0.;var sum=0.;
+    for(var k=0u;k<LAMP_CANDIDATES;k+=1u) {
+        let candidate=sampleLampPoint(origin,rng);
+        let score=meshFloat(meshMaterialOffset(candidate.material)+12u)*max(dot(normal,candidate.direction),0.);
+        let w=select(0.,score/candidate.pdf,candidate.pdf>0.);
+        sum+=w;
+        if w>0. && rngNextFloat(rng)*sum<w {chosen=candidate;chosenTarget=score;}
+    }
+    if chosenTarget<=0. {return LampChoice();}
+    return LampChoice(chosen.direction,chosen.distance,lampRadiance(chosen),chosen.pdf,sum/(f32(LAMP_CANDIDATES)*chosenTarget));
+}
+struct LampPoint {direction: vec3<f32>, distance: f32, pdf: f32, material: u32, uv0: vec2<f32>, uv1: vec2<f32>}
+fn lampRadiance(point: LampPoint) -> vec3<f32> {
+    let m=meshMaterialOffset(point.material);
+    let cones=coneActive;coneActive=false;
+    let radiance=meshVec3(m+4u)*meshTexture(m+32u,point.uv0,point.uv1,true).rgb;
+    coneActive=cones;
+    return radiance;
+}
+fn sampleLamp(origin: vec3<f32>, rng: ptr<function,u32>) -> LampSample {
+    let point=sampleLampPoint(origin,rng);
+    return LampSample(point.direction,point.distance,lampRadiance(point),point.pdf);
+}
+fn sampleLampPoint(origin: vec3<f32>, rng: ptr<function,u32>) -> LampPoint {
+    let table=meshData[12u];let count=meshData[table];
+    let x=rngNextFloat(rng)*f32(count);let slot=min(u32(x),count-1u);
+    let entry=table+2u+slot*4u;
+    let pick=select(meshData[entry+1u],slot,fract(x)<meshFloat(entry));
+    let triangle=meshData[table+2u+pick*4u+2u];
+    let tri=meshData[2u]+triangle*4u;
+    let va=vertexOffset(meshData[tri]);let vb=vertexOffset(meshData[tri+1u]);let vc=vertexOffset(meshData[tri+2u]);
+    let r=sqrt(rngNextFloat(rng));let s=rngNextFloat(rng);
+    let w=vec3(1.-r,r*(1.-s),r*s);
+    let a=meshVec3(va);let b=meshVec3(vb);let c=meshVec3(vc);
+    let point=w.x*a+w.y*b+w.z*c;
+    let normal=cross(b-a,c-a);
+    let toLight=point-origin;let distance=length(toLight);let direction=toLight/max(distance,1e-20);
+    let material=meshData[tri+3u];
+    let uv0=w.x*vertexUV0(va)+w.y*vertexUV0(vb)+w.z*vertexUV0(vc);
+    let uv1=w.x*vertexUV1(va)+w.y*vertexUV1(vb)+w.z*vertexUV1(vc);
+    let cosLight=abs(dot(normal,direction))/max(length(normal),1e-20);
+    return LampPoint(direction,distance,lampPdfAt(material,distance,cosLight),material,uv0,uv1);
 }
 
 fn encodeOct(direction:vec3<f32>)->vec2<f32>{

@@ -158,6 +158,31 @@ fn csSunEnergy(@builtin(global_invocation_id) id:vec3<u32>) {
     queries[id.x].brute=vec4(combined/256.,0.);
 }
 @compute @workgroup_size(64)
+fn csLampEnergy(@builtin(global_invocation_id) id:vec3<u32>) {
+    if id.x>=arrayLength(&queries) {return;}
+    var rng=jenkinsHash(id.x+733u);var nee=vec3(0.);var bsdf=vec3(0.);var combined=vec3(0.);
+    var hit=Intersection();hit.n=vec3(0.,1.,0.);hit.geometricNormal=hit.n;
+    let ray=Ray(vec3(0.3,1.,0.1),normalize(vec3(-0.3,-1.,-0.1)));let surface=pbrSurface(ray,hit);
+    for(var i=0u;i<256u;i+=1u) {
+        let s=sampleLamp(hit.p,&rng);let ev=evaluatePbr(surface,hit,s.direction);
+        nee+=ev.rgb*s.radiance/s.pdf;
+        // Resampled lamp choice, MIS-weighted with the source pdf.
+        let r=lampRis(hit.p,hit.n,&rng);let er=evaluatePbr(surface,hit,r.direction);
+        combined+=er.rgb*r.radiance*misWeight(r.pdf,er.a)*r.scale;
+        let b=samplePbr(surface,hit,&rng);var h=Intersection();
+        if meshIntersection(Ray(hit.p+hit.n*1e-4,b.scatter.ray.direction),&h,MAX_T) {
+            let e=meshVec3(meshMaterialOffset(h.materialIdx)+4u);
+            let d=normalize(b.scatter.ray.direction);
+            let pdf=lampPdfAt(h.materialIdx,h.t*length(b.scatter.ray.direction),abs(dot(h.geometricNormal,d)));
+            bsdf+=b.scatter.throughput*e;
+            combined+=b.scatter.throughput*e*misWeight(b.pdf,pdf);
+        }
+    }
+    queries[id.x].hit=vec4(nee/256.,0.);
+    queries[id.x].brute=vec4(bsdf/256.,0.);
+    queries[id.x].normal=vec4(combined/256.,0.);
+}
+@compute @workgroup_size(64)
 fn csSky(@builtin(global_invocation_id) id:vec3<u32>) {
     if id.x>=arrayLength(&queries) {return;}
     var rng=jenkinsHash(id.x+71u);var sum=vec3(0.);
@@ -188,7 +213,7 @@ fn csCompare(@builtin(global_invocation_id) id:vec3<u32>) {
     }
     queries[id.x].hit=vec4(select(MAX_T,hit.t,found),hit.u,hit.v,f32(hit.materialIdx));
     queries[id.x].brute=vec4(select(MAX_T,brute.t,bruteFound),brute.u,brute.v,f32(brute.materialIdx));
-    queries[id.x].direction.w=f32(meshOccluded(ray));
+    queries[id.x].direction.w=f32(meshOccluded(ray,MAX_T));
     queries[id.x].normal=vec4(hit.n,f32(found));
     queries[id.x].bruteNormal=vec4(brute.n,f32(bruteFound));
 }
@@ -715,6 +740,63 @@ fn sun_nee_and_bsdf_hits_sum_to_the_direct_sun_integral() {
         assert!(
             (combined / direct - 1.).abs() < 0.03,
             "sun MIS changed direct energy: {combined} vs {direct}"
+        );
+    }
+}
+
+/// Two emissive quads of different strength and size above the origin, facing down.
+fn lamps() -> Mesh {
+    let mut mesh = fixture();
+    let template = mesh.vertices[0];
+    let mut material = mesh.materials[0];
+    mesh.vertices.clear();
+    mesh.triangles.clear();
+    for (index, (x0, size, emission)) in [(-1.2_f32, 0.6_f32, 2.0_f32), (0.5, 1.0, 0.5)]
+        .into_iter()
+        .enumerate()
+    {
+        material[4..7]
+            .copy_from_slice(&[emission, emission * 0.8, emission * 0.6].map(f32::to_bits));
+        mesh.materials.push(material);
+        let id = mesh.materials.len() as u32 - 1;
+        let offset = mesh.vertices.len() as u32;
+        for (dx, dz) in [(0., 0.), (size, 0.), (0., size), (size, size)] {
+            let mut v = template;
+            v.position = [x0 + dx, 2. + index as f32 * 0.3, -0.4 + dz];
+            v.normal = [0., -1., 0.];
+            mesh.vertices.push(v);
+        }
+        mesh.triangles.push(Triangle {
+            vertices: [offset, offset + 1, offset + 2],
+            material: id,
+        });
+        mesh.triangles.push(Triangle {
+            vertices: [offset + 1, offset + 3, offset + 2],
+            material: id,
+        });
+    }
+    mesh.build_bvh();
+    mesh
+}
+
+#[test]
+#[ignore = "requires a GPU"]
+fn lamp_sampling_matches_bsdf_hits_and_mis_preserves_energy() {
+    let queries = vec![ray([0.; 3], [0.; 3]); 2048];
+    let results = run_queries(lamps(), &queries, "csLampEnergy");
+    for channel in 0..3 {
+        let sum = |f: &dyn Fn(&Query) -> f32| results.iter().map(|q| f64::from(f(q))).sum::<f64>();
+        let nee = sum(&|q| q.hit[channel]);
+        let bsdf = sum(&|q| q.brute[channel]);
+        let combined = sum(&|q| q.normal[channel]);
+        assert!(nee > 0., "no lamp light");
+        assert!(
+            (bsdf / nee - 1.).abs() < 0.05,
+            "lamp sampling {nee} vs BSDF hits {bsdf}"
+        );
+        assert!(
+            (combined / nee - 1.).abs() < 0.03,
+            "resampled lamp MIS {combined} vs {nee}"
         );
     }
 }

@@ -184,7 +184,8 @@ fn meshResolveLocal(ray: Ray, candidate: MeshCandidate) -> Intersection {
         footprintUV1=coneWidth*vec2(length(b1.x*dual1+c1.x*dual2),length(b1.y*dual1+c1.y*dual2));
     }
     if SKIP_FINAL_SCATTER && pathBounce+1u==samplingParams.numBounces {
-        return Intersection(ray.origin+candidate.t*ray.direction,vec3(0.),uv0.x,uv0.y,candidate.t,materialIdx,0xffffffffu,uv1,vec3(0.));
+        // Shading normals are skipped; the geometric normal weighs lamp hits (MIS).
+        return Intersection(ray.origin+candidate.t*ray.direction,vec3(0.),uv0.x,uv0.y,candidate.t,materialIdx,0xffffffffu,uv1,normalize(cross(e1,e2)));
     }
     var geo=normalize(cross(e1,e2));
     var n=weights.x*vertexNormal(va)+weights.y*vertexNormal(vb)+weights.z*vertexNormal(vc);
@@ -326,31 +327,31 @@ fn scatterPbr(inRay: Ray, hit: Intersection, rng: ptr<function,u32>) -> Scatter 
 }
 
 // Shadow queries stop on the first accepted surface; cutout tests stay in meshCandidate.
-fn meshOccluded(ray: Ray) -> bool {
-    if HW_RT{var ignored=MeshCandidate();return meshHwCandidate(ray,MAX_T,true,&ignored) || meshInstanceCandidate(ray,MAX_T,true,&ignored);}
+fn meshOccluded(ray: Ray, limit: f32) -> bool {
+    if HW_RT{var ignored=MeshCandidate();return meshHwCandidate(ray,limit,true,&ignored) || meshInstanceCandidate(ray,limit,true,&ignored);}
     if QUAD_BVH{
         var ignored=MeshCandidate();
-        return meshQuadCandidate(ray,MAX_T,true,&ignored,0u) || meshInstanceCandidate(ray,MAX_T,true,&ignored);
+        return meshQuadCandidate(ray,limit,true,&ignored,0u) || meshInstanceCandidate(ray,limit,true,&ignored);
     }
-    if PAIR_BVH{var ignored=Intersection();return meshPairQuery(ray,&ignored,MAX_T,true);}
-    if WIDE_BVH>2u{var ignored=Intersection();return meshWideQuery(ray,&ignored,MAX_T,true);}
+    if PAIR_BVH{var ignored=Intersection();return meshPairQuery(ray,&ignored,limit,true);}
+    if WIDE_BVH>2u{var ignored=Intersection();return meshWideQuery(ray,&ignored,limit,true);}
     if meshData[0u]==0u {return false;}
     let parallel=abs(ray.direction)<vec3(1e-20);
     let inverse=vec3(1.)/select(ray.direction,vec3(1.),parallel);
     var stack:array<u32,64>;var size=0u;var index=0u;var needsBox=true;
     loop {
-        if !needsBox || meshBox(ray,inverse,parallel,index,MAX_T)<MAX_T {
+        if !needsBox || meshBox(ray,inverse,parallel,index,limit)<limit {
             let node=16u+index*8u;let first=meshData[node+3u];let count=meshData[node+7u];
             if count!=0u {
                 for(var i=0u;i<count;i+=1u) {
                     var hit=MeshCandidate();
-                    if meshCandidate(ray,first+i,MAX_T,&hit) {return true;}
+                    if meshCandidate(ray,first+i,limit,&hit) {return true;}
                 }
             } else {
                 let left=index+1u;let right=first;
-                let a=meshBox(ray,inverse,parallel,left,MAX_T);let b=meshBox(ray,inverse,parallel,right,MAX_T);
-                if min(a,b)<MAX_T {
-                    if max(a,b)<MAX_T {stack[size]=select(left,right,a<=b);size+=1u;}
+                let a=meshBox(ray,inverse,parallel,left,limit);let b=meshBox(ray,inverse,parallel,right,limit);
+                if min(a,b)<limit {
+                    if max(a,b)<limit {stack[size]=select(left,right,a<=b);size+=1u;}
                     index=select(right,left,a<=b);needsBox=false;continue;
                 }
             }

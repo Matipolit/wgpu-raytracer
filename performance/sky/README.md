@@ -118,3 +118,33 @@ Cost on Iris Xe, `--fastest`, 640×400, median GPU frame time, two interleaved r
 
 Skipping the shadow ray at the last bounce saved only about 1%, so every bounce samples
 the sun.
+
+# Lamps: emissive triangles sampled directly (2026-11-17)
+
+Emissive scene triangles form a lamp table (alias method over emitted luminance ×
+area, packed into the scene buffer). Each mesh surface takes one light sample: the
+sun with probability 0.75 when both exist, otherwise a lamp. The lamp is chosen by
+resampled importance sampling (the first stage of ReSTIR DI) among
+`LAMP_CANDIDATES` = 8 candidates scored by luminance × max(n·ω, 0) / source pdf; MIS
+against BSDF hits uses the source pdf on both sides, so the weights still sum to one.
+GPU tests: lamp sampling matches BSDF hits on emitters (5%), MIS/RIS preserve energy.
+
+`--night` now dims the atmosphere to about 1e-4 of daylight (was 2e-3, which looked
+like dusk and drowned the lamps).
+
+Bistro at night, Iris Xe, `--fastest`, 640×400, 16 spp vs a 2048-spp reference
+(display PSNR), median GPU time per sample (`RT_LAMP_CANDIDATES`):
+
+| Lamp sampling | ms/spp | PSNR |
+|---|---:|---:|
+| none (BSDF hits only) | 28.3 | 13.87 dB |
+| 1 candidate | 52.8 | 15.48 dB |
+| 4 | 62.0 | 16.41 dB |
+| 8 (default) | 71.3 | 16.76 dB |
+| 16 | 88.2 | 17.11 dB |
+| 32 | 127.5 | 17.37 dB |
+
+Each candidate costs about 2.3 ms here (three random vertex reads); the shadow rays
+about 24 ms. At equal time on this GPU plain path tracing is still competitive by
+mean error; the gain is in fireflies and in what spatial/temporal reuse (ReSTIR)
+can build on. Daytime Bistro: 38.8 → 44.8 ms/spp (+16%).

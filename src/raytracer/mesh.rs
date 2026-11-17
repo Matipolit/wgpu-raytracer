@@ -522,6 +522,98 @@ impl Mesh {
     }
 
     /// Triangles of the static scene (moving objects' triangles follow them).
+    /// Light-selection weight per unit area of each material: the luminance of its
+    /// emission (factor × mean of the emissive texture, linear). Zero: not a lamp.
+    pub fn lamp_weights(&self) -> Vec<f32> {
+        self.materials
+            .iter()
+            .map(|m| {
+                let factor: [f32; 3] = std::array::from_fn(|i| f32::from_bits(m[4 + i]));
+                let mut mean = [1f32; 3];
+                if m[32] != u32::MAX
+                    && let Some(&[offset, width, height, _]) = self.textures.get(m[32] as usize)
+                {
+                    let decode = |c: u8| {
+                        let c = f32::from(c) / 255.;
+                        if c <= 0.04045 {
+                            c / 12.92
+                        } else {
+                            ((c + 0.055) / 1.055).powf(2.4)
+                        }
+                    };
+                    let (step_x, step_y) = ((width / 64).max(1), (height / 64).max(1));
+                    let mut sum = [0f64; 3];
+                    let mut n = 0f64;
+                    for y in (0..height).step_by(step_y as usize) {
+                        for x in (0..width).step_by(step_x as usize) {
+                            let rgba = self.pixels[(offset + y * width + x) as usize].to_le_bytes();
+                            for c in 0..3 {
+                                sum[c] += f64::from(decode(rgba[c]));
+                            }
+                            n += 1.;
+                        }
+                    }
+                    mean = sum.map(|v| (v / n.max(1.)) as f32);
+                }
+                let rgb: [f32; 3] = std::array::from_fn(|i| factor[i] * mean[i]);
+                (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]).max(0.)
+            })
+            .collect()
+    }
+
+    /// Scene triangles (not moving objects) with emitting materials and their power
+    /// (weight × area).
+    fn lamp_triangles(&self, weights: &[f32]) -> Vec<(u32, f64)> {
+        self.triangles[..self.scene_triangle_count()]
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| weights[t.material as usize] > 0.)
+            .filter_map(|(i, t)| {
+                let [a, b, c] = t
+                    .vertices
+                    .map(|v| glm::Vec3::from(self.vertices[v as usize].position));
+                let area = 0.5 * f64::from(glm::length(&glm::cross(&(b - a), &(c - a))));
+                let power = f64::from(weights[t.material as usize]) * area;
+                (power > 0.).then_some((i as u32, power))
+            })
+            .collect()
+    }
+
+    /// Number of emitting scene triangles (the renderer samples them directly).
+    pub fn lamp_count(&self) -> usize {
+        self.lamp_triangles(&self.lamp_weights()).len()
+    }
+
+    /// Lamp table: count, total weight (f32 bits), then per entry an alias-method
+    /// record (threshold f32, alias index, triangle, 0) selecting triangles in
+    /// proportion to weight × area.
+    fn lamp_table(&self, weights: &[f32]) -> Vec<u32> {
+        let lamps = self.lamp_triangles(weights);
+        let total: f64 = lamps.iter().map(|l| l.1).sum();
+        let n = lamps.len();
+        let mut scaled: Vec<f64> = lamps.iter().map(|l| l.1 * n as f64 / total).collect();
+        let mut alias: Vec<u32> = (0..n as u32).collect();
+        let (mut small, mut large): (Vec<usize>, Vec<usize>) =
+            (0..n).partition(|&i| scaled[i] < 1.);
+        while let (Some(&s), Some(&l)) = (small.last(), large.last()) {
+            small.pop();
+            alias[s] = l as u32;
+            scaled[l] -= 1. - scaled[s];
+            if scaled[l] < 1. {
+                large.pop();
+                small.push(l);
+            }
+        }
+        for i in small.into_iter().chain(large) {
+            scaled[i] = 1.;
+        }
+        let mut words = vec![n as u32, (total as f32).to_bits()];
+        for (i, &(triangle, _)) in lamps.iter().enumerate() {
+            words.extend([(scaled[i] as f32).to_bits(), alias[i], triangle, 0]);
+        }
+        words
+    }
+
     pub fn scene_triangle_count(&self) -> usize {
         self.objects
             .first()
@@ -943,8 +1035,11 @@ impl Mesh {
         // GPU materials name sampled GPU textures (see gpu_textures): slot word 0
         // is the GPU texture index plus one (0 = none), word 7 the sampler index.
         let (_, slots) = self.texture_plan();
-        for (material, indices) in self.materials.iter().zip(&slots) {
+        let lamp_weights = self.lamp_weights();
+        for ((material, indices), weight) in self.materials.iter().zip(&slots).zip(&lamp_weights) {
             let mut material = *material;
+            // Lamp selection weight per unit area (raytracer.wgsl lampPdfAt).
+            material[12] = weight.to_bits();
             for (slot, index) in super::gpu_textures::SLOTS.into_iter().zip(indices) {
                 if material[slot] == u32::MAX {
                     material[slot] = 0;
@@ -1038,6 +1133,13 @@ impl Mesh {
             words.extend(opaque);
             words[5] = words.len() as u32;
             words.extend(shaded);
+        }
+        if lamp_weights.iter().any(|&w| w > 0.) {
+            let table = self.lamp_table(&lamp_weights);
+            if table[0] > 0 {
+                words[12] = words.len() as u32;
+                words.extend(table);
+            }
         }
         if !object_roots.is_empty() {
             words[15] = words.len() as u32;

@@ -622,6 +622,11 @@ impl Raytracer {
                 "SUN",
                 f64::from(render_params.sky.sun && !render_params.sky.night),
             ),
+            ("LAMPS", f64::from(scene.mesh.lamp_count() > 0)),
+            (
+                "LAMP_CANDIDATES",
+                std::env::var("RT_LAMP_CANDIDATES").map_or(8., |v| v.parse().unwrap()),
+            ),
             (
                 "SKY_IMPORTANCE",
                 f64::from(std::env::args().any(|a| a == "--sky-importance")),
@@ -2270,7 +2275,7 @@ impl SkyParams {
 const SUN_ANGULAR_RADIUS: f32 = 0.2666 * std::f32::consts::PI / 180.;
 pub(crate) const SUN_SOLID_ANGLE: f32 = 6.806e-5; // 2π(1 − cos SUN_ANGULAR_RADIUS)
 /// Night atmosphere: the day sky dimmed to faint, bluish moonlight.
-const NIGHT_SKY: [f32; 3] = [0.0015, 0.002, 0.003];
+const NIGHT_SKY: [f32; 3] = [0.00006, 0.0001, 0.00016];
 
 /// Direct-beam transmittance of the atmosphere for R, G and B (680, 550, 440 nm):
 /// Rayleigh and turbidity-dependent aerosol optical depths (Preetham et al. 1999)
