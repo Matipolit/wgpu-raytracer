@@ -517,7 +517,9 @@ impl winit::application::ApplicationHandler for LauncherApp {
                 } else {
                     s.apply_preset(Preset::Medium, &models);
                 }
-                s.hw_rt = context.ray_query;
+                // Off by default: slower than the compute tracer on the Deck (2.5x) and
+                // on the RTX (Bistro day 28 vs 22 ms); opt in per machine.
+                s.hw_rt = false;
                 s
             },
             Settings::parse,
@@ -856,7 +858,11 @@ fn graphics(
         });
     ui.end_row();
     ui.label("Hardware ray tracing");
-    let note = if ray_query { "" } else { "not supported" };
+    let note = if ray_query {
+        "usually slower than the compute tracer"
+    } else {
+        "not supported"
+    };
     ui.add_enabled(ray_query, egui::Checkbox::new(&mut settings.hw_rt, note));
     ui.end_row();
     ui.label("Auto-tuner");
