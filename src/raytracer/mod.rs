@@ -1826,6 +1826,15 @@ impl Raytracer {
         self.filter_dirty = true;
     }
 
+    /// Forget the ReSTIR DI/GI history (reservoirs and GI samples), e.g. when a capture
+    /// starts a new sequence or trace region: stale samples would otherwise be reused.
+    pub fn clear_history(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.clear_buffer(&self.images.reservoirs, 0, None);
+        encoder.clear_buffer(&self.images.gi, 0, None);
+        queue.submit([encoder.finish()]);
+    }
+
     /// Primary-hit guides of the last traced frame, 12 floats per pixel.
     /// The primary-hit guides, 12 floats per pixel (without the emission slot).
     pub fn read_gbuffer(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
@@ -1934,10 +1943,6 @@ impl Raytracer {
             Ok(_) => {}
             Err(err) => return Err(err),
         }
-        if let Some(temporal) = &mut self.temporal {
-            temporal.moved();
-        }
-
         // Exposure is a display setting: update it even after convergence,
         // without throwing away the expensive accumulated samples.
         queue.write_buffer(
@@ -1953,6 +1958,12 @@ impl Raytracer {
         let mut previous = self.latest_render_params;
         previous.exposure = render_params.exposure;
         previous.auto_exposure = render_params.auto_exposure;
+        if let Some(temporal) = &mut self.temporal {
+            // Exposure alone does not restart the still-view convergence.
+            if previous != *render_params || output_size != self.output_size {
+                temporal.moved();
+            }
+        }
         if previous == *render_params {
             self.latest_render_params = *render_params;
             return Ok(());
@@ -2257,6 +2268,7 @@ pub fn gbuffer_enabled() -> bool {
     crate::has_flag("--gbuffer")
         || crate::has_flag("--capture")
         || crate::has_flag("--temporal-model")
+        || crate::has_flag("--restir")
         || upscale::render_scale() < 1.
 }
 

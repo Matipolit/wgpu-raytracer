@@ -89,6 +89,9 @@ HRS=$(left_hours 0.75)
 STEPS=0
 [ $SMOKE = 1 ] && HRS=0.05 && STEPS=20
 stamp "train five tiers for $HRS h (bf16, tensor cores)"
+# Five processes share one 16 GB GPU: batch 4 and expandable segments avoid running
+# out of memory from fragmentation.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 train() {  # name, batch, args...: halves the batch and resumes on failure (out of memory)
     local name=$1 batch=$2; shift 2
     while [ "$batch" -ge 1 ]; do
@@ -102,7 +105,7 @@ TIERS="tiny small medium large ultra"
 P=v3
 [ $SMOKE = 1 ] && P=v3-smoke
 for tier in $TIERS; do
-    train $P-$tier 6 --tier $tier &
+    train $P-$tier 4 --tier $tier &
 done
 wait
 

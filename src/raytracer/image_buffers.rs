@@ -9,6 +9,9 @@ pub(super) struct ImageBuffers {
     /// Primary-hit guides, 48 bytes per pixel, then 16 per pixel of emission (see
     /// raytracer.wgsl `gbuffer`, `DENOISER_INPUT`).
     pub gbuffer: wgpu::Buffer,
+    /// ReSTIR DI reservoirs and ReSTIR GI samples (history: cleared by `clear_history`).
+    pub reservoirs: wgpu::Buffer,
+    pub gi: wgpu::Buffer,
     pub trace_layout: wgpu::BindGroupLayout,
     pub filter_layout: wgpu::BindGroupLayout,
     pub display_layout: wgpu::BindGroupLayout,
@@ -68,7 +71,7 @@ impl ImageBuffers {
             5,
             Some("exposure state"),
         );
-        let (accumulation, filtered, gbuffer, [trace, filter, display]) = Self::allocate(
+        let (accumulation, filtered, [gbuffer, reservoirs, gi], [trace, filter, display]) = Self::allocate(
             device,
             frame,
             &exposure,
@@ -82,6 +85,8 @@ impl ImageBuffers {
             filtered,
             exposure,
             gbuffer,
+            reservoirs,
+            gi,
             trace_layout,
             filter_layout,
             display_layout,
@@ -95,7 +100,7 @@ impl ImageBuffers {
         if self.accumulation.handle().size() == bytes {
             return;
         }
-        let (accumulation, filtered, gbuffer, [trace, filter, display]) = Self::allocate(
+        let (accumulation, filtered, [gbuffer, reservoirs, gi], [trace, filter, display]) = Self::allocate(
             device,
             frame,
             &self.exposure,
@@ -107,6 +112,8 @@ impl ImageBuffers {
         self.accumulation = accumulation;
         self.filtered = filtered;
         self.gbuffer = gbuffer;
+        self.reservoirs = reservoirs;
+        self.gi = gi;
         self.trace = trace;
         self.filter = filter;
         self.display = display;
@@ -123,7 +130,7 @@ impl ImageBuffers {
     ) -> (
         StorageBuffer,
         StorageBuffer,
-        wgpu::Buffer,
+        [wgpu::Buffer; 3],
         [wgpu::BindGroup; 3],
     ) {
         let accumulation = StorageBuffer::new(device, bytes, 1, Some("accumulated radiance"));
@@ -140,7 +147,7 @@ impl ImageBuffers {
         let reservoirs = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ReSTIR reservoirs"),
             size: bytes / 12 * 72,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         // ReSTIR GI: this frame's samples (48 bytes per pixel) and two sets of final
@@ -148,7 +155,7 @@ impl ImageBuffers {
         let gi = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ReSTIR GI samples and reservoirs"),
             size: bytes / 12 * 112,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         fn binding(buffer: &wgpu::Buffer, binding: u32) -> wgpu::BindGroupEntry<'_> {
@@ -187,6 +194,6 @@ impl ImageBuffers {
                 binding(exposure.handle(), 6),
             ],
         });
-        (accumulation, filtered, gbuffer, [trace, filter, display])
+        (accumulation, filtered, [gbuffer, reservoirs, gi], [trace, filter, display])
     }
 }

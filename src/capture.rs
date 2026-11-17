@@ -229,6 +229,10 @@ async fn capture() {
     for sequence in 0..sequences {
         let directory = output.join(format!("seq_{sequence:03}"));
         std::fs::create_dir_all(&directory).unwrap();
+        tracer.clear_history(&device, &queue);
+        for low in &mut lows {
+            low.tracer.clear_history(&device, &queue);
+        }
         let origin = if crop.is_some() {
             let x = ((rng.next() * (width - out_w + 1) as f32) as u32).min(width - out_w);
             let y = ((rng.next() * (height - out_h + 1) as f32) as u32).min(height - out_h);

@@ -613,6 +613,11 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                     if bounce == 0u {primaryEmission = emitted;}
                 }
                 let last = bounce+1u==samplingParams.numBounces;
+                // MIS state of the vertex before this one: a delta transmission sample
+                // passes straight through and keeps it (shadow rays skip transmissive
+                // surfaces, so that vertex's light samples already see through glass).
+                let before = array(lastBsdfPdf,skyMisWeight,sunMisWeight,vertexSunShare);
+                let lampsCoveredBefore = lampsCovered;
                 vertexSunShare = sunShare;lampsCovered = false;
                 if RESTIR && bounce == 0u && sampleIndex == 0u && samplingParams.restir != 0u {
                     let surface = pbrSurface(ray,hit);
@@ -677,11 +682,15 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                     if sunOn {sunMisWeight = misWeight(sampled.pdf,vertexSunShare*sunPdf(normalize(scatter.ray.direction)));}
                     lastBsdfPdf = sampled.pdf;
                 } else {scatter = scatterPbr(ray,hit,rngState);}
+                if (SKY_IMPORTANCE || sunOn || LAMPS || giActive) && lastBsdfPdf >= 1e7 {
+                    lastBsdfPdf = before[0];skyMisWeight = before[1];sunMisWeight = before[2];
+                    vertexSunShare = before[3];lampsCovered = lampsCoveredBefore;
+                }
                 if GBUFFER && gbufferPending {
                     gbufferPending = false;
                     writeGbuffer(shadedBase, hit.t * length(ray.direction), hit.n, shadedRough, shadedMetal, meshPrevious, 1.);
                 }
-                if giActive && bounce == 0u && lastBsdfPdf > 0. && lastBsdfPdf < 1e7 {
+                if giActive && bounce == 0u && lastBsdfPdf > 0. && lastBsdfPdf < 1e7 && meshFloat(m+48u) <= 0. {
                     giRecorded = true;giColor0 = color;giThroughput = scatter.throughput;giPdf = lastBsdfPdf;
                     giPrimary = hit.p;giPrimaryNormal = hit.n;
                 }
