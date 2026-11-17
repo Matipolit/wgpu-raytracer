@@ -48,7 +48,10 @@ fn params() -> RenderParams {
         },
         exposure: 0.246,
         auto_exposure: false,
-        sky: SkyParams::default(),
+        sky: SkyParams {
+            sun: false,
+            ..SkyParams::default()
+        },
         sampling: SamplingParams {
             max_samples_per_pixel: 8,
             ..Default::default()
@@ -534,4 +537,62 @@ fn sky_distribution_has_full_support_and_normalized_solid_angle_pdf() {
     }
     assert_eq!(previous, 1.0);
     assert!((integral - 1.0).abs() < 1e-5);
+}
+
+fn luminance(rgb: [f32; 3]) -> f64 {
+    0.2126 * f64::from(rgb[0]) + 0.7152 * f64::from(rgb[1]) + 0.0722 * f64::from(rgb[2])
+}
+
+#[test]
+fn sun_is_four_times_sky_at_reference() {
+    let sky = SkyParams {
+        zenith_degrees: 45.,
+        turbidity: 4.,
+        ..SkyParams::default()
+    };
+    let sun = luminance(super::sun_radiance(&sky))
+        * f64::from(super::SUN_SOLID_ANGLE)
+        * std::f64::consts::FRAC_1_SQRT_2;
+    let ratio = sun / super::sky_illuminance(&sky);
+    assert!(
+        (3.6..4.4).contains(&ratio),
+        "sun/sky horizontal illuminance {ratio}"
+    );
+}
+
+#[test]
+fn sun_state_handles_horizon_and_below() {
+    let at = |zenith_degrees| {
+        super::sun_radiance(&SkyParams {
+            zenith_degrees,
+            ..SkyParams::default()
+        })
+    };
+    let (low, high) = (at(89.), at(30.));
+    assert!(low.iter().all(|c| c.is_finite() && *c > 0.), "{low:?}");
+    assert!(low[0] / low[2] > high[0] / high[2], "{low:?} vs {high:?}");
+    assert_eq!(at(95.), [0.; 3]);
+    let state = SkyParams {
+        zenith_degrees: 95.,
+        ..SkyParams::default()
+    }
+    .to_sky_state()
+    .unwrap();
+    assert_eq!(state.sun_radiance[..3], [0.; 3]);
+}
+
+#[test]
+fn night_sky_is_dark_and_sunless() {
+    let day = SkyParams::default().to_sky_state().unwrap();
+    let night = SkyParams {
+        night: true,
+        ..SkyParams::default()
+    }
+    .to_sky_state()
+    .unwrap();
+    assert_eq!(night.sun_radiance[..3], [0.; 3]);
+    assert!(day.sun_radiance[1] > 0.);
+    for c in 0..3 {
+        assert!(night.radiances[c] < 0.01 * day.radiances[c]);
+    }
 }

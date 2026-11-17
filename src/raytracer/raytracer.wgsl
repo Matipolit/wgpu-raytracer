@@ -754,7 +754,8 @@ fn radiance(theta: f32, gamma: f32, channel: u32) -> f32 {
 struct SkyState {
     params: array<f32, 27>,
     radiances: array<f32, 3>,
-    sunDirection: vec3<f32>,
+    sunDirection: vec4<f32>, // w: cos(angular radius)
+    sunRadiance: vec4<f32>, // rgb (0: no sun), w: solid angle
     sampling: array<vec2<f32>,2048>,
 };
 
@@ -983,10 +984,15 @@ fn jenkinsHash(input: u32) -> u32 {
     return x;
 }
 
-fn skyRadiance(v: vec3<f32>) -> vec3<f32> {
+// Atmosphere plus sun disk, for unit directions.
+fn skyRadiance(v: vec3<f32>) -> vec3<f32> {return atmosphereRadiance(v)+sunRadiance(v);}
+fn atmosphereRadiance(v: vec3<f32>) -> vec3<f32> {
     let theta=acos(clamp(v.y,-1.,1.));
-    let gamma=acos(clamp(dot(v,skyState.sunDirection),-1.,1.));
+    let gamma=acos(clamp(dot(v,skyState.sunDirection.xyz),-1.,1.));
     return vec3(radiance(theta,gamma,0u),radiance(theta,gamma,1u),radiance(theta,gamma,2u));
+}
+fn sunRadiance(v: vec3<f32>) -> vec3<f32> {
+    return select(vec3(0.),skyState.sunRadiance.rgb,dot(v,skyState.sunDirection.xyz)>=skyState.sunDirection.w);
 }
 fn misWeight(a: f32,b: f32) -> f32 {return a*a/max(a*a+b*b,1e-30);}
 fn skyPdf(direction: vec3<f32>) -> f32 {

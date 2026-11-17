@@ -2201,6 +2201,10 @@ pub struct SkyParams {
     pub turbidity: f32,
     // Albedo elements must be between 0..=1
     pub albedo: [f32; 3],
+    /// A sun disk (sampled directly on mesh surfaces) next to the atmosphere.
+    pub sun: bool,
+    /// Faint moonlit atmosphere, no sun: emissive materials light the scene.
+    pub night: bool,
 }
 
 impl Default for SkyParams {
@@ -2210,6 +2214,8 @@ impl Default for SkyParams {
             zenith_degrees: 85_f32,
             turbidity: 4_f32,
             albedo: [1_f32; 3],
+            sun: true,
+            night: false,
         }
     }
 }
@@ -2226,22 +2232,134 @@ impl SkyParams {
         ];
 
         let state = hw_skymodel::rgb::SkyState::new(&hw_skymodel::rgb::SkyParams {
-            elevation: FRAC_PI_2 - zenith,
+            elevation: (FRAC_PI_2 - zenith).max(0.),
             turbidity: self.turbidity,
             albedo: self.albedo,
         })?;
 
-        let (params_data, radiance_data) = state.raw();
+        let (params_data, mut radiance_data) = state.raw();
+        if self.night {
+            for (radiance, scale) in radiance_data.iter_mut().zip(NIGHT_SKY) {
+                *radiance *= scale;
+            }
+        }
 
         let sampling = sky_sampling_table(&params_data, &radiance_data, sun_direction);
+        let sun = sun_radiance(self);
         Ok(GpuSkyState {
             sampling,
             params: params_data,
             radiances: radiance_data,
             _padding: [0_u32, 2],
-            sun_direction,
+            sun_direction: [
+                sun_direction[0],
+                sun_direction[1],
+                sun_direction[2],
+                SUN_ANGULAR_RADIUS.cos(),
+            ],
+            sun_radiance: [sun[0], sun[1], sun[2], SUN_SOLID_ANGLE],
         })
     }
+}
+
+/// The sun's angular radius (radians) and the solid angle of its disk.
+const SUN_ANGULAR_RADIUS: f32 = 0.2666 * std::f32::consts::PI / 180.;
+pub(crate) const SUN_SOLID_ANGLE: f32 = 6.806e-5; // 2π(1 − cos SUN_ANGULAR_RADIUS)
+/// Night atmosphere: the day sky dimmed to faint, bluish moonlight.
+const NIGHT_SKY: [f32; 3] = [0.0015, 0.002, 0.003];
+
+/// Direct-beam transmittance of the atmosphere for R, G and B (680, 550, 440 nm):
+/// Rayleigh and turbidity-dependent aerosol optical depths (Preetham et al. 1999)
+/// times the Kasten–Young air mass for this sun zenith angle.
+fn sun_transmittance(zenith_degrees: f32, turbidity: f32) -> [f64; 3] {
+    let z = f64::from(zenith_degrees);
+    let air_mass = 1. / (z.to_radians().cos() + 0.50572 * (96.07995 - z).powf(-1.6364));
+    let beta = 0.04608 * f64::from(turbidity) - 0.04586;
+    [0.68_f64, 0.55, 0.44].map(|micrometres| {
+        let depth = 0.008735 * micrometres.powf(-4.08) + beta * micrometres.powf(-1.3);
+        (-depth * air_mass).exp()
+    })
+}
+
+/// Sun disk radiance (linear RGB, the sky model's units). Scaled so that at 45°
+/// elevation and turbidity 4 the sun gives 4× the sky's horizontal illuminance;
+/// other elevations and turbidities follow the atmosphere's transmittance.
+pub(crate) fn sun_radiance(params: &SkyParams) -> [f32; 3] {
+    if !params.sun || params.night || params.zenith_degrees >= 90. {
+        return [0.; 3];
+    }
+    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let scale = *SCALE.get_or_init(|| {
+        let reference = SkyParams {
+            zenith_degrees: 45.,
+            turbidity: 4.,
+            ..SkyParams::default()
+        };
+        let t = sun_transmittance(45., 4.);
+        let luminance = 0.2126 * t[0] + 0.7152 * t[1] + 0.0722 * t[2];
+        4. * sky_illuminance(&reference)
+            / (luminance * f64::from(SUN_SOLID_ANGLE) * std::f64::consts::FRAC_1_SQRT_2)
+    });
+    sun_transmittance(params.zenith_degrees, params.turbidity).map(|t| (scale * t) as f32)
+}
+
+/// Horizontal illuminance (luminance-weighted irradiance) from the atmosphere alone.
+pub(crate) fn sky_illuminance(params: &SkyParams) -> f64 {
+    let zenith = Angle::degrees(params.zenith_degrees.min(90.)).as_radians();
+    let azimuth = Angle::degrees(params.azimuth_degrees).as_radians();
+    let sun = [
+        zenith.sin() * azimuth.cos(),
+        zenith.cos(),
+        zenith.sin() * azimuth.sin(),
+    ];
+    let state = hw_skymodel::rgb::SkyState::new(&hw_skymodel::rgb::SkyParams {
+        elevation: FRAC_PI_2 - zenith,
+        turbidity: params.turbidity,
+        albedo: params.albedo,
+    })
+    .expect("valid sky parameters");
+    let (sky, radiances) = state.raw();
+    // Equal-area cells: y uniform in (0, 1], φ uniform.
+    let (rows, columns) = (128, 128);
+    let cell = std::f64::consts::TAU / f64::from(rows * columns);
+    let mut sum = 0.;
+    for row in 0..rows {
+        let y = (f64::from(row) + 0.5) / f64::from(rows);
+        for column in 0..columns {
+            let phi = std::f64::consts::TAU * (f64::from(column) + 0.5) / f64::from(columns);
+            let r = (1. - y * y).sqrt();
+            let direction = [r * phi.cos(), y, r * phi.sin()];
+            let rgb = atmosphere_rgb(&sky, &radiances, direction, sun);
+            sum += (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) * y * cell;
+        }
+    }
+    sum
+}
+
+/// The analytic sky (same formula as WGSL `atmosphereRadiance`, mirrored below the horizon).
+fn atmosphere_rgb(
+    params: &[f32; 27],
+    radiances: &[f32; 3],
+    direction: [f64; 3],
+    sun: [f32; 3],
+) -> [f64; 3] {
+    let y = direction[1];
+    let cg = (direction[0] * f64::from(sun[0])
+        + y * f64::from(sun[1])
+        + direction[2] * f64::from(sun[2]))
+    .clamp(-1.0, 1.0);
+    let gamma = cg.acos();
+    std::array::from_fn(|channel| {
+        let p: [f64; 9] = std::array::from_fn(|i| f64::from(params[channel * 9 + i]));
+        (f64::from(radiances[channel])
+            * (1.0 + p[0] * (p[1] / (y.abs() + 0.01)).exp())
+            * (p[2]
+                + p[3] * (p[4] * gamma).exp()
+                + p[5] * cg * cg
+                + p[6] * (1.0 + cg * cg) / (1.0 + p[8] * p[8] - 2.0 * p[8] * cg).powf(1.5)
+                + p[7] * y.abs().sqrt()))
+        .max(0.0)
+    })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2507,7 +2625,8 @@ struct GpuSkyState {
     params: [f32; 27],          // 0 byte offset, 108 byte size
     radiances: [f32; 3],        // 108 byte offset, 12 byte size
     _padding: [u32; 2],         // 120 byte offset, 8 byte size
-    sun_direction: [f32; 4],    // 128 byte offset, 16 byte size
+    sun_direction: [f32; 4],    // 128 byte offset; w = cos(sun angular radius)
+    sun_radiance: [f32; 4],     // 144 byte offset; rgb (0 = no sun), w = solid angle
     sampling: [[f32; 2]; 2048], // CDF and solid-angle PDF, 64x32 equal-area cells
 }
 
@@ -2519,23 +2638,12 @@ fn sky_sampling_table(params: &[f32; 27], radiances: &[f32; 3], sun: [f32; 4]) -
         let y = 1.0 - 2.0 * ((i / 64) as f64 + 0.5) / 32.0;
         let phi = std::f64::consts::TAU * ((i % 64) as f64 + 0.5) / 64.0;
         let r = (1.0 - y * y).sqrt();
-        let cg = (r * phi.cos() * f64::from(sun[0])
-            + y * f64::from(sun[1])
-            + r * phi.sin() * f64::from(sun[2]))
-        .clamp(-1.0, 1.0);
-        let gamma = cg.acos();
-        let mut rgb = [0.0; 3];
-        for channel in 0..3 {
-            let p: [f64; 9] = std::array::from_fn(|i| f64::from(params[channel * 9 + i]));
-            rgb[channel] = (f64::from(radiances[channel])
-                * (1.0 + p[0] * (p[1] / (y.abs() + 0.01)).exp())
-                * (p[2]
-                    + p[3] * (p[4] * gamma).exp()
-                    + p[5] * cg * cg
-                    + p[6] * (1.0 + cg * cg) / (1.0 + p[8] * p[8] - 2.0 * p[8] * cg).powf(1.5)
-                    + p[7] * y.abs().sqrt()))
-            .max(0.0);
-        }
+        let rgb = atmosphere_rgb(
+            params,
+            radiances,
+            [r * phi.cos(), y, r * phi.sin()],
+            [sun[0], sun[1], sun[2]],
+        );
         *weight = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
     }
     let total: f64 = weights.iter().sum();

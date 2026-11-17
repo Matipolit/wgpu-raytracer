@@ -667,12 +667,19 @@ fn scene_exposure(scene: &Scene) -> f32 {
         2.
     }
 }
+/// Mesh scenes: sun at 45° (`--no-sun`: the overcast-looking sky alone, `--night`:
+/// moonlit atmosphere only); the sphere demo keeps its sunless sky.
 fn scene_sky(scene: &Scene) -> SkyParams {
     if scene.mesh.triangles.is_empty() {
-        SkyParams::default()
+        SkyParams {
+            sun: false,
+            ..SkyParams::default()
+        }
     } else {
         SkyParams {
             zenith_degrees: 45.,
+            sun: !has_flag("--no-sun"),
+            night: has_flag("--night"),
             ..SkyParams::default()
         }
     }
