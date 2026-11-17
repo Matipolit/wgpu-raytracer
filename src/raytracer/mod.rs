@@ -619,6 +619,10 @@ impl Raytracer {
                 f64::from(!std::env::args().any(|a| a == "--no-russian-roulette")),
             ),
             (
+                "SUN",
+                f64::from(render_params.sky.sun && !render_params.sky.night),
+            ),
+            (
                 "SKY_IMPORTANCE",
                 f64::from(std::env::args().any(|a| a == "--sky-importance")),
             ),

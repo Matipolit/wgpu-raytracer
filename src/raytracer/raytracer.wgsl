@@ -76,6 +76,8 @@ override TRACE_HEIGHT: u32 = 8u;
 // Opt-in unbiased path termination, retaining the existing hard bounce limit.
 override RUSSIAN_ROULETTE: bool = true;
 override SKY_IMPORTANCE: bool = false;
+// Mesh surfaces sample the sun disk directly (shadow ray), MIS with BSDF hits.
+override SUN: bool = false;
 override GGX_VNDF: bool = false;
 override GGX_BOUNDED:bool=false;
 
@@ -417,6 +419,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
     var color = vec3(0f);
     var throughput = vec3(1f);
     var skyMisWeight = 1.;
+    var sunMisWeight = 1.;
     if OPACITY_APPROX {pathDiffuse=false;}
     var packedDirection=0u;var packedValid=false;
 
@@ -439,7 +442,20 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
             if TRACE_MESHES && hit.sphereIdx == 0xffffffffu {
                 let m = meshMaterialOffset(hit.materialIdx);
                 color += throughput * meshVec3(m+4u) * meshTexture(m+32u,vec2(hit.u,hit.v),hit.uv1,true).rgb;
-                if SKIP_FINAL_SCATTER && bounce+1u==samplingParams.numBounces {
+                let last = bounce+1u==samplingParams.numBounces;
+                if SUN && skyState.sunRadiance.g > 0. {
+                    // Direct sun at every surface; MIS against the BSDF continuation,
+                    // which is never traced from the last surface.
+                    let surface = pbrSurface(ray,hit);
+                    let direction = sampleSun(rngState);
+                    let eval = evaluatePbr(surface,hit,direction);
+                    if any(eval.rgb > vec3(0.)) && !skyOccluded(Ray(hit.p+hit.geometricNormal*0.0001,direction)) {
+                        let pdf = 1./skyState.sunRadiance.w; // inside the cone by construction
+                        let weight = select(misWeight(pdf,eval.a),1.,last);
+                        color += throughput * skyState.sunRadiance.rgb * eval.rgb * weight/pdf;
+                    }
+                }
+                if SKIP_FINAL_SCATTER && last {
                     // All mesh BSDFs consume exactly three path random draws.
                     for(var unused=0u;unused<3u;unused+=1u){_ = rngNextInt(rngState);}
                     break;
@@ -452,12 +468,17 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                         let eval = evaluatePbr(surface,hit,direction);
                         let pdf = skyPdf(direction);
                         if any(eval.rgb > vec3(0.)) && !skyOccluded(Ray(hit.p+hit.geometricNormal*0.0001,direction)) {
-                            color += throughput * skyRadiance(direction) * eval.rgb * misWeight(pdf,eval.a)/pdf;
+                            color += throughput * atmosphereRadiance(direction) * eval.rgb * misWeight(pdf,eval.a)/pdf;
                         }
                     }
                     let sampled = samplePbr(surface,hit,rngState);
                     scatter = sampled.scatter;
                     skyMisWeight = misWeight(sampled.pdf,skyPdf(scatter.ray.direction));
+                    if SUN {sunMisWeight = misWeight(sampled.pdf,sunPdf(normalize(scatter.ray.direction)));}
+                } else if SUN {
+                    let sampled = samplePbr(pbrSurface(ray,hit),hit,rngState);
+                    scatter = sampled.scatter;
+                    sunMisWeight = misWeight(sampled.pdf,sunPdf(normalize(scatter.ray.direction)));
                 } else {scatter = scatterPbr(ray,hit,rngState);}
                 if GBUFFER && gbufferPending {
                     gbufferPending = false;
@@ -480,7 +501,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                     break;
                 }
 
-                skyMisWeight = 1.;packedValid=false;if OPACITY_APPROX {pathDiffuse=false;}
+                skyMisWeight = 1.;sunMisWeight = 1.;packedValid=false;if OPACITY_APPROX {pathDiffuse=false;}
                 var scatter = scatterRay(ray, hit, material, rngState);
                 ray = scatter.ray;
                 throughput *= scatter.throughput;
@@ -488,7 +509,8 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
             }
         } else {
             if GBUFFER && bounce == 0u { writeGbufferMiss(ray); }
-            color += throughput * skyRadiance(normalize(ray.direction)) * skyMisWeight;
+            let escaped = normalize(ray.direction);
+            color += throughput * (atmosphereRadiance(escaped) * skyMisWeight + sunRadiance(escaped) * sunMisWeight);
 
             break;
         }
@@ -990,6 +1012,16 @@ fn atmosphereRadiance(v: vec3<f32>) -> vec3<f32> {
     let theta=acos(clamp(v.y,-1.,1.));
     let gamma=acos(clamp(dot(v,skyState.sunDirection.xyz),-1.,1.));
     return vec3(radiance(theta,gamma,0u),radiance(theta,gamma,1u),radiance(theta,gamma,2u));
+}
+// Uniform direction in the sun's cone, and its solid-angle pdf.
+fn sampleSun(rng: ptr<function,u32>) -> vec3<f32> {
+    let width=skyState.sunRadiance.w/(2.*PI); // 1 - cos(angular radius)
+    let z=1.-rngNextFloat(rng)*width;let phi=2.*PI*rngNextFloat(rng);
+    let radial=sqrt(max(0.,1.-z*z));
+    return pixarOnb(skyState.sunDirection.xyz)*vec3(radial*cos(phi),radial*sin(phi),z);
+}
+fn sunPdf(v: vec3<f32>) -> f32 {
+    return select(0.,1./skyState.sunRadiance.w,dot(v,skyState.sunDirection.xyz)>=skyState.sunDirection.w);
 }
 fn sunRadiance(v: vec3<f32>) -> vec3<f32> {
     return select(vec3(0.),skyState.sunRadiance.rgb,dot(v,skyState.sunDirection.xyz)>=skyState.sunDirection.w);

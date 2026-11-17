@@ -130,15 +130,32 @@ fn csSkyEnergy(@builtin(global_invocation_id) id:vec3<u32>) {
         let old=scatterPbr(ray,hit,&oldRng);
         let sampled=samplePbr(surface,hit,&rng);
         error=max(error,length(old.throughput-sampled.scatter.throughput));
-        let sky=skyRadiance(sampled.scatter.ray.direction);
+        let sky=atmosphereRadiance(sampled.scatter.ray.direction);
         base+=old.throughput*sky;
         combined+=sampled.scatter.throughput*sky*misWeight(sampled.pdf,skyPdf(sampled.scatter.ray.direction));
         let d=sampleSky(&rng);let ev=evaluatePbr(surface,hit,d);let pdf=skyPdf(d);
-        combined+=ev.rgb*skyRadiance(d)*misWeight(pdf,ev.a)/pdf;
+        combined+=ev.rgb*atmosphereRadiance(d)*misWeight(pdf,ev.a)/pdf;
     }
     queries[id.x].hit=vec4(base/256.,0.);
     queries[id.x].brute=vec4(combined/256.,0.);
     queries[id.x].normal.x=error;
+}
+@compute @workgroup_size(64)
+fn csSunEnergy(@builtin(global_invocation_id) id:vec3<u32>) {
+    if id.x>=arrayLength(&queries) {return;}
+    var rng=jenkinsHash(id.x+517u);var direct=vec3(0.);var combined=vec3(0.);
+    var hit=Intersection();hit.n=vec3(0.,1.,0.);hit.geometricNormal=hit.n;
+    let ray=Ray(vec3(0.),normalize(vec3(0.3,-1.,0.1)));let surface=pbrSurface(ray,hit);
+    for(var i=0u;i<256u;i+=1u) {
+        // Cone samples are inside the cone by construction: constant pdf and radiance.
+        let d=sampleSun(&rng);let ev=evaluatePbr(surface,hit,d);let pdf=1./skyState.sunRadiance.w;
+        direct+=ev.rgb*skyState.sunRadiance.rgb/pdf;
+        combined+=ev.rgb*skyState.sunRadiance.rgb*misWeight(pdf,ev.a)/pdf;
+        let sampled=samplePbr(surface,hit,&rng);let b=sampled.scatter.ray.direction;
+        combined+=sampled.scatter.throughput*sunRadiance(b)*misWeight(sampled.pdf,sunPdf(b));
+    }
+    queries[id.x].hit=vec4(direct/256.,0.);
+    queries[id.x].brute=vec4(combined/256.,0.);
 }
 @compute @workgroup_size(64)
 fn csSky(@builtin(global_invocation_id) id:vec3<u32>) {
@@ -207,13 +224,22 @@ fn run_queries(mesh: Mesh, queries: &[Query], entry: &str) -> Vec<Query> {
     )
 }
 fn run_scene_queries(scene: Scene, queries: &[Query], entry: &str) -> Vec<Query> {
+    run_scene_queries_with(scene, queries, entry, &params())
+}
+
+fn run_scene_queries_with(
+    scene: Scene,
+    queries: &[Query],
+    entry: &str,
+    render_params: &crate::raytracer::RenderParams,
+) -> Vec<Query> {
     let (device, queue) = gpu();
     let tracer = Raytracer::new(
         &device,
         &queue,
-        &config(params().viewport_size),
+        &config(render_params.viewport_size),
         &scene,
-        &params(),
+        render_params,
     )
     .unwrap();
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -666,6 +692,31 @@ fn sky_mis_preserves_unoccluded_pbr_energy_and_continuation_weights() {
         );
     }
     assert!(results.iter().all(|q| q.normal[0] < 1e-4));
+}
+
+#[test]
+#[ignore = "requires a GPU"]
+fn sun_nee_and_bsdf_hits_sum_to_the_direct_sun_integral() {
+    let mut render_params = params();
+    render_params.sky = crate::raytracer::SkyParams {
+        zenith_degrees: 30.,
+        ..crate::raytracer::SkyParams::default()
+    };
+    let queries = vec![ray([0.; 3], [0.; 3]); 1024];
+    let scene = Scene {
+        mesh: fixture(),
+        ..Default::default()
+    };
+    let results = run_scene_queries_with(scene, &queries, "csSunEnergy", &render_params);
+    for channel in 0..3 {
+        let direct: f64 = results.iter().map(|q| f64::from(q.hit[channel])).sum();
+        let combined: f64 = results.iter().map(|q| f64::from(q.brute[channel])).sum();
+        assert!(direct > 0., "no direct sun");
+        assert!(
+            (combined / direct - 1.).abs() < 0.03,
+            "sun MIS changed direct energy: {combined} vs {direct}"
+        );
+    }
 }
 
 #[test]

@@ -94,3 +94,27 @@ metrics above remain historical; their JSON is archived in the results directory
 |---|---:|---|
 | 1 | -3.1% | +0.100 dB / +0.170 dB |
 | 19 | +11.2% | -0.387 dB / -0.532 dB |
+
+# Sun disk (default since 2026-11-17)
+
+The analytic sky now has a sun disk (angular radius 0.2666°, `--no-sun` turns it off,
+`--night` dims the atmosphere to moonlight and removes it). Its colour follows the
+atmosphere's direct-beam transmittance (Rayleigh + turbidity-dependent aerosol optical
+depth, Kasten–Young air mass); its brightness is scaled so that at 45° elevation and
+turbidity 4 it gives 4× the sky's horizontal illuminance.
+
+Mesh PBR surfaces sample the disk at every bounce (uniform cone, one shadow ray) and
+combine it with BSDF hits on the disk by the power heuristic; the last surface's sample
+has weight 1 because no continuation is traced from it. Sky importance sampling, when
+enabled, uses the atmosphere alone. A GPU test checks that the light-sampled and
+BSDF-sampled parts add up to the direct sun integral.
+
+Cost on Iris Xe, `--fastest`, 640×400, median GPU frame time, two interleaved runs:
+
+| Scene | `--no-sun` | sun | `--night` |
+|---|---:|---:|---:|
+| Sponza atrium | 17.9 ms | 24.8 ms (+38%) | 18.5 ms |
+| Bistro street | 28.0 ms | 38.7 ms (+38%) | 28.0 ms |
+
+Skipping the shadow ray at the last bounce saved only about 1%, so every bounce samples
+the sun.
