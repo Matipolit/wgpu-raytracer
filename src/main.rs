@@ -240,6 +240,9 @@ impl AppState {
                         v.parse().expect("--max-samples must be a positive integer")
                     }),
                 denoising_enabled: !has_flag("--no-denoise"),
+                // Real-time frames (a temporal denoiser) reuse lamp samples (ReSTIR).
+                restir: (has_flag("--temporal-model") || has_flag("--restir"))
+                    && !has_flag("--no-restir"),
                 ..Default::default()
             },
             viewport_size: (size.width.max(1), size.height.max(1)),

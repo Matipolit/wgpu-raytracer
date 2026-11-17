@@ -66,6 +66,7 @@ async fn render() {
         viewport_size: (width, height),
     };
     params.sampling.denoising_enabled = !std::env::args().any(|a| a == "--no-denoise");
+    params.sampling.restir = crate::has_flag("--restir");
     if let Some((position, direction, vfov)) = crate::camera_argument() {
         params.camera.eye_pos = position;
         params.camera.eye_dir = direction;

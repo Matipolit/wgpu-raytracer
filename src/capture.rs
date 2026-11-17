@@ -352,8 +352,10 @@ async fn capture() {
                         &movers.iter().map(Mover::transform).collect::<Vec<_>>(),
                     );
                 }
-                // Noisy 1-spp frame and its guides.
+                // Noisy 1-spp frame and its guides (`--restir`: as the real-time renderer
+                // traces it, with lamp reservoirs carried over from the previous frame).
                 params.sampling.num_samples_per_pixel = 1;
+                params.sampling.restir = crate::has_flag("--restir");
                 tracer.set_render_params(&device, &queue, &params).unwrap();
                 render(&device, &queue, &mut tracer, 1);
                 let noisy = tracer.read_radiance(&device, &queue);
@@ -378,6 +380,7 @@ async fn capture() {
                         .find(|k| reference_spp % k == 0)
                         .unwrap();
                     params.sampling.num_samples_per_pixel = per_dispatch;
+                    params.sampling.restir = false;
                     tracer.set_render_params(&device, &queue, &params).unwrap();
                     tracer.reset_accumulation();
                     render(&device, &queue, &mut tracer, reference_spp / per_dispatch);
@@ -408,6 +411,7 @@ async fn capture() {
                 // The same instant at this scale: 1-spp input and guides.
                 low.params.camera = params.camera;
                 low.params.sampling.num_samples_per_pixel = 1;
+                low.params.sampling.restir = crate::has_flag("--restir");
                 low.tracer
                     .set_render_params(&device, &queue, &low.params)
                     .unwrap();

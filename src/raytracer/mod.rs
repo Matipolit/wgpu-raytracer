@@ -150,6 +150,8 @@ pub struct Raytracer {
     latest_render_params: RenderParams,
     render_progress: RenderProgress,
     frame_number: u32,
+    /// ReSTIR frames rendered (the reservoir ping-pong; see `SamplingParams::restir`).
+    restir_frames: u32,
 }
 
 impl Raytracer {
@@ -624,6 +626,7 @@ impl Raytracer {
             ),
             ("LAMPS", f64::from(scene.mesh.lamp_count() > 0)),
             ("DENOISER_INPUT", f64::from(temporal_source.is_some())),
+            ("RESTIR", f64::from(scene.mesh.lamp_count() > 0)),
             (
                 "LAMP_CANDIDATES",
                 std::env::var("RT_LAMP_CANDIDATES").map_or(8., |v| v.parse().unwrap()),
@@ -975,6 +978,7 @@ impl Raytracer {
             latest_render_params: *render_params,
             render_progress,
             frame_number,
+            restir_frames: 0,
         })
     }
 
@@ -1624,9 +1628,13 @@ impl Raytracer {
             bytemuck::bytes_of(&self.last_camera),
         );
         self.last_camera = camera;
-        let gpu_sampling_params = self
+        let mut gpu_sampling_params = self
             .render_progress
             .next_frame(&self.latest_render_params.sampling);
+        if self.latest_render_params.sampling.restir {
+            self.restir_frames = self.restir_frames.wrapping_add(1).max(1);
+            gpu_sampling_params.restir = self.restir_frames;
+        }
         {
             queue.write_buffer(
                 &self.sampling_parameter_buffer.handle(),
@@ -2386,6 +2394,9 @@ pub struct SamplingParams {
     pub denoising_enabled: bool,
     pub denoising_radius: u32, // 0 means effectively disabled, 1 for 3x3, 2 for 5x5 etc.
     pub denoising_sigma_color: f32,
+    /// Real-time frames: reuse lamp samples across pixels and frames (ReSTIR DI at the
+    /// primary surface). Biased, so off for progressive accumulation and references.
+    pub restir: bool,
 }
 
 impl Default for SamplingParams {
@@ -2397,6 +2408,7 @@ impl Default for SamplingParams {
             denoising_enabled: true,
             denoising_radius: 1, // 3x3 kernel
             denoising_sigma_color: 0.15,
+            restir: false,
         }
     }
 }
@@ -2434,6 +2446,8 @@ impl RenderProgress {
                 denoising_radius: sampling_params.denoising_radius,
                 denoising_sigma_color: sampling_params.denoising_sigma_color,
                 trace_origin: 0,
+                restir: 0,
+                _pad: [0; 3],
             }
         }
         // Progressive render
@@ -2448,6 +2462,8 @@ impl RenderProgress {
                 denoising_radius: sampling_params.denoising_radius,
                 denoising_sigma_color: sampling_params.denoising_sigma_color,
                 trace_origin: 0,
+                restir: 0,
+                _pad: [0; 3],
             }
         }
         // Completed render
@@ -2461,6 +2477,8 @@ impl RenderProgress {
                 denoising_radius: sampling_params.denoising_radius,
                 denoising_sigma_color: sampling_params.denoising_sigma_color,
                 trace_origin: 0,
+                restir: 0,
+                _pad: [0; 3],
             }
         }
     }
@@ -2695,6 +2713,9 @@ struct GpuSamplingParams {
     denoising_sigma_color: f32,
     /// Origin of the traced region, x | y << 16 (see `Raytracer::set_trace_region`).
     trace_origin: u32,
+    /// 0: no ReSTIR; else the ReSTIR frame count (its low bit picks the reservoir copy).
+    restir: u32,
+    _pad: [u32; 3],
 }
 
 #[repr(C)]

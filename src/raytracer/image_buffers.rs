@@ -41,6 +41,7 @@ impl ImageBuffers {
                 frame.layout(trace_stages),
                 storage(1, trace_stages, false),
                 storage(7, trace_stages, false),
+                storage(8, trace_stages, false),
             ],
         });
         let filter_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -134,6 +135,13 @@ impl ImageBuffers {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        // ReSTIR reservoirs: two frames x 24 bytes per pixel (raytracer.wgsl `reservoirs`).
+        let reservoirs = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ReSTIR reservoirs"),
+            size: bytes / 12 * 48,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         fn binding(buffer: &wgpu::Buffer, binding: u32) -> wgpu::BindGroupEntry<'_> {
             wgpu::BindGroupEntry {
                 binding,
@@ -147,6 +155,7 @@ impl ImageBuffers {
                 frame.binding(),
                 accumulation.binding(),
                 binding(&gbuffer, 7),
+                binding(&reservoirs, 8),
             ],
         });
         let filter = device.create_bind_group(&wgpu::BindGroupDescriptor {
