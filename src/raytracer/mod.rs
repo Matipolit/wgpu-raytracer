@@ -154,6 +154,8 @@ pub struct Raytracer {
     frame_number: u32,
     /// ReSTIR frames rendered (the reservoir ping-pong; see `SamplingParams::restir`).
     restir_frames: u32,
+    /// GPU time of the most recently measured trace pass (ms; 0 before the first).
+    pub last_trace_ms: f64,
 }
 
 impl Raytracer {
@@ -1007,6 +1009,7 @@ impl Raytracer {
             render_progress,
             frame_number,
             restir_frames: 0,
+            last_trace_ms: 0.,
         })
     }
 
@@ -1262,6 +1265,7 @@ impl Raytracer {
             .unwrap_or_default()
         {
             self.tuner.record(variant, ms, switched);
+            self.last_trace_ms = ms;
         }
         let variant = if params.num_samples_per_pixel != 0 {
             self.tuner.next()

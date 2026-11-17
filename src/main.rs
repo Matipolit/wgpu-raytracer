@@ -142,18 +142,6 @@ impl ApplicationHandler for App {
         if window_id != state.window.id() {
             return;
         }
-        let event = if matches!(event, WindowEvent::RedrawRequested)
-            && self
-                .smoke_frames_remaining
-                .as_mut()
-                .is_some_and(|remaining| {
-                    *remaining -= 1;
-                    *remaining == 0
-                }) {
-            WindowEvent::CloseRequested
-        } else {
-            event
-        };
         let response = state.egui_state.on_window_event(&state.window, &event);
         // Always deliver releases, even when a widget takes focus mid-gesture.
         let release = matches!(&event,
@@ -179,14 +167,36 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size),
             // Winit sends Resized with the physical dimensions after a scale change.
-            WindowEvent::RedrawRequested => state.render(event_loop),
+            // Frames are rendered from about_to_wait; a redraw request (expose) only
+            // matters before the first one.
+            WindowEvent::RedrawRequested if state.frames == 0 => state.render(event_loop),
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
-        if let Some(state) = &self.state {
+    /// Render continuously instead of on redraw requests: on Wayland and gamescope those
+    /// arrive once per displayed frame, after the previous frame is on screen, so the
+    /// GPU would idle between frames. The swapchain (two frames in flight) paces us.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        if state.window.is_minimized() == Some(true) {
             state.window.request_redraw();
+            return;
+        }
+        state.render(event_loop);
+        if self
+            .smoke_frames_remaining
+            .as_mut()
+            .is_some_and(|remaining| {
+                *remaining -= 1;
+                *remaining == 0
+            })
+        {
+            // Exercise the normal CloseRequested path in native lifecycle tests.
+            let id = state.window.id();
+            self.window_event(event_loop, id, WindowEvent::CloseRequested);
         }
     }
 
@@ -216,7 +226,47 @@ struct AppState {
     last_time: Instant,
     fps_counter: FpsCounter,
     gamepad: gamepad::Gamepad,
+    frame_log: FrameLog,
+    /// Frames rendered so far.
+    frames: u64,
     _display_handle: OwnedDisplayHandle,
+}
+
+/// `RT_FRAME_LOG=1`: every 2 s, where the frame time goes (presentation waits vs
+/// GPU tracing vs the rest), to find idle GPU time.
+#[derive(Default)]
+struct FrameLog {
+    frames: u32,
+    interval: f64,
+    acquire: f64,
+    present: f64,
+    /// Whole `render` calls (CPU side, including the waits above).
+    render: f64,
+    trace_ms: f64,
+}
+
+impl FrameLog {
+    fn frame(&mut self, interval: f64, trace_ms: f64) {
+        if std::env::var_os("RT_FRAME_LOG").is_none() {
+            return;
+        }
+        self.frames += 1;
+        self.interval += interval;
+        self.trace_ms += trace_ms;
+        if self.interval >= 2. {
+            let n = f64::from(self.frames);
+            eprintln!(
+                "frames: {:.1} fps, {:.1} ms/frame; in render() {:.1} ms (acquire {:.1}, present {:.1}); GPU tracing {:.1} ms",
+                n / self.interval,
+                1e3 * self.interval / n,
+                1e3 * self.render / n,
+                1e3 * self.acquire / n,
+                1e3 * self.present / n,
+                self.trace_ms / n
+            );
+            *self = Self::default();
+        }
+    }
 }
 
 impl AppState {
@@ -279,6 +329,8 @@ impl AppState {
             last_time: Instant::now(),
             fps_counter: FpsCounter::new(),
             gamepad: gamepad::Gamepad::new(),
+            frame_log: FrameLog::default(),
+            frames: 0,
             _display_handle: display_handle,
         }
     }
@@ -309,7 +361,12 @@ impl AppState {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        let (frame, suboptimal) = match self.context.surface.get_current_texture() {
+        self.frames += 1;
+        let render_start = Instant::now();
+        let acquire_start = Instant::now();
+        let acquired = self.context.surface.get_current_texture();
+        self.frame_log.acquire += acquire_start.elapsed().as_secs_f64();
+        let (frame, suboptimal) = match acquired {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
             wgpu::CurrentSurfaceTexture::Outdated => {
@@ -335,6 +392,8 @@ impl AppState {
         let now = Instant::now();
         let dt = now - self.last_time;
         self.last_time = now;
+        self.frame_log
+            .frame(dt.as_secs_f64(), self.raytracer.last_trace_ms);
         self.fps_counter.update(dt.as_secs_f32());
         self.fly_camera_controller.after_events(
             self.render_params.viewport_size,
@@ -431,7 +490,10 @@ impl AppState {
         self.raytracer.after_submit(&self.context.device);
         self.gui.free_textures();
         self.window.pre_present_notify();
+        let present_start = Instant::now();
         self.context.queue.present(frame);
+        self.frame_log.present += present_start.elapsed().as_secs_f64();
+        self.frame_log.render += render_start.elapsed().as_secs_f64();
         if suboptimal {
             self.resize(self.window.inner_size());
         }
