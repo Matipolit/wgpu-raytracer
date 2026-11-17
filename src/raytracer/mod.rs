@@ -13,6 +13,7 @@ pub mod mesh;
 mod temporal;
 mod texture;
 mod tuner;
+mod upscale;
 mod visibility;
 mod wavefront;
 
@@ -24,6 +25,21 @@ use std::f32::consts::*;
 pub(crate) const TRACE_WORKGROUP_SIZE: [u32; 2] = [8, 8];
 
 /// Explicit tuning override for reproducible GPU experiments; cached per process.
+/// Sub-pixel jitter of frame `frame` (Halton 2, 3), identical to raytracer.wgsl
+/// `frameJitter`: shared by the tracer (SHARED_JITTER), the visibility raster and the upscaler.
+pub(crate) fn frame_jitter(frame: u32) -> [f32; 2] {
+    std::array::from_fn(|axis| {
+        let base = 2 + axis as u32;
+        let (mut i, mut f, mut r) = (frame % 1024 + 1, 1f32, 0f32);
+        while i > 0 {
+            f /= base as f32;
+            r += f * (i % base) as f32;
+            i /= base;
+        }
+        r
+    })
+}
+
 pub(crate) fn trace_workgroup_size() -> [u32; 2] {
     static SIZE: std::sync::OnceLock<[u32; 2]> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
@@ -77,6 +93,11 @@ pub struct Raytracer {
     wavefront: Option<wavefront::Wavefront>,
     temporal: Option<temporal::TemporalDenoiser>,
     visibility: Option<visibility::Visibility>,
+    /// Temporal upscaler (`--render-scale` below 1) and the output resolution.
+    upscaler: Option<upscale::Upscaler>,
+    output_size: (u32, u32),
+    /// Frame index (frameData.z) of the last traced frame.
+    last_frame_index: u32,
     visibility_rastered: bool,
     /// Trace only this (x, y, width, height) rectangle; None traces the whole frame.
     trace_region: Option<(u32, u32, u32, u32)>,
@@ -101,6 +122,15 @@ impl Raytracer {
             Ok(_) => {}
             Err(err) => return Err(err),
         }
+        // Upscaling: everything up to the upscaler runs at render resolution; the caller's
+        // viewport is the output resolution.
+        let output_size = render_params.viewport_size;
+        let scaled_params = RenderParams {
+            viewport_size: upscale::render_size(output_size),
+            ..*render_params
+        };
+        let render_params = &scaled_params;
+        let upscaling = upscale::render_scale() < 1.;
         let variants = trace_variants(device, scene);
         // The visibility raster: G-buffer experiments, or a variant starting paths from it.
         let vis_on = device.features().contains(wgpu::Features::PRIMITIVE_INDEX)
@@ -551,6 +581,10 @@ impl Raytracer {
                 f64::from(crate::has_flag("--center-jitter")),
             ),
             (
+                "SHARED_JITTER",
+                f64::from(upscaling || crate::has_flag("--upscale-capture")),
+            ),
+            (
                 "CONES_PRIMARY_ONLY",
                 f64::from(crate::has_flag("--cones-primary-only")),
             ),
@@ -788,6 +822,18 @@ impl Raytracer {
             "automatic exposure compute",
             &[],
         );
+        let upscaler = upscaling.then(|| {
+            upscale::Upscaler::new(
+                device,
+                images.filtered.handle(),
+                &images.gbuffer,
+                &images.display_layout,
+                images.exposure.handle(),
+                output_size,
+                render_params.viewport_size,
+                temporal_source.is_some(),
+            )
+        });
         let display_pipeline = create_pipeline(
             &display_pipeline_layout,
             "fsMain",
@@ -845,6 +891,9 @@ impl Raytracer {
             wavefront,
             temporal,
             visibility,
+            upscaler,
+            output_size,
+            last_frame_index: 0,
             visibility_rastered: false,
             trace_region: None,
             skip_filter: false,
@@ -1049,6 +1098,12 @@ impl Raytracer {
         times[times.len() / 2]
     }
 
+    /// Sub-pixel jitter of the last traced frame when all pixels share one (upscaling,
+    /// `--upscale-capture`), see `frame_jitter`.
+    pub fn last_frame_jitter(&self) -> [f32; 2] {
+        frame_jitter(self.last_frame_index)
+    }
+
     /// Call after submitting a frame: starts reading back its timing for the auto-tuner.
     pub fn after_submit(&mut self, device: &wgpu::Device) {
         if let Some(timer) = &mut self.timer {
@@ -1064,9 +1119,12 @@ impl Raytracer {
 
     /// Dispatch tracing, then filtering; presentation only reads the completed result.
     pub fn accumulate_frame(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
-        if let Some(temporal) = &mut self.temporal {
-            // Real-time mode: one fresh sample per frame; history lives in the denoiser.
+        if self.temporal.is_some() || self.upscaler.is_some() {
+            // Real-time mode: one fresh sample per frame; history lives in the denoiser
+            // and/or the upscaler.
             self.render_progress.reset();
+        }
+        if let Some(temporal) = &mut self.temporal {
             temporal.prepare(queue);
         }
         if !self.filter_dirty
@@ -1078,6 +1136,9 @@ impl Raytracer {
             self.frame_number = self.frame_number.wrapping_add(1);
             return;
         }
+        // The frame index the tracer sees (frameData.z); prepare_frame advances it.
+        let frame_index = self.frame_number;
+        self.last_frame_index = frame_index;
         let mut params = self.prepare_frame(queue);
         if let Some((x, y, _, _)) = self.trace_region {
             params.trace_origin = x | (y << 16);
@@ -1120,10 +1181,14 @@ impl Raytracer {
             let once = std::env::var("RT_VIS_RASTER_ONCE").is_ok();
             if params.num_samples_per_pixel != 0 && (!once || !self.visibility_rastered) {
                 self.visibility_rastered = true;
+                let centred = crate::has_flag("--center-jitter") || once;
                 visibility.set_frame(
                     queue,
-                    self.frame_number,
-                    !crate::has_flag("--center-jitter") && !once,
+                    if centred {
+                        [0.5, 0.5]
+                    } else {
+                        frame_jitter(frame_index)
+                    },
                 );
                 let planes = GpuCamera::new(
                     &self.latest_render_params.camera,
@@ -1207,6 +1272,17 @@ impl Raytracer {
                 pass.dispatch_workgroups(1, 1, 1);
             }
             self.filter_dirty = false;
+        }
+        if let Some(upscaler) = &mut self.upscaler {
+            if params.num_samples_per_pixel != 0 {
+                upscaler.record(
+                    queue,
+                    encoder,
+                    frame_jitter(frame_index),
+                    frame_index,
+                    self.latest_render_params.exposure.to_bits(),
+                );
+            }
         }
     }
 
@@ -1483,7 +1559,11 @@ impl Raytracer {
     pub fn render_frame(&self, render_pass: &mut wgpu::RenderPass<'_>) {
         render_pass.set_pipeline(&self.display_pipeline);
         render_pass.set_bind_group(0, &self.vertex_uniform_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.images.display, &[]);
+        let display = self
+            .upscaler
+            .as_ref()
+            .map_or(&self.images.display, |u| &u.display);
+        render_pass.set_bind_group(1, display, &[]);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.draw(0..VERTICES.len() as u32, 0..1);
     }
@@ -1494,7 +1574,14 @@ impl Raytracer {
         queue: &wgpu::Queue,
         render_params: &RenderParams,
     ) -> Result<(), RenderParamsValidationError> {
-        if *render_params == self.latest_render_params {
+        // The caller's viewport is the output resolution (see Raytracer::new).
+        let output_size = render_params.viewport_size;
+        let scaled_params = RenderParams {
+            viewport_size: upscale::render_size(output_size),
+            ..*render_params
+        };
+        let render_params = &scaled_params;
+        if *render_params == self.latest_render_params && output_size == self.output_size {
             return Ok(());
         }
 
@@ -1541,6 +1628,22 @@ impl Raytracer {
                 visibility.resize(device, render_params.viewport_size);
             }
         }
+        if let Some(upscaler) = &mut self.upscaler {
+            if render_params.viewport_size != self.latest_render_params.viewport_size
+                || output_size != self.output_size
+            {
+                upscaler.resize(
+                    device,
+                    self.images.filtered.handle(),
+                    &self.images.gbuffer,
+                    &self.images.display_layout,
+                    self.images.exposure.handle(),
+                    output_size,
+                    render_params.viewport_size,
+                );
+            }
+        }
+        self.output_size = output_size;
         if let Some(temporal) = &mut self.temporal {
             if render_params.viewport_size != self.latest_render_params.viewport_size {
                 temporal.resize(
@@ -1773,6 +1876,7 @@ pub fn gbuffer_enabled() -> bool {
     crate::has_flag("--gbuffer")
         || crate::has_flag("--capture")
         || crate::has_flag("--temporal-model")
+        || upscale::render_scale() < 1.
 }
 
 fn read_buffer(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Buffer) -> Vec<f32> {

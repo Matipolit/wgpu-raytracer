@@ -132,6 +132,25 @@ override CENTER_JITTER:bool=false;
 // (visibility.wgsl) instead of tracing the primary ray; all pixels share the raster's
 // per-frame sub-pixel jitter.
 override VIS_PRIMARY:bool=false;
+// Upscaling (`--render-scale`): every pixel uses this frame's sub-pixel jitter, so the
+// upscaler knows where each sample lies (frameJitter, identical to Rust's frame_jitter).
+override SHARED_JITTER:bool=false;
+fn frameJitter(frame: u32) -> vec2<f32> {
+    var result = vec2(0.);
+    for (var axis = 0u; axis < 2u; axis += 1u) {
+        let base = 2u + axis;
+        var i = frame % 1024u + 1u;
+        var f = 1.;
+        var r = 0.;
+        while i > 0u {
+            f /= f32(base);
+            r += f * f32(i % base);
+            i /= base;
+        }
+        result[axis] = r;
+    }
+    return result;
+}
 // Set for the primary ray: the next mesh query takes its candidate from the visibility
 // buffer instead of traversing (spheres and hit resolution stay shared).
 var<private> visibilityPending:bool;
@@ -363,6 +382,7 @@ fn samplePixel(x: u32, y: u32, rngState: ptr<function, u32>) -> vec3<f32> {
         }
         var jitter=vec2(rngNextFloat(rngState),rngNextFloat(rngState));
         if CENTER_JITTER {jitter=vec2(0.5);}
+        if SHARED_JITTER {jitter=frameJitter(frameData.z);}
         if VIS_PRIMARY {jitter=visibilityJitter();}
         if BLUE_NOISE_JITTER {
             let mask=unpack2x16unorm(meshData[meshData[14u]+(y%64u)*64u+(x%64u)]);

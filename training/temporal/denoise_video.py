@@ -52,6 +52,7 @@ def display(x, exposure):
     return (np.where(v <= 0.0031308, 12.92 * v, 1.055 * v ** (1 / 2.4) - 0.055) * 255 + 0.5).astype(np.uint8)
 
 
+pathlib.Path(a.out).parent.mkdir(parents=True, exist_ok=True)
 files = sorted(seq.glob("frame_*.f16"))
 history = prev = None
 log_lum = None

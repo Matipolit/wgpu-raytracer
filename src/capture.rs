@@ -74,6 +74,22 @@ async fn capture() {
     let (w, h) = size.split_once('x').expect("--size WxH");
     let (width, height): (u32, u32) = (w.parse().unwrap(), h.parse().unwrap());
     let crop: Option<u32> = crate::argument_value("--crop").map(|v| v.parse().expect("--crop N"));
+    // `--upscale-capture S1,S2,...`: also trace each frame's 1-spp input at each scale
+    // (render size round(size * S), shared per-frame jitter) against the same reference,
+    // for denoise + upscale training. Any scale in (0, 1); see low.json per sequence.
+    // `--low-only`: add the low-resolution inputs to an existing capture (same arguments
+    // and seed: cameras, spheres and crops are deterministic) without re-rendering the
+    // output-resolution files and their expensive references.
+    let low_only = crate::has_flag("--low-only");
+    let scales: Vec<f32> = crate::argument_value("--upscale-capture").map_or(Vec::new(), |v| {
+        v.split(',')
+            .map(|s| {
+                let s: f32 = s.trim().parse().expect("--upscale-capture S1,S2,...");
+                assert!(s > 0. && s < 1., "upscale capture scales must be in (0, 1)");
+                s
+            })
+            .collect()
+    });
     let (base_eye, base_dir, base_fov) =
         crate::camera_argument().expect("--capture needs --camera (the scene's base view)");
 
@@ -151,6 +167,33 @@ async fn capture() {
     let mut tracer = Raytracer::new(&device, &queue, &config, &scene, &params).unwrap();
     tracer.set_skip_filter(!crate::has_flag("--temporal-model"));
     let (out_w, out_h) = crop.map_or((width, height), |n| (n.min(width), n.min(height)));
+    // One low-resolution tracer per scale (same scene, camera and spheres; separate
+    // tracers keep each scale's previous camera for its motion vectors). A low crop
+    // covers the output crop: origin floor(x * s), size ceil(crop * s) + 1.
+    let mut lows: Vec<LowCapture> = scales
+        .iter()
+        .map(|&s| {
+            let mut low_params = params;
+            low_params.viewport_size = (
+                ((width as f32 * s).round() as u32).max(1),
+                ((height as f32 * s).round() as u32).max(1),
+            );
+            let (lw, lh) = low_params.viewport_size;
+            let (sx, sy) = (lw as f32 / width as f32, lh as f32 / height as f32);
+            let crop_w = ((out_w as f32 * sx).ceil() as u32 + 1).min(lw);
+            let crop_h = ((out_h as f32 * sy).ceil() as u32 + 1).min(lh);
+            let mut tracer = Raytracer::new(&device, &queue, &config, &scene, &low_params).unwrap();
+            tracer.set_skip_filter(true);
+            LowCapture {
+                params: low_params,
+                tracer,
+                scale: (sx, sy),
+                crop: (crop_w, crop_h),
+                origin: (0, 0),
+                jitters: Vec::new(),
+            }
+        })
+        .collect();
     let start = std::time::Instant::now();
 
     let up = glm::vec3(0., 1., 0.);
@@ -165,14 +208,30 @@ async fn capture() {
         } else {
             (0, 0)
         };
-        std::fs::write(
-            directory.join("crop.json"),
-            format!(
-                "{{\"x\":{},\"y\":{},\"frame_width\":{width},\"frame_height\":{height}}}",
-                origin.0, origin.1
-            ),
-        )
-        .unwrap();
+        for low in &mut lows {
+            let (lw, lh) = low.params.viewport_size;
+            let lx = ((origin.0 as f32 * low.scale.0).floor() as u32).min(lw - low.crop.0);
+            let ly = ((origin.1 as f32 * low.scale.1).floor() as u32).min(lh - low.crop.1);
+            low.origin = (lx, ly);
+            low.jitters.clear();
+            low.tracer
+                .set_trace_region((crop.is_some()).then_some((lx, ly, low.crop.0, low.crop.1)));
+        }
+        let crop_json = format!(
+            "{{\"x\":{},\"y\":{},\"frame_width\":{width},\"frame_height\":{height}}}",
+            origin.0, origin.1
+        );
+        if low_only {
+            let existing = std::fs::read_to_string(directory.join("crop.json"))
+                .expect("--low-only needs an existing capture");
+            assert_eq!(
+                existing.trim(),
+                crop_json,
+                "--low-only: arguments or seed differ from the existing capture"
+            );
+        } else {
+            std::fs::write(directory.join("crop.json"), crop_json).unwrap();
+        }
         // Camera start: near the base view, turned a little.
         let base_yaw = base_dir.z.atan2(base_dir.x);
         let base_pitch = base_dir.y.asin();
@@ -232,58 +291,96 @@ async fn capture() {
             params.camera.eye_pos = eye;
             params.camera.eye_dir = forward(yaw, pitch);
             params.camera.vfov = crate::raytracer::Angle::degrees(fov);
-            tracer.set_render_params(&device, &queue, &params).unwrap();
-            tracer.set_spheres(&queue, &spheres);
-            // Noisy 1-spp frame and its guides.
-            params.sampling.num_samples_per_pixel = 1;
-            tracer.set_render_params(&device, &queue, &params).unwrap();
-            render(&device, &queue, &mut tracer, 1);
-            let noisy = tracer.read_radiance(&device, &queue);
-            let guides = tracer.read_gbuffer(&device, &queue);
-            if crate::has_flag("--temporal-model") {
-                // Parity checks: the renderer's denoised frame, f32 rgb.
-                let denoised = tracer.read_filtered(&device, &queue);
+            if !low_only {
+                tracer.set_render_params(&device, &queue, &params).unwrap();
+                tracer.set_spheres(&queue, &spheres);
+                // Noisy 1-spp frame and its guides.
+                params.sampling.num_samples_per_pixel = 1;
+                tracer.set_render_params(&device, &queue, &params).unwrap();
+                render(&device, &queue, &mut tracer, 1);
+                let noisy = tracer.read_radiance(&device, &queue);
+                let guides = tracer.read_gbuffer(&device, &queue);
+                if crate::has_flag("--temporal-model") {
+                    // Parity checks: the renderer's denoised frame, f32 rgb.
+                    let denoised = tracer.read_filtered(&device, &queue);
+                    std::fs::write(
+                        directory.join(format!("frame_{frame:0digits$}.den.f32")),
+                        bytemuck::cast_slice(&denoised),
+                    )
+                    .unwrap();
+                }
+                // Reference: same instant, same camera, many samples.
+                let reference = if crate::has_flag("--no-reference") {
+                    vec![0.; noisy.len()]
+                } else {
+                    // Many samples per dispatch: one dispatch per sample would wait for
+                    // its slowest ray thousands of times per frame.
+                    let per_dispatch = [32, 16, 8, 4, 2, 1]
+                        .into_iter()
+                        .find(|k| reference_spp % k == 0)
+                        .unwrap();
+                    params.sampling.num_samples_per_pixel = per_dispatch;
+                    tracer.set_render_params(&device, &queue, &params).unwrap();
+                    tracer.reset_accumulation();
+                    render(&device, &queue, &mut tracer, reference_spp / per_dispatch);
+                    tracer.read_radiance(&device, &queue)
+                };
+                let pixels = (out_w * out_h) as usize;
+                let mut bytes = Vec::with_capacity(pixels * 18 * 2);
+                for q in 0..pixels {
+                    let p = ((origin.1 + q as u32 / out_w) * width + origin.0 + q as u32 % out_w)
+                        as usize;
+                    for v in noisy[p * 3..p * 3 + 3]
+                        .iter()
+                        .chain(&guides[p * 12..p * 12 + 12])
+                        .chain(&reference[p * 3..p * 3 + 3])
+                    {
+                        let v = if v.is_finite() {
+                            v.clamp(-65000., 65000.)
+                        } else {
+                            0.
+                        };
+                        bytes.extend(half::f16::from_f32(v).to_le_bytes());
+                    }
+                }
+                std::fs::write(directory.join(format!("frame_{frame:0digits$}.f16")), bytes)
+                    .unwrap();
+            }
+            for (index, low) in lows.iter_mut().enumerate() {
+                // The same instant at this scale: 1-spp input and guides.
+                low.params.camera = params.camera;
+                low.params.sampling.num_samples_per_pixel = 1;
+                low.tracer
+                    .set_render_params(&device, &queue, &low.params)
+                    .unwrap();
+                low.tracer.set_spheres(&queue, &spheres);
+                render(&device, &queue, &mut low.tracer, 1);
+                low.jitters.push(low.tracer.last_frame_jitter());
+                let noisy = low.tracer.read_radiance(&device, &queue);
+                let guides = low.tracer.read_gbuffer(&device, &queue);
+                let lw = low.params.viewport_size.0;
+                let (cw, ch) = low.crop;
+                let mut bytes = Vec::with_capacity((cw * ch) as usize * 15 * 2);
+                for q in 0..cw * ch {
+                    let p = ((low.origin.1 + q / cw) * lw + low.origin.0 + q % cw) as usize;
+                    for v in noisy[p * 3..p * 3 + 3]
+                        .iter()
+                        .chain(&guides[p * 12..p * 12 + 12])
+                    {
+                        let v = if v.is_finite() {
+                            v.clamp(-65000., 65000.)
+                        } else {
+                            0.
+                        };
+                        bytes.extend(half::f16::from_f32(v).to_le_bytes());
+                    }
+                }
                 std::fs::write(
-                    directory.join(format!("frame_{frame:0digits$}.den.f32")),
-                    bytemuck::cast_slice(&denoised),
+                    directory.join(format!("frame_{frame:0digits$}.low{index}.f16")),
+                    bytes,
                 )
                 .unwrap();
             }
-            // Reference: same instant, same camera, many samples.
-            let reference = if crate::has_flag("--no-reference") {
-                vec![0.; noisy.len()]
-            } else {
-                // Many samples per dispatch: one dispatch per sample would wait for
-                // its slowest ray thousands of times per frame.
-                let per_dispatch = [32, 16, 8, 4, 2, 1]
-                    .into_iter()
-                    .find(|k| reference_spp % k == 0)
-                    .unwrap();
-                params.sampling.num_samples_per_pixel = per_dispatch;
-                tracer.set_render_params(&device, &queue, &params).unwrap();
-                tracer.reset_accumulation();
-                render(&device, &queue, &mut tracer, reference_spp / per_dispatch);
-                tracer.read_radiance(&device, &queue)
-            };
-            let pixels = (out_w * out_h) as usize;
-            let mut bytes = Vec::with_capacity(pixels * 18 * 2);
-            for q in 0..pixels {
-                let p =
-                    ((origin.1 + q as u32 / out_w) * width + origin.0 + q as u32 % out_w) as usize;
-                for v in noisy[p * 3..p * 3 + 3]
-                    .iter()
-                    .chain(&guides[p * 12..p * 12 + 12])
-                    .chain(&reference[p * 3..p * 3 + 3])
-                {
-                    let v = if v.is_finite() {
-                        v.clamp(-65000., 65000.)
-                    } else {
-                        0.
-                    };
-                    bytes.extend(half::f16::from_f32(v).to_le_bytes());
-                }
-            }
-            std::fs::write(directory.join(format!("frame_{frame:0digits$}.f16")), bytes).unwrap();
             // Advance the camera and spheres for the next frame.
             eye += velocity;
             yaw += yaw_rate;
@@ -292,19 +389,77 @@ async fn capture() {
                 sphere.set_center(sphere.center() + v);
             }
         }
+        if !lows.is_empty() {
+            let entries: Vec<String> = lows
+                .iter()
+                .map(|low| {
+                    let jitter: Vec<String> = low
+                        .jitters
+                        .iter()
+                        .map(|j| format!("[{},{}]", j[0], j[1]))
+                        .collect();
+                    format!(
+                        "{{\"origin\":[{},{}],\"jitter\":[{}]}}",
+                        low.origin.0,
+                        low.origin.1,
+                        jitter.join(",")
+                    )
+                })
+                .collect();
+            std::fs::write(
+                directory.join("low.json"),
+                format!("[{}]", entries.join(",")),
+            )
+            .unwrap();
+        }
         eprintln!(
             "capture: sequence {}/{sequences} done, {:.0}s elapsed",
             sequence + 1,
             start.elapsed().as_secs_f64()
         );
     }
+    let low_meta = format!(
+        "[{}]",
+        lows.iter()
+            .map(|l| format!(
+                "{{\"scale_x\":{},\"scale_y\":{},\"frame_width\":{},\"frame_height\":{},\"width\":{},\"height\":{}}}",
+                l.scale.0, l.scale.1, l.params.viewport_size.0, l.params.viewport_size.1, l.crop.0, l.crop.1
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    if !lows.is_empty() {
+        std::fs::write(output.join("low_meta.json"), &low_meta).unwrap();
+    }
+    if low_only {
+        return;
+    }
     std::fs::write(
         output.join("meta.json"),
         format!(
-            "{{\"width\":{out_w},\"height\":{out_h},\"frame_width\":{width},\"frame_height\":{height},\"frames\":{frames},\"sequences\":{sequences},\"reference_spp\":{reference_spp},\"scale\":{scale},\"channels\":[\"noisy_r\",\"noisy_g\",\"noisy_b\",\"albedo_r\",\"albedo_g\",\"albedo_b\",\"distance\",\"normal_x\",\"normal_y\",\"normal_z\",\"roughness\",\"motion_x\",\"motion_y\",\"metallic\",\"kind\",\"ref_r\",\"ref_g\",\"ref_b\"]}}"
+            "{{\"width\":{out_w},\"height\":{out_h},\"frame_width\":{width},\"frame_height\":{height},\"low\":[{}],\"frames\":{frames},\"sequences\":{sequences},\"reference_spp\":{reference_spp},\"scale\":{scale},\"channels\":[\"noisy_r\",\"noisy_g\",\"noisy_b\",\"albedo_r\",\"albedo_g\",\"albedo_b\",\"distance\",\"normal_x\",\"normal_y\",\"normal_z\",\"roughness\",\"motion_x\",\"motion_y\",\"metallic\",\"kind\",\"ref_r\",\"ref_g\",\"ref_b\"],\"low_channels\":\"noisy rgb + the 12 guides; frame_NN.lowI.f16 per scale I, crop origins and jitter in seq_*/low.json\"}}",
+            lows.iter()
+                .map(|l| format!(
+                    "{{\"scale_x\":{},\"scale_y\":{},\"frame_width\":{},\"frame_height\":{},\"width\":{},\"height\":{}}}",
+                    l.scale.0, l.scale.1, l.params.viewport_size.0, l.params.viewport_size.1, l.crop.0, l.crop.1
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
         ),
     )
     .unwrap();
+}
+
+/// A low-resolution tracer of --upscale-capture and its crop.
+struct LowCapture {
+    params: RenderParams,
+    tracer: Raytracer,
+    /// Render size / output size per axis.
+    scale: (f32, f32),
+    /// Crop size and this sequence's crop origin, in low-resolution pixels.
+    crop: (u32, u32),
+    origin: (u32, u32),
+    jitters: Vec<[f32; 2]>,
 }
 
 fn sphere_material(sphere: &Sphere) -> u32 {

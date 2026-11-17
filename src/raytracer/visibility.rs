@@ -744,23 +744,8 @@ impl Visibility {
         );
     }
 
-    /// This frame's sub-pixel jitter (Halton 2, 3), shared by the raster and the
-    /// tracer's primary rays; pixel centres when `jitter` is false.
-    pub fn set_frame(&self, queue: &wgpu::Queue, frame: u32, jitter: bool) {
-        fn halton(mut i: u32, base: u32) -> f32 {
-            let (mut f, mut r) = (1., 0.);
-            while i > 0 {
-                f /= base as f32;
-                r += f * (i % base) as f32;
-                i /= base;
-            }
-            r
-        }
-        let j = if jitter {
-            [halton(frame % 1024 + 1, 2), halton(frame % 1024 + 1, 3)]
-        } else {
-            [0.5, 0.5]
-        };
+    /// This frame's sub-pixel jitter, shared by the raster and the tracer's primary rays.
+    pub fn set_frame(&self, queue: &wgpu::Queue, j: [f32; 2]) {
         queue.write_buffer(
             &self.frame,
             0,

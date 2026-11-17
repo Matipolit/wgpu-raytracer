@@ -45,3 +45,6 @@ performance/local-sweep/results/
 
 # Benchmark scenes downloaded/converted by scripts/convert_scene.py (see performance/scenes/README.md).
 assets/scenes/
+
+# Log of scripts/pc_run.sh --detach.
+pc-run.log
