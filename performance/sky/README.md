@@ -148,3 +148,18 @@ Each candidate costs about 2.3 ms here (three random vertex reads); the shadow r
 about 24 ms. At equal time on this GPU plain path tracing is still competitive by
 mean error; the gain is in fireflies and in what spatial/temporal reuse (ReSTIR)
 can build on. Daytime Bistro: 38.8 → 44.8 ms/spp (+16%).
+
+RTX 5070 Ti, `--hw-rt`, 960×600, fixed exposure, vs an 8192-spp reference (the
+pre-lamp build patched to the same night sky):
+
+| Lamp sampling | ms/spp | 16 spp | 64 spp |
+|---|---:|---:|---:|
+| none | 2.51 | 19.19 dB | 20.45 dB |
+| 1 candidate | 5.29 | 20.85 dB | 23.77 dB |
+| 8 (default) | 6.42 | 22.22 dB | 26.18 dB |
+| 32 | 10.8 | 22.92 dB | 27.16 dB |
+
+Without lamp sampling the error is dominated by fireflies and barely falls with more
+samples (+1.3 dB for 4×); with it the error falls as expected. At equal time (64 spp
+at 8 candidates vs ~164 spp without) lamp sampling wins by roughly 1.7 dB here, and
+the gap grows with the sample count.
