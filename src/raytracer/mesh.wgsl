@@ -185,7 +185,7 @@ fn meshResolveLocal(ray: Ray, candidate: MeshCandidate) -> Intersection {
         footprintUV0=coneWidth*vec2(length(b0.x*dual1+c0.x*dual2),length(b0.y*dual1+c0.y*dual2));
         footprintUV1=coneWidth*vec2(length(b1.x*dual1+c1.x*dual2),length(b1.y*dual1+c1.y*dual2));
     }
-    if SKIP_FINAL_SCATTER && pathBounce+1u==samplingParams.numBounces {
+    if SKIP_FINAL_SCATTER && pathBounce+1u==samplingParams.numBounces && !pathKeepLast {
         // Shading normals are skipped; the geometric normal weighs lamp hits (MIS).
         return Intersection(ray.origin+candidate.t*ray.direction,vec3(0.),uv0.x,uv0.y,candidate.t,materialIdx,0xffffffffu,uv1,normalize(cross(e1,e2)));
     }

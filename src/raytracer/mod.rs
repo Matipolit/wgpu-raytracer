@@ -133,6 +133,8 @@ pub struct Raytracer {
     trace_layout: wgpu::PipelineLayout,
     /// ReSTIR's first pass (raytracer.wgsl csRestirInitial), when the scene has lamps.
     restir_pipeline: Option<wgpu::ComputePipeline>,
+    /// ReSTIR GI reuse (raytracer.wgsl csRestirGi), for mesh scenes.
+    gi_pipeline: Option<wgpu::ComputePipeline>,
     bloom: bloom::Bloom,
     profiler: Option<profiler::PassProfiler>,
     trace_constants: Vec<(&'static str, f64)>,
@@ -641,6 +643,10 @@ impl Raytracer {
             ("LAMPS", f64::from(scene.mesh.lamp_count() > 0)),
             ("DENOISER_INPUT", f64::from(temporal_source.is_some())),
             ("RESTIR", f64::from(scene.mesh.lamp_count() > 0)),
+            (
+                "RESTIR_GI",
+                f64::from(!scene.mesh.triangles.is_empty() && !crate::has_flag("--no-restir-gi")),
+            ),
             // Experiments: RT_RESTIR_SPATIAL, RT_RESTIR_RADIUS, RT_RESTIR_CAP.
             (
                 "RESTIR_SPATIAL",
@@ -783,6 +789,16 @@ impl Raytracer {
                     "csRestirInitial",
                     "ReSTIR initial reservoirs",
                     &constants,
+                )
+            });
+        // ReSTIR GI reuse, after the path tracer (mesh scenes).
+        let gi_pipeline = (!scene.mesh.triangles.is_empty() && !crate::has_flag("--no-restir-gi"))
+            .then(|| {
+                create_compute(
+                    &pipeline_layout,
+                    "csRestirGi",
+                    "ReSTIR GI reuse",
+                    &trace_constants,
                 )
             });
         if variants.len() > 1 {
@@ -1017,6 +1033,7 @@ impl Raytracer {
             vertex_buffer,
             trace_pipelines,
             restir_pipeline,
+            gi_pipeline,
             bloom,
             profiler: profiler::PassProfiler::new(device, queue),
             module_config,
@@ -1437,6 +1454,25 @@ impl Raytracer {
             timer.end(encoder, slot);
         }
         self.mark(encoder, "trace");
+        if params.num_samples_per_pixel != 0
+            && params.restir != 0
+            && let Some(pipeline) = &self.gi_pipeline
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ReSTIR GI pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.vertex_uniform_bind_group, &[]);
+            pass.set_bind_group(1, &self.images.trace, &[]);
+            pass.set_bind_group(2, &self.parameter_bind_group, &[]);
+            pass.set_bind_group(3, &self.scene_bind_group, &[]);
+            if let Some(visibility) = &self.visibility {
+                pass.set_bind_group(6, visibility.trace_group(), &[]);
+            }
+            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        }
+        self.mark(encoder, "restir gi");
         if let Some(temporal) = &self.temporal {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("temporal denoiser pass"),

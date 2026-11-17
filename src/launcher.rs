@@ -49,6 +49,8 @@ pub struct Settings {
     pub render_scale: f32,
     pub denoiser: Denoiser,
     pub bounces: u32,
+    /// ReSTIR GI (reused bounce lighting; real-time denoised modes).
+    pub gi: bool,
     pub max_samples: u32,
     pub hw_rt: bool,
     pub auto_tune: bool,
@@ -66,7 +68,8 @@ impl Default for Settings {
             fullscreen: false,
             render_scale: 0.67,
             denoiser: Denoiser::Neural("td2-half24".to_owned()),
-            bounces: 3,
+            bounces: 2,
+            gi: true,
             max_samples: 1,
             hw_rt: false,
             auto_tune: true,
@@ -92,8 +95,8 @@ impl Preset {
     pub fn description(self) -> &'static str {
         match self {
             Self::Low => "half resolution, 2 bounces, small neural denoiser",
-            Self::Medium => "67% resolution, 3 bounces, best neural denoiser",
-            Self::High => "full resolution, 3 bounces, best neural denoiser",
+            Self::Medium => "67% resolution, 2 bounces + ReSTIR GI, best neural denoiser",
+            Self::High => "full resolution, 2 bounces + ReSTIR GI, best neural denoiser",
             Self::Reference => "full resolution, 8 bounces, progressive (hold the camera still)",
         }
     }
@@ -135,16 +138,19 @@ impl Settings {
             }
         };
         self.preset = preset;
+        // 2 bounces + ReSTIR GI beats 3 plain bounces in quality and cost (Deck:
+        // Sponza 33 vs 36 ms per frame); Low drops GI for speed.
         (
             self.render_scale,
             self.bounces,
+            self.gi,
             self.denoiser,
             self.max_samples,
         ) = match preset {
-            Preset::Low => (0.5, 2, neural("td-half16"), 1),
-            Preset::Medium => (0.67, 3, neural("td2-half24"), 1),
-            Preset::High => (1., 3, neural("td2-half24"), 1),
-            Preset::Reference => (1., 8, Denoiser::Off, 4096),
+            Preset::Low => (0.5, 2, false, neural("td-half16"), 1),
+            Preset::Medium => (0.67, 2, true, neural("td2-half24"), 1),
+            Preset::High => (1., 2, true, neural("td2-half24"), 1),
+            Preset::Reference => (1., 8, false, Denoiser::Off, 4096),
         };
     }
 
@@ -169,6 +175,9 @@ impl Settings {
             Denoiser::Neural(stem) => push("--temporal-model", Some(format!("models/{stem}.wgsl"))),
         }
         push("--bounces", Some(self.bounces.to_string()));
+        if !self.gi {
+            push("--no-restir-gi", None);
+        }
         if self.max_samples > 1 {
             push("--max-samples", Some(self.max_samples.to_string()));
         }
@@ -202,7 +211,7 @@ impl Settings {
         };
         format!(
             "scene={}\npreset={}\nsize={}x{}\nfullscreen={}\nrender_scale={}\ndenoiser={denoiser}\n\
-             bounces={}\nmax_samples={}\nhw_rt={}\nauto_tune={}\ntextures={:?}\n\
+             bounces={}\ngi={}\nmax_samples={}\nhw_rt={}\nauto_tune={}\ntextures={:?}\n\
              sun_elevation={}\nsun_azimuth={}\n",
             self.scene,
             self.preset.label(),
@@ -211,6 +220,7 @@ impl Settings {
             self.fullscreen,
             self.render_scale,
             self.bounces,
+            self.gi,
             self.max_samples,
             self.hw_rt,
             self.auto_tune,
@@ -265,6 +275,7 @@ impl Settings {
                     }
                 },
                 "bounces" => s.bounces = value.parse().unwrap_or(s.bounces),
+                "gi" => s.gi = value.parse().unwrap_or(s.gi),
                 "max_samples" => s.max_samples = value.parse().unwrap_or(s.max_samples),
                 "hw_rt" => s.hw_rt = value.parse().unwrap_or(s.hw_rt),
                 "auto_tune" => s.auto_tune = value.parse().unwrap_or(s.auto_tune),
@@ -821,6 +832,12 @@ fn graphics(
     ui.label("Bounces");
     ui.add(egui::Slider::new(&mut settings.bounces, 1..=8));
     ui.end_row();
+    ui.label("ReSTIR GI");
+    ui.checkbox(
+        &mut settings.gi,
+        "reused bounce light (neural denoiser modes)",
+    );
+    ui.end_row();
     // A temporal denoiser renders one fresh sample per frame; otherwise a still camera
     // accumulates up to this many samples per pixel.
     ui.label("Samples to accumulate");
@@ -935,6 +952,7 @@ mod tests {
             render_scale: 0.67,
             denoiser: Denoiser::Neural("td2-half24".to_owned()),
             bounces: 4,
+            gi: false,
             max_samples: 1,
             hw_rt: true,
             auto_tune: false,

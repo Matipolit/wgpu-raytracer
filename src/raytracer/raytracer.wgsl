@@ -97,6 +97,21 @@ override RESTIR_CAP: f32 = 20.;
 // (W f32, M f32), (distance from the camera f32, normal oct snorm16x2).
 @group(1) @binding(8) var<storage, read_write> reservoirs: array<vec2<u32>>;
 var<private> sampleIndex: u32;
+// ReSTIR GI (real-time frames, mesh scenes): the path's light arriving at the
+// primary surface through its first bounce is recorded as a sample (secondary point,
+// its outgoing radiance, the bounce pdf) instead of being added to the pixel;
+// csRestirGi reuses samples across neighbours and frames and adds the result.
+override RESTIR_GI: bool = false;
+const GI_SPATIAL = 4u;
+const GI_RADIUS = 24.;
+const GI_CAP = 20.;
+// Three vec4 per pixel of this frame's samples (primary point + normal, secondary
+// point + normal, radiance rg/b + pdf), then two sets (parity) of final reservoirs,
+// two vec4 per pixel (secondary point + normal, radiance rg/b|M, W, distance).
+@group(1) @binding(9) var<storage, read_write> giData: array<vec4<u32>>;
+// The resolve at the GI sample's secondary point keeps shading normals even when it
+// is the last bounce (SKIP_FINAL_SCATTER), so light can be sampled there.
+var<private> pathKeepLast: bool;
 // Shadow (visibility) queries pass through transmissive surfaces.
 var<private> shadowRay: bool;
 // The path is inside a refracting volume (KHR_materials_volume), absorbing pathSigma
@@ -547,6 +562,12 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
     // continuation hits): ReSTIR vertices sample the sun every time and cover lamps.
     var vertexSunShare = sunShare;
     var lampsCovered = false;
+    let giActive = RESTIR_GI && sampleIndex == 0u && samplingParams.restir != 0u;
+    var giRecorded = false;var giHasSecondary = false;
+    var giColor0 = vec3(0.);var giThroughput = vec3(0.);var giPdf = 0.;
+    var giPrimary = vec3(0.);var giPrimaryNormal = vec3(0.);
+    var giSecondary = vec3(0.);var giSecondaryNormal = vec3(0.);
+    pathKeepLast = false;
     if OPACITY_APPROX {pathDiffuse=false;}
     var packedDirection=0u;var packedValid=false;
 
@@ -560,9 +581,11 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
         if RAY_CONES {coneActive=!CONES_PRIMARY_ONLY || bounce==0u;}
         var hit = Intersection();
         if VIS_PRIMARY {visibilityPending = bounce == 0u;}
+        pathKeepLast = giRecorded && bounce == 1u;
 
         if intersection(ray, &hit) {
             if pathInside {throughput *= exp(-pathSigma * hit.t * length(ray.direction));}
+            if giRecorded && bounce == 1u {giSecondary = hit.p;giSecondaryNormal = hit.n;giHasSecondary = true;}
             if GBUFFER && bounce == 0u {
                 let shaded = TRACE_MESHES && hit.sphereIdx == 0xffffffffu && !(SKIP_FINAL_SCATTER && samplingParams.numBounces == 1u);
                 if shaded { gbufferPending = true; } else { writeGbufferHit(ray, hit); }
@@ -642,7 +665,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                     skyMisWeight = misWeight(sampled.pdf,skyPdf(scatter.ray.direction));
                     if sunOn {sunMisWeight = misWeight(sampled.pdf,vertexSunShare*sunPdf(normalize(scatter.ray.direction)));}
                     lastBsdfPdf = sampled.pdf;
-                } else if sunOn || LAMPS {
+                } else if sunOn || LAMPS || giActive {
                     let sampled = samplePbr(pbrSurface(ray,hit),hit,rngState);
                     scatter = sampled.scatter;
                     if sunOn {sunMisWeight = misWeight(sampled.pdf,vertexSunShare*sunPdf(normalize(scatter.ray.direction)));}
@@ -651,6 +674,10 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                 if GBUFFER && gbufferPending {
                     gbufferPending = false;
                     writeGbuffer(shadedBase, hit.t * length(ray.direction), hit.n, shadedRough, shadedMetal, meshPrevious, 1.);
+                }
+                if giActive && bounce == 0u && lastBsdfPdf > 0. && lastBsdfPdf < 1e7 {
+                    giRecorded = true;giColor0 = color;giThroughput = scatter.throughput;giPdf = lastBsdfPdf;
+                    giPrimary = hit.p;giPrimaryNormal = hit.n;
                 }
                 ray = scatter.ray;
                 if RAY_CONES {coneSpread=min(1.,coneSpread+0.25*meshFloat(m+8u));}
@@ -680,11 +707,27 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
             if GBUFFER && bounce == 0u { writeGbufferMiss(ray); }
             let escaped = normalize(ray.direction);
             color += throughput * (atmosphereRadiance(escaped) * skyMisWeight + sunRadiance(escaped) * sunMisWeight);
+            // An escaped GI bounce: a distant secondary point in that direction.
+            if giRecorded && bounce == 1u {giSecondary = giPrimary + escaped * 1e5;giSecondaryNormal = -escaped;giHasSecondary = true;}
 
             break;
         }
     }
 
+    if giActive {
+        var record = array(vec4(0u), vec4(0u), vec4(0u));
+        if giRecorded && giHasSecondary {
+            // Radiance leaving the secondary point toward the primary one.
+            let outgoing = select(vec3(0.), (color - giColor0) / giThroughput, giThroughput > vec3(1e-8));
+            record = array(
+                vec4(bitcast<vec3<u32>>(giPrimary), pack2x16snorm(encodeOct(giPrimaryNormal))),
+                vec4(bitcast<vec3<u32>>(giSecondary), pack2x16snorm(encodeOct(giSecondaryNormal))),
+                vec4(pack2x16float(min(max(outgoing.rg, vec2(0.)), vec2(60000.))), pack2x16float(vec2(min(max(outgoing.b, 0.), 60000.), 0.)), bitcast<u32>(giPdf), 1u),
+            );
+            color = giColor0;
+        }
+        for (var k = 0u; k < 3u; k += 1u) {giData[gbufferPixel * 3u + k] = record[k];}
+    }
     return color;
 }
 
@@ -1223,7 +1266,8 @@ fn skyOccluded(ray: Ray) -> bool {return occludedWithin(ray,MAX_T);}
 // Any blocker along a unit-direction ray before distance `limit`.
 fn occludedWithin(ray: Ray, limit: f32) -> bool {
     let diffuse=pathDiffuse;if OPACITY_APPROX {pathDiffuse=false;}
-    let blocked=skyOccludedExact(ray,limit);
+    // Traversal reports missed boxes at MAX_T: a larger limit would visit every node.
+    let blocked=skyOccludedExact(ray,min(limit,MAX_T));
     if OPACITY_APPROX {pathDiffuse=diffuse;}
     return blocked;
 }
@@ -1357,7 +1401,9 @@ fn restirResolve(merge: RestirMerge, hit: Intersection, cap: f32, depth: f32) ->
     return stored;
 }
 @compute @workgroup_size(8, 8)
-fn csRestirInitial(@builtin(global_invocation_id) id: vec3<u32>) {
+fn csRestirInitial(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
+    // Traversal with the workgroup-memory stack indexes its slots by lane (64 lanes).
+    quadLane = lane;
     if !RESTIR || id.x>=frameData.x || id.y>=frameData.y {return;}
     let pixel=frameData.x*id.y+id.x;
     var rng=initRng(id.xy,frameData.xy,frameData.z^0x5bd1e995u);
@@ -1418,6 +1464,101 @@ fn restirLamps(hit: Intersection, surface: PbrSurface, rng: ptr<function,u32>) -
     if stored.w<=0. {return vec3(0.);}
     let eval=evaluatePbr(surface,hit,merge.chosen.direction);
     return lampRadiance(merge.chosen)*eval.rgb*merge.chosen.cosLight/max(merge.chosen.distance*merge.chosen.distance,1e-12)*stored.w;
+}
+
+// ReSTIR GI reuse (Ouyang et al. 2021), after the path tracer. The pixel's own sample,
+// its final reservoir of the previous frame (followed along the motion) and
+// GI_SPATIAL neighbours' samples of this frame are merged with M-capped,
+// 1/M-normalised weights; reused samples carry the reconnection Jacobian. Target:
+// luminance of BSDF x cos x radiance at the primary point (material from the G-buffer).
+// The winner, when borrowed, gets a visibility ray; its contribution is added to the
+// pixel and kept as the final reservoir for the next frame.
+struct GiSample {primary: vec3<f32>, primaryNormal: vec3<f32>, secondary: vec3<f32>, secondaryNormal: vec3<f32>, radiance: vec3<f32>, pdf: f32}
+fn loadGiSample(pixel: u32) -> GiSample {
+    let a=giData[pixel*3u];let b=giData[pixel*3u+1u];let c=giData[pixel*3u+2u];
+    return GiSample(bitcast<vec3<f32>>(a.xyz),decodeOct(a.w),bitcast<vec3<f32>>(b.xyz),decodeOct(b.w),
+        vec3(unpack2x16float(c.x),unpack2x16float(c.y).x),select(0.,bitcast<f32>(c.z),c.w!=0u));
+}
+fn giFinalSlot(parity: u32, pixel: u32) -> u32 {return frameData.x*frameData.y*3u+(parity*frameData.x*frameData.y+pixel)*2u;}
+struct GiPick {secondary: vec3<f32>, secondaryNormal: vec3<f32>, radiance: vec3<f32>, score: f32, borrowed: bool}
+fn giTarget(surface: PbrSurface, hit: Intersection, secondary: vec3<f32>, radiance: vec3<f32>) -> f32 {
+    let eval=evaluatePbr(surface,hit,normalize(secondary-hit.p));
+    return dot(eval.rgb*radiance,vec3(0.2126,0.7152,0.0722));
+}
+// Reconnecting a sample made at `source` to the primary point `destination`: ratio of the solid
+// angles the secondary point's area subtends (clamped against extreme reuse).
+fn giJacobian(secondary: vec3<f32>, secondaryNormal: vec3<f32>, source: vec3<f32>, destination: vec3<f32>) -> f32 {
+    let a=source-secondary;let b=destination-secondary;
+    let cosFrom=abs(dot(secondaryNormal,normalize(a)));let cosTo=abs(dot(secondaryNormal,normalize(b)));
+    let j=(cosTo*dot(a,a))/max(cosFrom*dot(b,b),1e-12);
+    return select(j,0.,j>10. || j<0.1);
+}
+@compute @workgroup_size(8, 8)
+fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
+    // Traversal with the workgroup-memory stack indexes its slots by lane (64 lanes).
+    quadLane = lane;
+    if !RESTIR_GI || id.x>=frameData.x || id.y>=frameData.y {return;}
+    let pixel=frameData.x*id.y+id.x;
+    let parity=samplingParams.restir&1u;
+    let own=loadGiSample(pixel);
+    if own.pdf<=0. {
+        giData[giFinalSlot(parity,pixel)]=vec4(0u);giData[giFinalSlot(parity,pixel)+1u]=vec4(0u);
+        return;
+    }
+    var rng=initRng(id.xy,frameData.xy,frameData.z^0x27d4eb2du);
+    let g0=gbuffer[pixel*3u];let g1=gbuffer[pixel*3u+1u];let g2=gbuffer[pixel*3u+2u];
+    var hit=Intersection();hit.p=own.primary;hit.n=own.primaryNormal;hit.geometricNormal=own.primaryNormal;
+    let rough=max(g1.w,0.045);let alpha=rough*rough;let base=g0.xyz;let metal=g2.z;
+    let view=normalize(camera.eye-own.primary);
+    let f0=mix(vec3(0.04),base,metal);
+    let surface=PbrSurface(base,metal,alpha*alpha,view,max(dot(hit.n,view),1e-6),f0,clamp(max(f0.r,max(f0.g,f0.b)),0.25,0.9),0.,1.5,true,vec3(0.),1.);
+    // The pixel's own sample: W = 1 / pdf.
+    var pick=GiPick(own.secondary,own.secondaryNormal,own.radiance,giTarget(surface,hit,own.secondary,own.radiance),false);
+    var sum=pick.score/own.pdf;var m=1.;
+    // Temporal: last frame's final reservoir along the motion.
+    let previous=previousPixel(own.primary);
+    if previous.x>=0. && previous.y>=0. && previous.x<f32(frameData.x) && previous.y<f32(frameData.y) {
+        let slot=giFinalSlot(parity^1u,u32(previous.y)*frameData.x+u32(previous.x));
+        let a=giData[slot];let b=giData[slot+1u];
+        let rm=min(unpack2x16float(b.y).y,GI_CAP);
+        let seenFrom=distance(prevCamera.eye,own.primary);
+        if rm>0. && abs(bitcast<f32>(b.w)-seenFrom)<=0.1*seenFrom {
+            let secondary=bitcast<vec3<f32>>(a.xyz);let radiance=vec3(unpack2x16float(b.x),unpack2x16float(b.y).x);
+            let score=giTarget(surface,hit,secondary,radiance);
+            let w=score*bitcast<f32>(b.z)*rm;
+            sum+=w;m+=rm;
+            if w>0. && rngNextFloat(&rng)*sum<w {pick=GiPick(secondary,decodeOct(a.w),radiance,score,true);}
+        }
+    }
+    // Spatial: this frame's samples of nearby pixels on a similar surface.
+    let here=vec2(f32(id.x),f32(id.y))+vec2(0.5);
+    let depth=distance(camera.eye,own.primary);
+    for(var k=0u;k<GI_SPATIAL;k+=1u) {
+        let angle=6.2831853*rngNextFloat(&rng);
+        let at=here+GI_RADIUS*sqrt(rngNextFloat(&rng))*vec2(cos(angle),sin(angle));
+        if at.x<0. || at.y<0. || at.x>=f32(frameData.x) || at.y>=f32(frameData.y) {continue;}
+        let other=loadGiSample(u32(at.y)*frameData.x+u32(at.x));
+        if other.pdf<=0. || abs(distance(camera.eye,other.primary)-depth)>0.1*depth || dot(other.primaryNormal,own.primaryNormal)<0.9 {continue;}
+        let jacobian=giJacobian(other.secondary,other.secondaryNormal,other.primary,own.primary);
+        let score=giTarget(surface,hit,other.secondary,other.radiance);
+        let w=score*jacobian/other.pdf;
+        sum+=w;m+=1.;
+        if w>0. && rngNextFloat(&rng)*sum<w {pick=GiPick(other.secondary,other.secondaryNormal,other.radiance,score,true);}
+    }
+    var weight=select(0.,sum/(m*pick.score),pick.score>0.);
+    let toSecondary=pick.secondary-own.primary;let span=length(toSecondary);
+    // Degenerate or non-finite picks contribute nothing (a NaN ray would traverse the
+    // whole BVH: every box test passes).
+    if !(span>1e-4 && span<1e6 && weight<1e30) {weight=0.;}
+    if pick.borrowed && weight>0. && occludedWithin(Ray(own.primary+own.primaryNormal*0.0001,toSecondary/span),span*0.999) {weight=0.;}
+    let slot=giFinalSlot(parity,pixel);
+    giData[slot]=vec4(bitcast<vec3<u32>>(pick.secondary),pack2x16snorm(encodeOct(pick.secondaryNormal)));
+    giData[slot+1u]=vec4(pack2x16float(pick.radiance.rg),pack2x16float(vec2(pick.radiance.b,min(m,GI_CAP))),bitcast<u32>(weight),bitcast<u32>(depth));
+    if weight<=0. {return;}
+    let eval=evaluatePbr(surface,hit,toSecondary/span);
+    let indirect=eval.rgb*pick.radiance*weight*select(1.,1./f32(max(samplingParams.numSamplesPerPixel,1u)),DENOISER_INPUT);
+    let c=imageBuffer[pixel];
+    imageBuffer[pixel]=array<f32,3>(c[0]+indirect.r,c[1]+indirect.g,c[2]+indirect.b);
 }
 
 fn encodeOct(direction:vec3<f32>)->vec2<f32>{
