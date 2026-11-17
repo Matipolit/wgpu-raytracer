@@ -49,7 +49,28 @@ pub(crate) fn experiment_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     }
 }
 
+/// AMD's RADV driver runs compute shaders as 64-wide waves by default; 32-wide waves
+/// waste fewer lanes on the tracer's divergent loops (Steam Deck: Sponza 18.4 -> 16.7
+/// ms, night Bistro 71.2 -> 58.8 ms per frame). RADV reads the toggle from the
+/// environment when the device is created; other drivers ignore it. RT_WAVE64=1 opts out.
+fn prefer_wave32() {
+    if std::env::var_os("RT_WAVE64").is_some() {
+        return;
+    }
+    let current = std::env::var("RADV_PERFTEST").unwrap_or_default();
+    if !current.split(',').any(|o| o == "cswave32") {
+        let value = if current.is_empty() {
+            "cswave32".to_owned()
+        } else {
+            format!("{current},cswave32")
+        };
+        // SAFETY: first thing in main, before any other thread exists.
+        unsafe { std::env::set_var("RADV_PERFTEST", value) };
+    }
+}
+
 fn main() {
+    prefer_wave32();
     if has_flag("--gpu-info") {
         pollster::block_on(async {
             let instance = wgpu::Instance::default();
