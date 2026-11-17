@@ -1243,7 +1243,7 @@ fn storeReservoir(slot: u32, r: Reservoir) {
 // M-capped, 1/M-normalised weights (biased, the usual real-time variant), one shadow
 // ray for the winner, stored as the final reservoir for the next frame.
 const RESTIR_INITIAL = 2u;
-fn reservoirSet(set: u32, pixel: u32) -> u32 {return reservoirSlot(set,pixel);}
+fn reservoirSet(group: u32, pixel: u32) -> u32 {return reservoirSlot(group,pixel);}
 struct RestirMerge {chosen: LampPoint, score: f32, sum: f32, m: f32}
 fn restirAdd(merge: ptr<function,RestirMerge>, r: Reservoir, origin: vec3<f32>, n: vec3<f32>, cap: f32, rng: ptr<function,u32>) {
     let candidate=lampAt(r.triangle,r.bary,origin);
