@@ -125,6 +125,8 @@ pub struct Raytracer {
     source_prefix: String,
     source_suffix: String,
     trace_layout: wgpu::PipelineLayout,
+    /// ReSTIR's first pass (raytracer.wgsl csRestirInitial), when the scene has lamps.
+    restir_pipeline: Option<wgpu::ComputePipeline>,
     trace_constants: Vec<(&'static str, f64)>,
     /// Identifies the scene in the calibration cache.
     scene_key: String,
@@ -746,6 +748,18 @@ impl Raytracer {
             &variants,
             module_config,
         );
+        // ReSTIR's first pass (lamp candidates, temporal reuse, visibility).
+        let restir_pipeline = trace_constants
+            .iter()
+            .any(|&(name, value)| name == "RESTIR" && value != 0.)
+            .then(|| {
+                create_compute(
+                    &pipeline_layout,
+                    "csRestirInitial",
+                    "ReSTIR initial reservoirs",
+                    &trace_constants,
+                )
+            });
         if variants.len() > 1 {
             eprintln!(
                 "Auto-tune: {} trace variants {:?}",
@@ -961,6 +975,7 @@ impl Raytracer {
             scene_bind_group,
             vertex_buffer,
             trace_pipelines,
+            restir_pipeline,
             module_config,
             source_prefix: trace_source,
             source_suffix,
@@ -1292,6 +1307,24 @@ impl Raytracer {
                     &planes,
                 );
             }
+        }
+        if params.num_samples_per_pixel != 0
+            && params.restir != 0
+            && let Some(pipeline) = &self.restir_pipeline
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ReSTIR initial pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.vertex_uniform_bind_group, &[]);
+            pass.set_bind_group(1, &self.images.trace, &[]);
+            pass.set_bind_group(2, &self.parameter_bind_group, &[]);
+            pass.set_bind_group(3, &self.scene_bind_group, &[]);
+            if let Some(visibility) = &self.visibility {
+                pass.set_bind_group(6, visibility.trace_group(), &[]);
+            }
+            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
         }
         if params.num_samples_per_pixel != 0 {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

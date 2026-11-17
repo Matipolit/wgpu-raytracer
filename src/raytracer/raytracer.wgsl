@@ -92,8 +92,9 @@ override RESTIR: bool = false;
 override RESTIR_SPATIAL: u32 = 6u;
 override RESTIR_RADIUS: f32 = 16.;
 override RESTIR_CAP: f32 = 20.;
-// Reservoirs: two frames (parity) x pixels x 3 vec2<u32>: (triangle, barycentrics
-// unorm16x2), (W f32, M f32), (distance from the camera f32, normal oct snorm16x2).
+// Reservoirs: three sets (final of the last two frames by parity, then this frame's
+// initial ones) x pixels x 3 vec2<u32>: (triangle, barycentrics unorm16x2),
+// (W f32, M f32), (distance from the camera f32, normal oct snorm16x2).
 @group(1) @binding(8) var<storage, read_write> reservoirs: array<vec2<u32>>;
 var<private> sampleIndex: u32;
 var<private> primaryEmission: vec3<f32>;
@@ -1233,58 +1234,93 @@ fn storeReservoir(slot: u32, r: Reservoir) {
     reservoirs[slot+1u]=vec2(bitcast<u32>(r.w),bitcast<u32>(r.m));
     reservoirs[slot+2u]=vec2(bitcast<u32>(r.depth),pack2x16snorm(encodeOct(r.normal)));
 }
-// Direct lamp light at the primary surface by ReSTIR DI: fresh RIS candidates, the
-// pixel's reservoir from the previous frame (followed along the motion) and
-// RESTIR_SPATIAL previous-frame neighbours, combined with M-capped, 1/M-normalised
-// weights (biased, the usual real-time variant); one shadow ray for the winner, whose
-// reservoir is kept (W = 0 when occluded) for the next frame.
+// ReSTIR DI for lamps at the primary surface, in two passes per frame.
+// csRestirInitial (before the path tracer): fresh RIS candidates plus the pixel's
+// final reservoir of the previous frame (followed along the motion), the winner
+// shadow-tested (W = 0 when occluded, M still counts) and stored as this frame's
+// initial reservoir. restirLamps (the path tracer's primary surface): the pixel's own
+// and RESTIR_SPATIAL neighbours' initial reservoirs of this frame, merged with
+// M-capped, 1/M-normalised weights (biased, the usual real-time variant), one shadow
+// ray for the winner, stored as the final reservoir for the next frame.
+const RESTIR_INITIAL = 2u;
+fn reservoirSet(set: u32, pixel: u32) -> u32 {return reservoirSlot(set,pixel);}
+struct RestirMerge {chosen: LampPoint, score: f32, sum: f32, m: f32}
+fn restirAdd(merge: ptr<function,RestirMerge>, r: Reservoir, origin: vec3<f32>, n: vec3<f32>, cap: f32, rng: ptr<function,u32>) {
+    let candidate=lampAt(r.triangle,r.bary,origin);
+    let score=restirTarget(candidate,n);
+    let rm=min(r.m,cap);
+    let w=score*r.w*rm;
+    (*merge).sum+=w;(*merge).m+=rm;
+    if w>0. && rngNextFloat(rng)*(*merge).sum<w {(*merge).chosen=candidate;(*merge).score=score;}
+}
+// Shadow-tests the merged winner; returns its reservoir (W = 0 if occluded or none).
+fn restirResolve(merge: RestirMerge, hit: Intersection, cap: f32, depth: f32) -> Reservoir {
+    var stored=Reservoir(merge.chosen.triangle,merge.chosen.bary,0.,min(merge.m,cap),depth,hit.n);
+    if merge.score>0. && !occludedWithin(Ray(hit.p+hit.geometricNormal*0.0001,merge.chosen.direction),merge.chosen.distance*0.999) {
+        stored.w=merge.sum/(merge.m*merge.score);
+    }
+    return stored;
+}
+@compute @workgroup_size(8, 8)
+fn csRestirInitial(@builtin(global_invocation_id) id: vec3<u32>) {
+    if !RESTIR || id.x>=frameData.x || id.y>=frameData.y {return;}
+    let pixel=frameData.x*id.y+id.x;
+    var rng=initRng(id.xy,frameData.xy,frameData.z^0x5bd1e995u);
+    var jitter=vec2(0.5);
+    if SHARED_JITTER {jitter=frameJitter(frameData.z);}
+    let u=(f32(id.x)+jitter.x)/f32(frameData.x);let v=(f32(id.y)+jitter.y)/f32(frameData.y);
+    if RAY_CONES {coneActive=false;}
+    let ray=cameraMakeRay(camera,&rng,u,1.-v);
+    var hit=Intersection();
+    var stored=Reservoir();
+    if intersection(ray,&hit) && hit.sphereIdx==0xffffffffu {
+        let n=hit.n;
+        var merge=RestirMerge();
+        let total=meshFloat(meshData[12u]+1u);
+        for(var k=0u;k<LAMP_CANDIDATES;k+=1u) {
+            let candidate=sampleLampPoint(hit.p,&rng);
+            let score=restirTarget(candidate,n);
+            let w=score*total/max(meshFloat(meshMaterialOffset(candidate.material)+12u),1e-30);
+            merge.sum+=w;
+            if w>0. && rngNextFloat(&rng)*merge.sum<w {merge.chosen=candidate;merge.score=score;}
+        }
+        merge.m=f32(LAMP_CANDIDATES);
+        let cap=RESTIR_CAP*f32(LAMP_CANDIDATES);
+        // Temporal: the pixel's final reservoir of the previous frame.
+        let previous=previousPixel(hit.p);
+        if previous.x>=0. && previous.y>=0. && previous.x<f32(frameData.x) && previous.y<f32(frameData.y) {
+            let seenFrom=distance(prevCamera.eye,hit.p);
+            let r=loadReservoir(reservoirSet((samplingParams.restir&1u)^1u,u32(previous.y)*frameData.x+u32(previous.x)));
+            if r.m>0. && abs(r.depth-seenFrom)<=0.1*seenFrom && dot(r.normal,n)>=0.9 {
+                restirAdd(&merge,r,hit.p,n,cap,&rng);
+            }
+        }
+        stored=restirResolve(merge,hit,cap,distance(camera.eye,hit.p));
+    }
+    storeReservoir(reservoirSet(RESTIR_INITIAL,pixel),stored);
+}
 fn restirLamps(hit: Intersection, surface: PbrSurface, rng: ptr<function,u32>) -> vec3<f32> {
     let n=hit.n;
-    var chosen=LampPoint();var chosenTarget=0.;var sum=0.;var m=0.;
-    let total=meshFloat(meshData[12u]+1u);
-    for(var k=0u;k<LAMP_CANDIDATES;k+=1u) {
-        let candidate=sampleLampPoint(hit.p,rng);
-        let score=restirTarget(candidate,n);
-        let w=score*total/max(meshFloat(meshMaterialOffset(candidate.material)+12u),1e-30);
-        sum+=w;
-        if w>0. && rngNextFloat(rng)*sum<w {chosen=candidate;chosenTarget=score;}
-    }
-    m=f32(LAMP_CANDIDATES);
     let cap=RESTIR_CAP*f32(LAMP_CANDIDATES);
-    let previous=previousPixel(hit.p);
-    let seenFrom=distance(prevCamera.eye,hit.p);
-    let parity=samplingParams.restir&1u;
+    let seenFrom=distance(camera.eye,hit.p);
+    var merge=RestirMerge();
+    let here=vec2(f32(gbufferPixel%frameData.x),f32(gbufferPixel/frameData.x))+vec2(0.5);
     for(var k=0u;k<=RESTIR_SPATIAL;k+=1u) {
-        var at=previous;
+        var at=here;
         if k>0u {
             let angle=6.2831853*rngNextFloat(rng);
             at+=RESTIR_RADIUS*sqrt(rngNextFloat(rng))*vec2(cos(angle),sin(angle));
         }
         if at.x<0. || at.y<0. || at.x>=f32(frameData.x) || at.y>=f32(frameData.y) {continue;}
-        let pixel=u32(at.y)*frameData.x+u32(at.x);
-        let r=loadReservoir(reservoirSlot(parity^1u,pixel));
-        // Occluded winners were stored with W = 0: they still count their M (skipping
-        // them keeps only lit samples and inflates every later estimate).
+        let r=loadReservoir(reservoirSet(RESTIR_INITIAL,u32(at.y)*frameData.x+u32(at.x)));
         if r.m<=0. || abs(r.depth-seenFrom)>0.1*seenFrom || dot(r.normal,n)<0.9 {continue;}
-        let candidate=lampAt(r.triangle,r.bary,hit.p);
-        let score=restirTarget(candidate,n);
-        let rm=min(r.m,cap);
-        let w=score*r.w*rm;
-        sum+=w;m+=rm;
-        if w>0. && rngNextFloat(rng)*sum<w {chosen=candidate;chosenTarget=score;}
+        restirAdd(&merge,r,hit.p,n,cap,rng);
     }
-    var stored=Reservoir(chosen.triangle,chosen.bary,0.,min(m,cap),distance(camera.eye,hit.p),n);
-    var light=vec3(0.);
-    if chosenTarget>0. {
-        let weight=sum/(m*chosenTarget);
-        let eval=evaluatePbr(surface,hit,chosen.direction);
-        if !occludedWithin(Ray(hit.p+hit.geometricNormal*0.0001,chosen.direction),chosen.distance*0.999) {
-            stored.w=weight;
-            light=lampRadiance(chosen)*eval.rgb*chosen.cosLight/max(chosen.distance*chosen.distance,1e-12)*weight;
-        }
-    }
-    storeReservoir(reservoirSlot(parity,gbufferPixel),stored);
-    return light;
+    let stored=restirResolve(merge,hit,cap,seenFrom);
+    storeReservoir(reservoirSet(samplingParams.restir&1u,gbufferPixel),stored);
+    if stored.w<=0. {return vec3(0.);}
+    let eval=evaluatePbr(surface,hit,merge.chosen.direction);
+    return lampRadiance(merge.chosen)*eval.rgb*merge.chosen.cosLight/max(merge.chosen.distance*merge.chosen.distance,1e-12)*stored.w;
 }
 
 fn encodeOct(direction:vec3<f32>)->vec2<f32>{

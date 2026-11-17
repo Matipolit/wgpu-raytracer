@@ -135,10 +135,10 @@ impl ImageBuffers {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        // ReSTIR reservoirs: two frames x 24 bytes per pixel (raytracer.wgsl `reservoirs`).
+        // ReSTIR reservoirs: three sets x 24 bytes per pixel (raytracer.wgsl `reservoirs`).
         let reservoirs = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ReSTIR reservoirs"),
-            size: bytes / 12 * 48,
+            size: bytes / 12 * 72,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
