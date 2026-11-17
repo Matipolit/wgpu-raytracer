@@ -1262,7 +1262,9 @@ fn restirLamps(hit: Intersection, surface: PbrSurface, rng: ptr<function,u32>) -
         if at.x<0. || at.y<0. || at.x>=f32(frameData.x) || at.y>=f32(frameData.y) {continue;}
         let pixel=u32(at.y)*frameData.x+u32(at.x);
         let r=loadReservoir(reservoirSlot(parity^1u,pixel));
-        if r.m<=0. || r.w<=0. || abs(r.depth-seenFrom)>0.1*seenFrom || dot(r.normal,n)<0.9 {continue;}
+        // Occluded winners were stored with W = 0: they still count their M (skipping
+        // them keeps only lit samples and inflates every later estimate).
+        if r.m<=0. || abs(r.depth-seenFrom)>0.1*seenFrom || dot(r.normal,n)<0.9 {continue;}
         let candidate=lampAt(r.triangle,r.bary,hit.p);
         let score=restirTarget(candidate,n);
         let rm=min(r.m,cap);
