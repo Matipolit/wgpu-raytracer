@@ -18,12 +18,50 @@ flicker (measured 2026-11-18):
 - 7-14% of pixels drop their history every frame, mostly from the normal check (dot
   >= 0.8 on normal-mapped shading normals under sub-pixel jitter).
 
+## Research and measurements (2026-11-18)
+
+A literature review (NRD, SVGF/A-SVGF, Thomas et al. HPG 2022, Hasselgren et al. EG
+2020, Isik et al. 2021, DLSS-RR / FSR2 / XeSS / AMD Ray Regeneration docs, Arm NSS,
+QRISP, NSRD, "Frozen History" 2026) and measurements on still captures found these
+faults in v3, largest first:
+1. **Remodulation by one jittered albedo sample**, never accumulated (measured). The
+   final `x * albedo` applies a per-frame jittered albedo: texture and geometry edges
+   flicker at full amplitude after the network. On a still 192x120 Sponza capture,
+   this alone flickers 0.087 log units per frame, about 9x TAAU's total on the
+   video; 30-37% of pixels change albedo between frames. Fix: accumulate in
+   modulated (final colour) space, or keep a separate albedo history.
+2. **Short, hard-reset history.** SVGF/NRD keep a per-pixel history length, blend at
+   1/N up to about 60 frames, and shrink the length on doubtful matches instead of
+   resetting. NRD feeds back the unfiltered accumulation, not the spatially filtered
+   output, and reprojects with Catmull-Rom (bilinear blurs every frame). We reset
+   7-14% of pixels per frame and validate with jittered depth and normals.
+3. **Reference noise in the temporal loss** (measured). Still-camera 1024-spp
+   references change 0.018 (Sponza) / 0.014 (fireplace) log units per frame, 3% and
+   0.6% of the signal, and 7.7% at night: about twice TAAU's whole flicker. The
+   temporal term cannot see flicker below that. Fix: denoise the references, weight
+   the loss toward late frames.
+4. **ReSTIR's temporally correlated noise** (AMD Ray Regeneration): blobs lasting
+   several frames survive a short history. Fix: randomize ReSTIR's temporal reuse.
+5. **Specular divided by base-colour albedo.** Production denoisers split diffuse and
+   specular, or divide by a pre-integrated specular term.
+6. **No exposure normalization** of inputs (DLSS/FSR2/XeSS all take exposure).
+
+Costs in the literature: XeSS (DP4a) is about 4.3-4.9 ms at 1080p output on an Iris
+Xe-class GPU, upscaling an already clean image. U-Net denoisers (Thomas et al.:
+5.2 ms on an RTX 3070 with TensorRT int8) would take over 50 ms here. Only a tiny
+per-pixel network driving fixed filters fits.
+
 ## Goal
 
 One learned denoise + upscale stage that the user can run on the laptop.
-- **Budget** (Iris Xe, 1280x720 output): 5 ms target, 6-8 ms acceptable, for
-  everything after the path tracer. That includes the output-resolution albedo and
-  excludes bloom.
+- **Budget** (Iris Xe), for everything after the path tracer, including the
+  output-resolution albedo and excluding bloom:
+  - stretch target: 5 ms at 1920x1080 output, XeSS's cost, but also denoising
+    1-spp input;
+  - realistic: 6-8 ms at 1080p; first milestone 5 ms at 1280x720.
+  - Today's pieces scaled to 1080p (render 960x540): td-half16 about 6 ms, a TAAU
+    pass 2.5-3.5 ms, the raster about 1.9 ms, so about 10-11 ms. The stretch target
+    needs every piece halved (f16, fused kernels, a leaner network).
 - **Image:** at least as good as td + TAAU at the same budget, in PSNR on the
   v3-style evaluation set. Stable: long-video flicker at or below TAAU's.
 - **Integration:** a launcher denoiser choice, like the temporal models. The Deck and
@@ -63,18 +101,24 @@ works at one render scale.
   model.py): demodulated 1-spp input, reprojected history, features, a 2x2 pool, 2-3
   convs of 12-16 channels at half render resolution (f16), a blend and 2-3 a-trous
   levels. New inputs: history age (frames since the last reset, capped at 64, as
-  log2(age)/6) and a geometric-normal history check. Output: demodulated radiance at
-  render resolution plus its history.
-- **Stage B, output resolution, one pass:**
-  - Gather the stage A output for the output pixel: 4x4 render pixels, Gaussian by
-    jittered distance, the same gather as upscale.wgsl and model.py.
-  - Reproject the output history (demodulated rgb, 8 bytes, packed f16) by the
-    output-resolution motion.
-  - Validate the history by distance and geometric normal.
+  log2(age)/6) and a soft geometric-normal / plane-distance history check. The
+  history is the unfiltered temporal accumulation (the a-trous levels filter a copy
+  for output). Inputs exposure-normalized. Specular either split (separate signal) or
+  divided by a pre-integrated specular term instead of the base colour. Output:
+  demodulated radiance at render resolution plus its history.
+- **Stage B, output resolution, one pass** (accumulates in final-colour space, so
+  jittered albedo and edges are anti-aliased over time):
+  - Gather the stage A output (demodulated) for the output pixel: 4x4 render pixels,
+    Gaussian by jittered distance, the same gather as upscale.wgsl and model.py.
+  - Remodulate this frame's gathered value by this frame's (jittered) output albedo.
+  - Reproject the output history (final colour, packed f16, plus a history length)
+    with Catmull-Rom.
+  - Validate softly: plane distance and geometric normal on unjittered data; a
+    doubtful match shrinks the history length instead of resetting it.
   - A tiny learned head (one hidden layer of 8, inputs: gather confidence,
-    nearest-sample distance, history age and validity, luminance difference) predicts
-    the blend weight and a neighbourhood clamp strength.
-  - Remodulate by the output albedo; write the image and the history.
+    nearest-sample distance, history length and confidence, luminance difference)
+    predicts the blend weight (around 1/N) and a neighbourhood clamp strength.
+  - Write the image and the history.
   All weights fit in registers; no intermediate buffers.
 - **Output albedo and guides:** the output-resolution visibility raster (already the
   single raster in joint mode) and an albedo fetch inside stage B. No guide buffer is
@@ -82,9 +126,12 @@ works at one render scale.
 
 ### Training
 - Data: as v3, with 64-frame sequences, references only for the last 16 frames (the
-  first 48 warm the history), and `--di-shared` off.
-- Loss: per-frame L1 in log space plus the existing temporal term on the late frames
-  (truncated backpropagation through the last 16), at all three render scales.
+  first 48 warm the history), and `--di-shared` off. References denoised offline
+  (Open Image Denoise at full quality) so the temporal target is clean. ReSTIR's
+  temporal reuse randomized.
+- Loss: per-frame L1 in exposure-normalized log space, plus the temporal term on the
+  late frames (truncated backpropagation through the last 16), at all three render
+  scales. The recurrence stays in f32.
 - Tiers: 12 and 16 channels at 2 and 3 convs; tier choice by measured time on the
   target GPU, as the launcher already does by preset.
 
@@ -113,10 +160,16 @@ works at one render scale.
 - **`--joint-model` stays** until the new network ships; then the v3 joint networks go,
   and stage B reuses joint mode's single output-resolution raster.
 
-## Decisions (yours)
-1. Which preset must reach 5 ms: Low (0.5, likely) or Medium (0.67, likely 6.5-7.5 ms)?
-2. Should stage B also run after today's td (no retraining of stage A) as a first step?
-   It would show the output-pass gain alone within a day, before an overnight run.
+## Order of work (agreed 2026-11-18)
+1. **No retraining:** stage B as a non-learned pass (TAAU blend with history length,
+   soft unjittered checks, Catmull-Rom) after today's td, remodulating by the
+   output-resolution albedo and accumulating in final colour. Plus an in-renderer
+   evaluation: final frames of a moving-camera sequence and their motion-compensated
+   frame-to-frame change, so td + TAAU, the joint network and stage B are compared on
+   what the app shows.
+2. **Stage A network fixes and the learned stage B head**, with the new training data.
+3. **Performance toward the 1080p stretch target:** f16, fused kernels, inline albedo
+   resolve.
 
 ## Left to the builder
 Exact feature lists, kernel fusion details, buffer packing, export code sharing with
