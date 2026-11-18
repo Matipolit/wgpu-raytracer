@@ -8,10 +8,13 @@ Status: single still frames; not yet wired into `--capture` (see "Not done").
 
 The old references (`--capture --reference-spp 1024`, earlier 2048) traced the same
 number of samples at every pixel and stored the plain mean:
-- **Still noisy.** 2048 spp leaves 1.4% error per pixel in Sponza (0.0145 log units,
-  measured below); still-camera 1024-spp references changed 0.6-7.7% of the signal
-  from frame to frame (docs/research/2026-11-18-neural-denoise-upscale-literature.md
-  1.4). The temporal loss cannot see flicker smaller than that.
+- **Still noisy.** At 2048 spp the median pixel of the shaded Sponza window is off by
+  about 11% of its value (0.013 log units; log units understate relative error about
+  7x at mid-grey), and by 7% in night Bistro. Why, and what would change it:
+  docs/research/2026-11-18-reference-noise.md. Still-camera 1024-spp references
+  changed 0.6-7.7% of the signal from frame to frame
+  (docs/research/2026-11-18-neural-denoise-upscale-literature.md 1.4). The temporal
+  loss cannot see flicker smaller than that.
 - **No error estimate.** A single mean says nothing about how wrong it is, so noise
   could neither be measured nor targeted.
 - **Samples spent evenly.** Sky and directly lit walls converge in tens of samples;
