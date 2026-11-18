@@ -88,7 +88,7 @@ fn main() {
     }
     if std::env::args().any(|argument| argument == "--help") {
         println!(
-            "Usage: cargo run --release -- [--sponza | --model FILE.gltf|FILE.glb] [--inspect-model] [--render-output FILE.png --samples N --size WIDTHxHEIGHT] [--russian-roulette | --no-russian-roulette] [--bounces N] [--sky-importance] [--ggx-vndf] [--exposure X | --exposure-compensation X] [--no-auto-exposure] [--camera x,y,z,dx,dy,dz,fov] [--move-speed UNITS_PER_S] [--sample-offset N] [--timing-output FILE.json] [--benchmark]\nDownload Sponza first with: python scripts/download_sponza.py\nLocal experiments: --bvh4 --bvh8 --quantized-bvh --bvh-leaf N --sah32 --sah-stop --packed-shading --stochastic-color --stochastic-all --fp16-state --packed-directions --skip-final-scatter --classify-opacity --approximate-alpha --alpha-cap4 --blue-noise-jitter --bounded-vndf --ray-cones --scene-cache"
+            "Usage: cargo run --release -- [--sponza | --model FILE.gltf|FILE.glb] [--inspect-model] [--render-output FILE.png --samples N --size WIDTHxHEIGHT] [--russian-roulette | --no-russian-roulette] [--bounces N] [--sky-importance] [--ggx-vndf | --ndf-sampling] [--lamp-candidates N[,M]] [--exposure X | --exposure-compensation X] [--no-auto-exposure] [--camera x,y,z,dx,dy,dz,fov] [--move-speed UNITS_PER_S] [--sample-offset N] [--timing-output FILE.json] [--benchmark]\nDownload Sponza first with: python scripts/download_sponza.py\nLocal experiments: --bvh4 --bvh8 --quantized-bvh --bvh-leaf N --sah32 --sah-stop --packed-shading --stochastic-color --stochastic-all --fp16-state --packed-directions --skip-final-scatter --classify-opacity --approximate-alpha --alpha-cap4 --blue-noise-jitter --ray-cones --scene-cache"
         );
         return;
     }

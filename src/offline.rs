@@ -142,7 +142,20 @@ async fn render() {
         glm::vec3(c[0], c[1], c[2])
     });
     let yaw: f32 = crate::argument_value("--eval-yaw").map_or(0., |v| v.parse().unwrap());
+    // `--raw-frames FILE`: every frame is a fresh 1-spp image (no accumulation), as the
+    // real-time renderer traces it; after `--raw-warmup` frames (default 32), every
+    // `--raw-every`-th (default 32) is appended to FILE as f32 rgb. Frames that far
+    // apart are nearly independent of each other (ReSTIR history is capped at 20).
+    let raw_frames = crate::argument_value("--raw-frames");
+    let number = |name: &str, default: u32| {
+        crate::argument_value(name).map_or(default, |v| v.parse().expect("a number"))
+    };
+    let (raw_warmup, raw_every) = (number("--raw-warmup", 32), number("--raw-every", 32));
+    let mut raw = Vec::new();
     for frame in 0..samples {
+        if raw_frames.is_some() {
+            tracer.reset_accumulation();
+        }
         if frame > 0 && (velocity.is_some() || yaw != 0.) {
             params.camera.eye_pos += velocity.unwrap_or_default();
             params.camera.eye_dir =
@@ -203,6 +216,9 @@ async fn render() {
             }
             timer.unmap();
         }
+        if raw_frames.is_some() && frame >= raw_warmup && (frame - raw_warmup) % raw_every == 0 {
+            raw.extend(tracer.read_radiance(&device, &queue));
+        }
         if let Some(stability) = &mut stability {
             stability.frame(
                 frame,
@@ -217,6 +233,9 @@ async fn render() {
                 start.elapsed().as_secs_f64()
             );
         }
+    }
+    if let Some(path) = raw_frames {
+        std::fs::write(path, bytemuck::cast_slice(&raw)).unwrap();
     }
     if let Some(raw) = crate::argument_value("--raw-output") {
         tracer.save_raw(&device, &queue, &raw, samples);

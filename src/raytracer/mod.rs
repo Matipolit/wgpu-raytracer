@@ -711,11 +711,11 @@ impl Raytracer {
             ),
             (
                 "LAMP_CANDIDATES",
-                std::env::var("RT_LAMP_CANDIDATES").map_or(4., |v| v.parse().unwrap()),
+                lamp_candidates(0, "RT_LAMP_CANDIDATES", 4.),
             ),
             (
                 "LAMP_CANDIDATES_DEEP",
-                std::env::var("RT_LAMP_CANDIDATES_DEEP").map_or(2., |v| v.parse().unwrap()),
+                lamp_candidates(1, "RT_LAMP_CANDIDATES_DEEP", 2.),
             ),
             (
                 "SKY_IMPORTANCE",
@@ -727,9 +727,11 @@ impl Raytracer {
             ),
             (
                 "GGX_BOUNDED",
-                f64::from(
-                    crate::has_flag("--bounded-vndf") || std::env::var("RT_BOUNDED_GGX").is_ok(),
-                ),
+                // Default: bounded visible normals. Sampling the normal distribution
+                // (`--ndf-sampling`) wastes the specular samples that reflect below the
+                // surface: 40% of shaded Sponza pixels got no light in a 1-spp ReSTIR
+                // frame, 19% with this, at the same frame time (2026-11-18).
+                f64::from(!crate::has_flag("--ndf-sampling") && !crate::has_flag("--ggx-vndf")),
             ),
             (
                 "BLUE_NOISE_JITTER",
@@ -2486,6 +2488,19 @@ fn create_module(device: &wgpu::Device, source: String) -> wgpu::ShaderModule {
 }
 
 /// Primary-hit guide output (`--gbuffer`; implied by capture and temporal denoising).
+/// Lamp candidates per light sample: `--lamp-candidates FIRST[,DEEP]` (at the primary
+/// hit, and at deeper hits) or the environment variable; more cost time, not rays.
+fn lamp_candidates(index: usize, variable: &str, default: f64) -> f64 {
+    crate::argument_value("--lamp-candidates")
+        .and_then(|v| {
+            v.split(',')
+                .nth(index)
+                .map(|n| n.parse().expect("--lamp-candidates N[,M]"))
+        })
+        .or_else(|| std::env::var(variable).ok().map(|v| v.parse().unwrap()))
+        .unwrap_or(default)
+}
+
 pub fn gbuffer_enabled() -> bool {
     crate::has_flag("--gbuffer")
         || crate::has_flag("--capture")

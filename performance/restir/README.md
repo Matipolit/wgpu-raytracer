@@ -75,6 +75,35 @@ Quality: 4x4 PSNR -0.6 dB (Bistro) / -0.5 dB (fireplace), and the noise is visib
 default. Trusting last frame's DI visibility instead (as GI does) saved only 1 ms:
 the winner usually comes from a neighbour's reservoir.
 
+## Bounded visible normals by default; lamp candidates (2026-11-18)
+
+Raw 1-spp frames as the real-time renderer traces them (ReSTIR DI + GI, 2 bounces, no
+denoiser or upscaler, 960x540, still camera, Iris Xe): `--render-output x.png
+--raw-frames FILE` keeps every 32nd frame, `training/reference/raw_frames.py`
+measures the noise of one frame around the mean of 16. Repeated runs agree to 1%.
+
+| scene | setting | noise per pixel (median) | noise per 8x8 block | pixels with no light | ms |
+|---|---|---:|---:|---:|---:|
+| Sponza | normal distribution (before) | 1.14 | 0.174 | 39.5% | 65.8 |
+| Sponza | bounded visible normals | 0.64 | 0.099 | 19.4% | 66.8 |
+| Bistro day | before | 1.04 | 0.158 | 29.5% | 208 |
+| Bistro day | bounded visible normals | 0.59 | 0.094 | 15.7% | 203 |
+| Bistro night | before | 1.73 | 0.356 | 32.7% | 188 |
+| Bistro night | bounded visible normals | 1.67 | 0.347 | 17.4% | 184 |
+| Bistro night | 16 / 4 lamp candidates | 1.70 | 0.341 | 31.1% | 186 |
+| Bistro night | 32 / 8 lamp candidates | 1.69 | 0.334 | | 189 |
+| Bistro night | 16 / 4 candidates + bounded | 1.64 | 0.334 | | 188 |
+
+- **Bounded visible normals are now the default** (`--ndf-sampling` goes back).
+  Sampling the normal distribution reflects many specular samples below the surface;
+  such a pixel then gets no bounce and no ReSTIR GI that frame. Mean brightness is
+  unchanged (within 1%). td2 + TAAU on still Sponza is unchanged (30.36 -> 30.40 dB,
+  flicker 0.0010): the denoiser was hiding this noise already.
+- **Lamp candidates stay at 4 / 2** (`--lamp-candidates N,M` or RT_LAMP_CANDIDATES):
+  16 / 4 lowers night Bistro's noise 2-4%, 32 / 8 2-6%. Frame times were within
+  run-to-run noise (179-188 ms for the same setting); the laptop was in use.
+- Still 16-19% of lit pixels get no light in a frame with ReSTIR GI on.
+
 ## Not adopted
 
 Alpha-test shortcuts (`--opacity-micromap`, `--approximate-alpha`, `--alpha-cap4`)
