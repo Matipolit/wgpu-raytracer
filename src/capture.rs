@@ -71,6 +71,10 @@ async fn capture() {
     let reference_spp: u32 = number("--reference-spp", 128);
     // References may trace more bounces than the 1-spp inputs (closer to the truth).
     let reference_bounces: u32 = number("--reference-bounces", crate::selected_bounces());
+    // `--reference-groups G`: the reference's samples in G independent groups, with a
+    // sidecar per frame for the finishing step (docs/reference-frames.md).
+    let reference_groups: u32 = number("--reference-groups", 1);
+    assert!(reference_groups >= 1 && reference_spp % reference_groups == 0);
     let seed: u64 = number("--seed", 1);
     let size = crate::argument_value("--size").unwrap_or_else(|| "320x200".into());
     let (w, h) = size.split_once('x').expect("--size WxH");
@@ -390,15 +394,51 @@ async fn capture() {
                     // its slowest ray thousands of times per frame.
                     let per_dispatch = [32, 16, 8, 4, 2, 1]
                         .into_iter()
-                        .find(|k| reference_spp % k == 0)
+                        .find(|k| (reference_spp / reference_groups) % k == 0)
                         .unwrap();
                     params.sampling.num_samples_per_pixel = per_dispatch;
                     params.sampling.num_bounces = reference_bounces;
                     params.sampling.restir = false;
                     tracer.set_render_params(&device, &queue, &params).unwrap();
-                    tracer.reset_accumulation();
-                    render(&device, &queue, &mut tracer, reference_spp / per_dispatch);
-                    tracer.read_radiance(&device, &queue)
+                    if reference_groups > 1 {
+                        // Independent groups of samples and pixel-integrated guides, for
+                        // training/reference/finish_capture.py: sidecar frame_NN.ref.f16
+                        // (per group rgb of the window, then albedo and normal).
+                        let window = (out_w * out_h) as usize;
+                        let at = |q: usize| {
+                            ((origin.1 + q as u32 / out_w) * width + origin.0 + q as u32 % out_w)
+                                as usize
+                        };
+                        let mut sum = vec![0f32; noisy.len()];
+                        let mut guide = vec![0f32; window * 6];
+                        let mut side = Vec::with_capacity(window * (reference_groups as usize * 3 + 6) * 2);
+                        let mut half = |v: f32| {
+                            let v = if v.is_finite() { v.clamp(-65000., 65000.) } else { 0. };
+                            side.extend(half::f16::from_f32(v).to_le_bytes());
+                        };
+                        for _ in 0..reference_groups {
+                            tracer.reset_accumulation();
+                            render(&device, &queue, &mut tracer, reference_spp / reference_groups / per_dispatch);
+                            let mean = tracer.read_radiance(&device, &queue);
+                            let surface = tracer.read_gbuffer(&device, &queue);
+                            for q in 0..window {
+                                let p = at(q);
+                                for c in 0..3 {
+                                    half(mean[p * 3 + c]);
+                                    sum[p * 3 + c] += mean[p * 3 + c] / reference_groups as f32;
+                                    guide[q * 6 + c] += surface[p * 12 + c] / reference_groups as f32;
+                                    guide[q * 6 + 3 + c] += surface[p * 12 + 4 + c] / reference_groups as f32;
+                                }
+                            }
+                        }
+                        guide.iter().for_each(|&v| half(v));
+                        std::fs::write(directory.join(format!("frame_{frame:0digits$}.ref.f16")), side).unwrap();
+                        sum
+                    } else {
+                        tracer.reset_accumulation();
+                        render(&device, &queue, &mut tracer, reference_spp / per_dispatch);
+                        tracer.read_radiance(&device, &queue)
+                    }
                 };
                 let pixels = (out_w * out_h) as usize;
                 let mut bytes = Vec::with_capacity(pixels * 18 * 2);

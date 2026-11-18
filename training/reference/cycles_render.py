@@ -108,6 +108,41 @@ if irradiance.max() > 0:
     scene.collection.objects.link(holder)
     holder.rotation_euler = (-blender(sun)).normalized().to_track_quat("-Z", "Y").to_euler()
 
+# The renderer's per-scene material fixes (performance/scenes/material_overrides.txt).
+import os
+
+overrides = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../performance/scenes/material_overrides.txt")
+if os.path.exists(overrides) and not a.clay:
+    file = os.path.basename(a.model)
+    rules = [line.split() for line in open(overrides) if line.strip() and not line.startswith("#")]
+    for material in bpy.data.materials:
+        if not material.use_nodes:
+            continue
+        principled = next((n for n in material.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        if principled is None:
+            continue
+
+        def put(name, value):
+            socket = principled.inputs.get(name)
+            if socket is not None and not socket.is_linked:
+                socket.default_value = value
+
+        for rule in rules:
+            if rule[0] != file or not (rule[1] == "*" or rule[1] in material.name):
+                continue
+            for setting in rule[2:]:
+                key, value = setting.split("=")
+                if key == "transmission":
+                    put("Transmission Weight", float(value))
+                elif key == "ior":
+                    put("IOR", float(value))
+                elif key == "specular":
+                    put("Specular IOR Level", 0.5 * float(value))
+                elif key == "roughness":
+                    put("Roughness", float(value))
+                elif key == "base":
+                    put("Base Color", (*[float(x) for x in value.split(",")], 1))
+
 if a.clay:
     clay = bpy.data.materials.new("clay")
     clay.use_nodes = True

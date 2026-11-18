@@ -212,6 +212,10 @@ override SKIP_FINAL_SCATTER:bool=false;
 // The last vertex is now lit with its geometric normal; the bounce-reuse sample's
 // secondary point uses the same cheap resolve. RT_FLAT_LAST=0: the old behaviour.
 override FLAT_LAST:bool=true;
+// The atmosphere lights the path's last vertex too (RT_SKY_LAST=0: as before, where
+// "N bounces" gave the sun and the lamps one more path segment than the sky; found by
+// comparing against Blender Cycles with equal settings).
+override SKY_LAST:bool=true;
 override BLUE_NOISE_JITTER:bool=false;
 // `--blue-noise-path`: the first BLUE_NOISE_DIMS random numbers of every path (pixel
 // jitter, lens, bounce-0 lobe and direction) come from the 64x64 blue-noise masks,
@@ -744,6 +748,19 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                         let weight = select(misWeight(pdf,eval.a),1.,last);
                         color += throughput * radiance * eval.rgb * weight*scale;
                     }
+                }
+                if SKY_LAST && last {
+                    // Nothing scatters on from the last vertex, so a BSDF sample that
+                    // would escape never brings back the sky: the sun and the lamps lit
+                    // this vertex (light samples), the atmosphere did not. One
+                    // visibility ray in a BSDF-sampled direction adds it (the sun's
+                    // disk is the light sample's).
+                    let toSky = samplePbr(pbrSurface(ray,hit),hit,rngState).scatter;
+                    let escaped = normalize(toSky.ray.direction);
+                    if max(toSky.throughput.r,max(toSky.throughput.g,toSky.throughput.b)) > 0. && !skyOccluded(Ray(toSky.ray.origin,escaped)) {
+                        color += throughput * toSky.throughput * atmosphereRadiance(escaped);
+                    }
+                    if SKIP_FINAL_SCATTER {break;}
                 }
                 if SKIP_FINAL_SCATTER && last {
                     // All mesh BSDFs consume exactly three path random draws.

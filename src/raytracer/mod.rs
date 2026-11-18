@@ -673,6 +673,10 @@ impl Raytracer {
             ("RESTIR_BLOCKS", f64::from(restir_blocks())),
             ("GI_BLOCKS", f64::from(gi_blocks())),
             (
+                "SKY_LAST",
+                f64::from(std::env::var("RT_SKY_LAST").map_or(true, |v| v != "0")),
+            ),
+            (
                 "GI_SPATIAL_BELOW",
                 std::env::var("RT_GI_SPATIAL_BELOW").map_or(8., |v| v.parse().unwrap()),
             ),
@@ -827,7 +831,9 @@ impl Raytracer {
             ("GBUFFER", f64::from(gbuffer_enabled())),
             (
                 "REFERENCE_GUIDES",
-                f64::from(crate::has_flag("--reference-output")),
+                f64::from(
+                    crate::has_flag("--reference-output") || crate::has_flag("--reference-groups"),
+                ),
             ),
             (
                 "COHERENCE_TEST",
