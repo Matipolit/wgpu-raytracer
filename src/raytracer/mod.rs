@@ -131,6 +131,8 @@ pub struct Raytracer {
     source_prefix: String,
     source_suffix: String,
     trace_layout: wgpu::PipelineLayout,
+    /// The visibility raster exists (ReSTIR's first pass takes its primary hits from it).
+    vis_on: bool,
     /// ReSTIR's first pass (raytracer.wgsl csRestirInitial), when the scene has lamps.
     restir_pipeline: Option<(wgpu::ComputePipeline, Option<wgpu::ComputePipeline>)>,
     /// Joint network: csOutputGuides and its output-sized frame data.
@@ -671,6 +673,14 @@ impl Raytracer {
             ("RESTIR_BLOCKS", f64::from(restir_blocks())),
             ("GI_BLOCKS", f64::from(gi_blocks())),
             (
+                "GI_DROP_UNUSABLE",
+                f64::from(std::env::var("RT_GI_DROP").map_or(true, |v| v != "0")),
+            ),
+            (
+                "RESTIR_VISIBILITY",
+                f64::from(std::env::var("RT_RESTIR_VIS").map_or(true, |v| v != "0")),
+            ),
+            (
                 "GI_NULL_SAMPLES",
                 f64::from(std::env::var("RT_GI_NULL").map_or(true, |v| v != "0")),
             ),
@@ -686,10 +696,6 @@ impl Raytracer {
             (
                 "GI_TEMPORAL_TRUST",
                 f64::from(std::env::var_os("RT_GI_TEMPORAL_RECHECK").is_none()),
-            ),
-            (
-                "RESTIR_VISIBILITY_REUSE",
-                f64::from(std::env::var_os("RT_RESTIR_VISIBILITY_REUSE").is_some()),
             ),
             (
                 "GI_SPATIAL",
@@ -1141,6 +1147,7 @@ impl Raytracer {
             source_prefix: trace_source,
             source_suffix,
             trace_layout: pipeline_layout,
+            vis_on,
             trace_constants,
             scene_key: format!(
                 "{}t{}v{}m{}s",
@@ -1295,6 +1302,7 @@ impl Raytracer {
             self.trace_pipelines =
                 self.trace_pipelines_for(device, chosen, &self.tuner.variants.clone());
             self.module_config = chosen;
+            self.rebuild_reuse_pipelines(device, chosen);
         }
         if crate::has_flag("--tuner-log") {
             eprintln!("calibrate: using {chosen:?}");
@@ -1324,6 +1332,67 @@ impl Raytracer {
             variants,
             config,
         )
+    }
+
+    /// The ReSTIR passes (lamp reservoirs, bounce reuse) with the calibrated module:
+    /// their visibility rays use the stack the trace kernel was tuned to (on Iris Xe
+    /// the default workgroup-memory stack is several times slower than registers).
+    fn rebuild_reuse_pipelines(&mut self, device: &wgpu::Device, config: tuner::ModuleConfig) {
+        if self.restir_pipeline.is_none() && self.gi_pipeline.is_none() {
+            return;
+        }
+        let module = create_module(
+            device,
+            format!(
+                "{}\n{}\n{}",
+                self.source_prefix,
+                mesh_source(config),
+                self.source_suffix
+            ),
+        );
+        let constants = |vis_primary: bool| -> Vec<(&str, f64)> {
+            self.trace_constants
+                .iter()
+                .map(|&(name, value)| match name {
+                    "VIS_PRIMARY" if vis_primary => (name, 1.),
+                    "HW_CLOSEST" => (name, f64::from(config.hw.closest())),
+                    "HW_SHADOWS" => (name, f64::from(config.hw.shadows())),
+                    _ => (name, value),
+                })
+                .collect()
+        };
+        let create = |entry_point: &str, label: &str, constants: &[(&str, f64)]| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&self.trace_layout),
+                module: &module,
+                entry_point: Some(entry_point),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+        };
+        let restir = self.restir_pipeline.as_ref().map(|(_, shared)| {
+            let constants = constants(self.vis_on);
+            (
+                create("csRestirInitial", "ReSTIR initial reservoirs", &constants),
+                shared.as_ref().map(|_| {
+                    create(
+                        "csRestirShared",
+                        "ReSTIR shared block reservoirs",
+                        &constants,
+                    )
+                }),
+            )
+        });
+        let gi = self
+            .gi_pipeline
+            .as_ref()
+            .map(|_| create("csRestirGi", "ReSTIR GI reuse", &constants(false)));
+        self.restir_pipeline = restir;
+        self.gi_pipeline = gi;
     }
 
     /// Median GPU ms of the trace pass (first tuner variant) with `config`.

@@ -122,6 +122,12 @@ override GI_TEMPORAL_TRUST: bool = true;
 // counts as the pixel's sample with weight 0, and the pixel still reuses its history
 // and its neighbours. Off (RT_GI_NULL=0): such a pixel gets no bounce light that frame.
 override GI_NULL_SAMPLES: bool = true;
+// What cannot be reused here is dropped instead of counted as a sample that found no
+// light: a neighbour's sample outside the Jacobian's range is skipped, and a pick that
+// turns out hidden is forgotten (not kept with weight 0 and its full history length).
+// Counted, they dilute the pixel's good samples: day Bistro was 12% too dark overall
+// and up to 50% on facades and foliage; 1% with this. Off: RT_GI_DROP=0.
+override GI_DROP_UNUSABLE: bool = true;
 // Three vec4 per pixel of this frame's samples (primary point + normal, secondary
 // point + normal, radiance rg/b + pdf), then two sets (parity) of final reservoirs,
 // two vec4 per pixel (secondary point + normal, radiance rg/b|M, W, distance).
@@ -1501,12 +1507,17 @@ fn restirAdd(merge: ptr<function,RestirMerge>, r: Reservoir, origin: vec3<f32>, 
     (*merge).sum+=w;(*merge).m+=rm;
     if w>0. && rngNextFloat(rng)*(*merge).sum<w {(*merge).chosen=candidate;(*merge).score=score;}
 }
-// RESTIR_VISIBILITY_REUSE: an occluded winner is stored with W = 0 while its M still
-// counts (Bitterli et al.'s visibility reuse). It darkens penumbras: a zero-W history
-// of M = 80 dilutes the next frame's fresh candidates to 4/84 of their weight (night
-// Bistro and the fireplace room 3-10% darker overall). Off: reservoirs resample the
-// visibility-free target and visibility is applied once, to the shaded sample.
-override RESTIR_VISIBILITY_REUSE: bool = false;
+// The reservoirs resample a target without visibility, so on their own they keep
+// proposing bright lamps behind walls (night Bistro: 72% of lit pixels got no lamp light
+// in a frame). With RESTIR_VISIBILITY (off: RT_RESTIR_VIS=0):
+// - the winner of the fresh candidates gets a shadow ray; hidden, the candidates enter
+//   the history as LAMP_CANDIDATES samples that found nothing;
+// - a final winner that is hidden at the shaded pixel is forgotten, and the pixel starts
+//   over from fresh candidates (kept with weight 0 and its full history length it
+//   dilutes them: 3-10% darker, 38% per 8x8 block in night Bistro).
+// Night Bistro: noise per pixel 135% -> 34%, per 8x8 block 31% -> 12%; the mean of 16
+// frames is as close to the reference as before.
+override RESTIR_VISIBILITY: bool = true;
 fn restirVisible(merge: RestirMerge, hit: Intersection) -> bool {
     return merge.score>0. && !occludedWithin(Ray(hit.p+hit.geometricNormal*0.0001,merge.chosen.direction),merge.chosen.distance*0.999);
 }
@@ -1540,6 +1551,16 @@ fn csRestirInitial(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_
     if intersection(ray,&hit) && hit.sphereIdx==0xffffffffu {
         let n=hit.n;
         var merge=RestirMerge();
+        let cap=RESTIR_CAP*f32(LAMP_CANDIDATES);
+        // Temporal: the pixel's final reservoir of the previous frame.
+        var history=Reservoir();var remembered=false;
+        let previous=previousPixel(hit.p);
+        if previous.x>=0. && previous.y>=0. && previous.x<f32(frameData.x) && previous.y<f32(frameData.y) {
+            let seenFrom=distance(prevCamera.eye,hit.p);
+            let last=select(u32(previous.y)*frameData.x+u32(previous.x),restirBlock(u32(previous.x),u32(previous.y)),DI_SHARED);
+            history=loadReservoir(reservoirSet((samplingParams.restir&1u)^1u,last));
+            remembered=history.m>0. && abs(history.depth-seenFrom)<=0.1*seenFrom && dot(history.normal,n)>=0.9;
+        }
         let total=meshFloat(meshData[12u]+1u);
         for(var k=0u;k<LAMP_CANDIDATES;k+=1u) {
             let candidate=sampleLampPoint(hit.p,&rng);
@@ -1549,18 +1570,13 @@ fn csRestirInitial(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_
             if w>0. && rngNextFloat(&rng)*merge.sum<w {merge.chosen=candidate;merge.score=score;}
         }
         merge.m=f32(LAMP_CANDIDATES);
-        let cap=RESTIR_CAP*f32(LAMP_CANDIDATES);
-        // Temporal: the pixel's final reservoir of the previous frame.
-        let previous=previousPixel(hit.p);
-        if previous.x>=0. && previous.y>=0. && previous.x<f32(frameData.x) && previous.y<f32(frameData.y) {
-            let seenFrom=distance(prevCamera.eye,hit.p);
-            let last=select(u32(previous.y)*frameData.x+u32(previous.x),restirBlock(u32(previous.x),u32(previous.y)),DI_SHARED);
-            let r=loadReservoir(reservoirSet((samplingParams.restir&1u)^1u,last));
-            if r.m>0. && abs(r.depth-seenFrom)<=0.1*seenFrom && dot(r.normal,n)>=0.9 {
-                restirAdd(&merge,r,hit.p,n,cap,&rng);
-            }
+        // Fresh candidates whose winner is hidden bring nothing into the history
+        // (they still count as LAMP_CANDIDATES samples).
+        if RESTIR_VISIBILITY && merge.score>0. && !restirVisible(merge,hit) {
+            merge.chosen=LampPoint();merge.score=0.;merge.sum=0.;
         }
-        stored=restirResolve(merge,hit,cap,distance(camera.eye,hit.p),!RESTIR_VISIBILITY_REUSE || restirVisible(merge,hit));
+        if remembered {restirAdd(&merge,history,hit.p,n,cap,&rng);}
+        stored=restirResolve(merge,hit,cap,distance(camera.eye,hit.p),true);
     }
     storeReservoir(reservoirSet(RESTIR_INITIAL,slot),stored);
 }
@@ -1611,7 +1627,9 @@ fn restirLamps(hit: Intersection, surface: PbrSurface, rng: ptr<function,u32>) -
     }
     let merge=restirSpatialMerge(hit,here,rng);
     let visible=restirVisible(merge,hit);
-    let stored=restirResolve(merge,hit,cap,seenFrom,visible || !RESTIR_VISIBILITY_REUSE);
+    var stored=restirResolve(merge,hit,cap,seenFrom,true);
+    // A hidden winner is not kept: the pixel starts over from fresh candidates.
+    if RESTIR_VISIBILITY && !visible {stored.w=0.;stored.m=0.;}
     storeReservoir(reservoirSet(samplingParams.restir&1u,gbufferPixel),stored);
     if stored.w<=0. || !visible {return vec3(0.);}
     return restirShade(merge.chosen,surface,hit,stored.w);
@@ -1730,6 +1748,8 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
         // A neighbour's null sample: one more sample that found nothing.
         if nothing {m+=1.;continue;}
         let jacobian=giJacobian(other.secondary,other.secondaryNormal,other.primary,own.primary);
+        // Outside the Jacobian's range the sample is not reusable here at all.
+        if jacobian<=0. && GI_DROP_UNUSABLE {continue;}
         let score=giTarget(surface,hit,other.secondary,other.radiance);
         let w=score*jacobian/other.pdf;
         sum+=w;m+=1.;
@@ -1747,6 +1767,8 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
     }
     let slot=giFinalSlot(parity,pixel);
     giData[slot]=vec4(bitcast<vec3<u32>>(pick.secondary),pack2x16snorm(encodeOct(pick.secondaryNormal)));
+    // A hidden pick is not kept: the pixel starts over.
+    if GI_DROP_UNUSABLE && !visible {m=0.;}
     giData[slot+1u]=vec4(pack2x16float(pick.radiance.rg),pack2x16float(vec2(pick.radiance.b,min(m,GI_CAP))),bitcast<u32>(select(weight,0.,GI_VISIBILITY_REUSE && !visible)),bitcast<u32>(depth));
     if weight<=0. || !visible {return;}
     let eval=evaluatePbr(surface,hit,toSecondary/span);

@@ -68,7 +68,13 @@ for name in a.files:
         lit = tb > 0.02 * tb.mean()
         off = np.abs(mb[lit] - tb[lit]) / tb[lit]
         against = f"  block error vs reference median {np.median(off):.3f} p90 {np.quantile(off, 0.9):.3f}"
-    print(f"{pathlib.Path(name).stem:16s} {len(frames)} frames  brightness {mean.mean() / base:.3f}  noise/pixel median {np.median(rel):.2f} p90 {np.quantile(rel, 0.9):.2f}"
+    brightness = mean.mean() / base
+    if truth is not None:
+        # Without the brightest 1% of the reference's blocks (emitters, sun glints).
+        tb, mb = blocks8(truth), blocks8(mean)
+        usual = tb < np.quantile(tb, 0.99)
+        brightness = mb[usual].sum() / tb[usual].sum()
+    print(f"{pathlib.Path(name).stem:16s} {len(frames)} frames  brightness {brightness:.3f}  noise/pixel median {np.median(rel):.2f} p90 {np.quantile(rel, 0.9):.2f}"
           f"  noise/8x8 block median {np.median(block):.3f} p90 {np.quantile(block, 0.9):.3f}  log RMS {noise:.4f}  outliers {100 * bright:.3f}%  no light {100 * black:.1f}%{against}")
     x = np.maximum(frames[0], 0) * k
     panels.append((pathlib.Path(name).stem, Image.fromarray(((x / (1 + x)) ** (1 / 2.2) * 255 + 0.5).astype(np.uint8))))
