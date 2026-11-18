@@ -10,8 +10,8 @@
 #    1-spp inputs as the real-time renderer makes them (2 bounces, ReSTIR lamps + GI) at
 #    render scales 0.5 / 0.67 / 0.77, references with 4 bounces; per-scene calibration
 #    picks RT cores or compute (--hw-rt). 60 fps video inputs (night Bistro, Sponza).
-# 3. train tiny ... ultra in parallel, bf16 mixed precision (tensor cores), until 45 min
-#    before --end
+# 3. train tiny ... ultra in parallel, bf16 mixed precision (tensor cores), until 1 h
+#    before --end; then capture the evaluation set and video inputs
 # 4. evaluate every tier per render scale, render videos, write v3-summary.txt
 # Stages resume: finished captures are skipped. Log: overnight-v3.log (with --detach).
 set -u
@@ -72,25 +72,12 @@ capture() {  # out, capture.py arguments... (RT cores allowed; compute-only retr
 stamp "capture training data into $TRAIN"
 capture $TRAIN --sequences $SEQ --frames $FRAMES --spp $SPP --size $SIZE --crop $CROP --seed-base 5000 \
     --motion-range 0.03,1 --render-scale $SCALES --objects 6 --fast-fraction 0.15 2>&1 | grep -vE "^glTF: optional"
-stamp "capture evaluation set into $EVAL"
-capture $EVAL --sequences $EVAL_SEQ --frames $EVAL_FRAMES --spp $EVAL_SPP --size $EVAL_SIZE --seed-base 9500 \
-    --motion-range 0.05,0.12 --render-scale $SCALES --objects 6 --fast-fraction 0.25 2>&1 | grep -vE "^glTF: optional"
-stamp "video inputs"
-for spec in "bistro-night assets/scenes/exterior.glb -10,2,0,1,0,0.3,65 1.2 7101 --night" \
-            "sponza assets/sponza/sponza-png.glb -8,1.6,0,1,0.08,-0.08,65 1.0 7201"; do
-    set -- $spec
-    [ -f $VIDEO/$1/meta.json ] && continue
-    $BIN --model $2 --camera $3 --capture $VIDEO/$1 --scale $4 --sequences 1 --frames $VIDEO_FRAMES --no-reference \
-        --size $EVAL_SIZE --seed $5 --motion-scale 0.08 --upscale-capture 0.5,0.67 --objects 6 --fastest \
-        $FLAGS $HWRT ${6:-} 2>&1 | tail -1
-done
-
 # --- 3. training ---
 # A GPU fault during capture leaves CUDA unusable: stop rather than train on the CPU.
 if nvidia-smi > /dev/null 2>&1 && ! $PY -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
     stamp "CUDA unavailable (GPU fault?), not training"; exit 1
 fi
-HRS=$(left_hours 0.75)
+HRS=$(left_hours 1.0)
 STEPS=0
 [ $SMOKE = 1 ] && HRS=0.05 && STEPS=20
 stamp "train five tiers for $HRS h (bf16, tensor cores)"
@@ -114,7 +101,21 @@ for tier in $TIERS; do
 done
 wait
 
-# --- 4. evaluation, videos, summary ---
+# --- 4. evaluation data and videos (after training: a GPU fault while capturing,
+# Xid 62 twice on 2026-11-18, then only costs the summary), evaluation, summary ---
+stamp "capture evaluation set into $EVAL"
+capture $EVAL --sequences $EVAL_SEQ --frames $EVAL_FRAMES --spp $EVAL_SPP --size $EVAL_SIZE --seed-base 9500 \
+    --motion-range 0.05,0.12 --render-scale $SCALES --objects 6 --fast-fraction 0.25 2>&1 | grep -vE "^glTF: optional"
+stamp "video inputs"
+for spec in "bistro-night assets/scenes/exterior.glb -10,2,0,1,0,0.3,65 1.2 7101 --night" \
+            "sponza assets/sponza/sponza-png.glb -8,1.6,0,1,0.08,-0.08,65 1.0 7201"; do
+    set -- $spec
+    [ -f $VIDEO/$1/meta.json ] && continue
+    $BIN --model $2 --camera $3 --capture $VIDEO/$1 --scale $4 --sequences 1 --frames $VIDEO_FRAMES --no-reference \
+        --size $EVAL_SIZE --seed $5 --motion-scale 0.08 --upscale-capture 0.5,0.67 --objects 6 --fastest \
+        $FLAGS $HWRT ${6:-} 2>&1 | tail -1
+done
+
 for tier in $TIERS; do
     m=$R/$P-$tier
     [ -f $m/best.pt ] || continue
