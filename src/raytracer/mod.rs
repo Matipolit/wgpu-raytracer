@@ -477,8 +477,6 @@ impl Raytracer {
         if let Some(source) = temporal_source.as_mut().filter(|_| model_f16) {
             *source = source.replacen("enable f16;\n", "", 1);
         }
-        let neural = crate::argument_value("--neural-model")
-            .map(|path| std::fs::read_to_string(path).expect("cannot read neural WGSL model"));
         let mut trace_source = include_str!("raytracer.wgsl").to_owned();
         if crate::has_flag("--fp16-state") {
             let start = trace_source.find("fn rayColor(").unwrap();
@@ -535,10 +533,9 @@ impl Raytracer {
         // + the rest; the parts are kept so calibration can rebuild the trace kernel.
         let module_config = default_module_config();
         let source_suffix = format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}",
             hw_source,
             include_str!("wavefront.wgsl"),
-            neural.as_deref().unwrap_or(""),
             temporal_source.as_deref().unwrap_or(""),
             if vis_on {
                 include_str!("visibility.wgsl")
@@ -894,11 +891,7 @@ impl Raytracer {
         }
         let denoising_pipeline = create_compute(
             &filter_pipeline_layout,
-            if neural.is_some() {
-                "csNeural"
-            } else {
-                "csDenoise"
-            },
+            "csDenoise",
             "denoising compute",
             &[(
                 "SPARSE_DENOISE",

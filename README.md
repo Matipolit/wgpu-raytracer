@@ -138,10 +138,10 @@ at low sample counts. See [the implementation and validation notes](performance/
 and [asset provenance/license](assets/sponza/README.md) for details. Download the
 asset before running the complete GPU test suite.
 
-## Overnight neural denoiser
+## Neural denoisers
 
-See [training/README.md](training/README.md) for resumable 1/512 spp Sponza capture,
-CPU training, WGSL inference and the measured 5 ms acceptance gate.
+See [training/README.md](training/README.md) for the temporal denoiser and the joint
+denoise + upscale network: captures, training, WGSL export.
 
 Measured Iris Xe traversal optimizations and reproduction commands are in
 [performance/laptop/README.md](performance/laptop/README.md).
