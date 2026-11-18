@@ -49,8 +49,18 @@ pub struct JointModel {
 }
 
 impl JointModel {
-    pub fn from_args() -> Option<Self> {
-        let path = std::path::PathBuf::from(crate::argument_value("--joint-model")?);
+    /// `--joint-model FILE.wgsl`, or its f16 variant FILE.f16.wgsl (export.py --f16:
+    /// the convs in f16 math) when the device has SHADER_F16 and the file exists
+    /// (RT_JN_F32 keeps f32).
+    pub fn from_args(device: &wgpu::Device) -> Option<Self> {
+        let mut path = std::path::PathBuf::from(crate::argument_value("--joint-model")?);
+        let half = path.with_extension("f16.wgsl");
+        if device.features().contains(wgpu::Features::SHADER_F16)
+            && std::env::var_os("RT_JN_F32").is_none()
+            && half.exists()
+        {
+            path = half;
+        }
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         let bin = path.with_extension("bin");
@@ -74,12 +84,27 @@ impl JointModel {
     }
 
     fn constant(&self, name: &str) -> u64 {
+        self.optional_constant(name)
+            .unwrap_or_else(|| panic!("joint model without {name}"))
+    }
+
+    fn optional_constant(&self, name: &str) -> Option<u64> {
         self.source
             .split(&format!("const {name} = "))
             .nth(1)
             .and_then(|rest| rest.split('u').next())
             .and_then(|n| n.trim().parse().ok())
-            .unwrap_or_else(|| panic!("joint model without {name}"))
+    }
+
+    /// The f32 weight rows, and an f16 variant's f16 rows (after JN_W32 f32 rows).
+    fn weight_parts(&self) -> (&[u8], Option<&[u8]>) {
+        match self.optional_constant("JN_W32") {
+            Some(rows) => {
+                let (f32_rows, f16_rows) = self.weights.split_at(rows as usize * 16);
+                (f32_rows, Some(f16_rows))
+            }
+            None => (&self.weights, None),
+        }
     }
 }
 
@@ -89,6 +114,8 @@ pub fn joint_requested() -> bool {
 }
 
 struct Joint {
+    /// f16 variant: the f16 weight rows (binding 13).
+    weights16: Option<wgpu::Buffer>,
     /// Kernel, whether it runs on the half-resolution grid, its name (profiler label).
     pipelines: Vec<(wgpu::ComputePipeline, bool, &'static str)>,
     weights: wgpu::Buffer,
@@ -150,12 +177,13 @@ impl Upscaler {
             },
             count: None,
         };
-        let entries: Vec<_> = if joint_model.is_some() {
+        let entries: Vec<_> = if let Some(model) = joint_model {
             [uniform]
                 .into_iter()
                 .chain([1, 2, 3, 4].map(|b| storage(b, true)))
                 .chain((5..12).map(|b| storage(b, false)))
                 .chain([storage(12, true)])
+                .chain(model.weight_parts().1.map(|_| storage(13, true)))
                 .collect()
         } else {
             vec![
@@ -202,8 +230,15 @@ impl Upscaler {
                     .collect(),
                 weights: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("joint network weights"),
-                    contents: &model.weights,
+                    contents: model.weight_parts().0,
                     usage: wgpu::BufferUsages::STORAGE,
+                }),
+                weights16: model.weight_parts().1.map(|rows| {
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("joint network f16 weights"),
+                        contents: rows,
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
                 }),
                 feature_groups: model.constant("JN_FEATURE_GROUPS"),
                 hidden_groups: model.constant("JN_HIDDEN_GROUPS"),
@@ -311,24 +346,26 @@ impl Upscaler {
             let filter = buffer("joint filter ping-pong", 16 * pixels);
             let warp = buffer("joint warp record", 16 * pixels);
             let groups = std::array::from_fn(|parity| {
+                let mut entries = vec![
+                    entry(0, params),
+                    entry(1, image),
+                    entry(2, gbuffer),
+                    entry(3, &out_guides),
+                    entry(4, &history[parity]),
+                    entry(5, &history[1 - parity]),
+                    entry(6, &output),
+                    entry(7, &features),
+                    entry(8, &hidden[0]),
+                    entry(9, &hidden[1]),
+                    entry(10, &filter),
+                    entry(11, &warp),
+                    entry(12, &joint.weights),
+                ];
+                entries.extend(joint.weights16.as_ref().map(|w| entry(13, w)));
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("joint network bindings"),
                     layout,
-                    entries: &[
-                        entry(0, params),
-                        entry(1, image),
-                        entry(2, gbuffer),
-                        entry(3, &out_guides),
-                        entry(4, &history[parity]),
-                        entry(5, &history[1 - parity]),
-                        entry(6, &output),
-                        entry(7, &features),
-                        entry(8, &hidden[0]),
-                        entry(9, &hidden[1]),
-                        entry(10, &filter),
-                        entry(11, &warp),
-                        entry(12, &joint.weights),
-                    ],
+                    entries: &entries,
                 })
             });
             (groups, Some(out_guides))

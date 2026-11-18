@@ -192,7 +192,7 @@ impl Raytracer {
             ..*render_params
         };
         let render_params = &scaled_params;
-        let joint_model = upscale::JointModel::from_args();
+        let joint_model = upscale::JointModel::from_args(device);
         let upscaling = upscale::render_scale() < 1. || joint_model.is_some();
         let variants = trace_variants(device, scene);
         // The visibility raster: G-buffer experiments, or a variant starting paths from it.

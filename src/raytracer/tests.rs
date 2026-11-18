@@ -629,7 +629,12 @@ fn joint_network_matches_pytorch() {
     // (training/upscale/export.py) must agree over several frames of history.
     use wgpu::util::DeviceExt;
     let (device, queue) = gpu();
-    for tier in ["tiny", "medium"] {
+    let f16 = device.features().contains(wgpu::Features::SHADER_F16);
+    let variants = ["tiny", "medium"]
+        .into_iter()
+        .flat_map(|tier| [(tier, ""), (tier, ".f16")])
+        .filter(|&(_, variant)| variant.is_empty() || f16);
+    for (tier, variant) in variants {
         let data = std::fs::read(format!("tests/assets/joint-parity-{tier}.bin")).unwrap();
         let words: Vec<u32> = bytemuck::pod_collect_to_vec(&data[..20]);
         let [w, h, ow, oh, frames] = words[..] else {
@@ -637,8 +642,8 @@ fn joint_network_matches_pytorch() {
         };
         let floats: Vec<f32> = bytemuck::pod_collect_to_vec(&data[20..]);
         let model = upscale::JointModel {
-            source: std::fs::read_to_string(format!("models/jn-{tier}.wgsl")).unwrap(),
-            weights: std::fs::read(format!("models/jn-{tier}.bin")).unwrap(),
+            source: std::fs::read_to_string(format!("models/jn-{tier}{variant}.wgsl")).unwrap(),
+            weights: std::fs::read(format!("models/jn-{tier}{variant}.bin")).unwrap(),
         };
         let (low, high) = ((w * h) as usize, (ow * oh) as usize);
         let storage = |size: usize| {
@@ -714,7 +719,7 @@ fn joint_network_matches_pytorch() {
             let mean = errors.iter().sum::<f32>() / errors.len() as f32;
             assert!(
                 max < 2e-2 && mean < 2e-3,
-                "{tier} frame {frame}: max {max}, mean {mean}"
+                "{tier}{variant} frame {frame}: max {max}, mean {mean}"
             );
         }
     }

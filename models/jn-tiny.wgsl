@@ -19,8 +19,6 @@ struct JnParams { renderSize: vec2<u32>, outputSize: vec2<u32>, jitter: vec2<f32
 // Intermediates as packed f16 vec4s: features (output res), hidden layers (half res),
 // the a-trous ping-pong and the warp record (warped rgb + validity, gathered rgb).
 @group(0) @binding(7) var<storage, read_write> jnFeatures: array<vec2<u32>>;
-@group(0) @binding(8) var<storage, read_write> jnA: array<vec2<u32>>;
-@group(0) @binding(9) var<storage, read_write> jnB: array<vec2<u32>>;
 @group(0) @binding(10) var<storage, read_write> jnX: array<vec2<u32>>;
 @group(0) @binding(11) var<storage, read_write> jnWarp: array<vec4<u32>>;
 @group(0) @binding(12) var<storage, read> jnW: array<vec4<f32>>;
@@ -30,6 +28,10 @@ fn jnPack(v: vec4<f32>) -> vec2<u32> {
     let c = clamp(v, vec4(-6e4), vec4(6e4));
     return vec2(pack2x16float(c.xy), pack2x16float(c.zw));
 }
+@group(0) @binding(8) var<storage, read_write> jnA: array<vec2<u32>>;
+@group(0) @binding(9) var<storage, read_write> jnB: array<vec2<u32>>;
+fn jnLoadH(v: vec2<u32>) -> vec4<f32> { return jnUnpack(v); }
+fn jnStoreH(v: vec4<f32>) -> vec2<u32> { return jnPack(v); }
 fn jnHalf() -> vec2<u32> { return (jn.outputSize + vec2(1u)) / 2u; }
 // Output pixel index of a neighbour, edges replicated.
 fn jnTap(p: vec2<u32>, dx: i32, dy: i32) -> u32 {
@@ -130,7 +132,7 @@ fn csJnFeatures(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_inv
         let t = lid.y * 8u + lid.x;
         let out = (halfPixel.y * jnHalf().x + halfPixel.x) * 5u;
         for (var g = 0u; g < 5u; g += 1u) {
-            jnA[out + g] = jnPack(0.25 * (jnTile[t][g] + jnTile[t + 1u][g] + jnTile[t + 8u][g] + jnTile[t + 9u][g]));
+            jnA[out + g] = jnStoreH(0.25 * (jnTile[t][g] + jnTile[t + 1u][g] + jnTile[t + 8u][g] + jnTile[t + 9u][g]));
         }
     }
 }
@@ -145,11 +147,11 @@ fn csJnConv1(@builtin(global_invocation_id) id: vec3<u32>) {
         let p = clamp(vec2<i32>(id.xy) + vec2(i32(tap % 3u) - 1, i32(tap / 3u) - 1), vec2(0), vec2<i32>(dims) - vec2(1));
         let q = (u32(p.y) * dims.x + u32(p.x)) * 5u;
         let base = 0u + tap * 36u;
-        let x0 = jnUnpack(jnA[q + 0u]);
-        let x1 = jnUnpack(jnA[q + 1u]);
-        let x2 = jnUnpack(jnA[q + 2u]);
-        let x3 = jnUnpack(jnA[q + 3u]);
-        let x4 = jnUnpack(jnA[q + 4u]);
+        let x0 = jnLoadH(jnA[q + 0u]);
+        let x1 = jnLoadH(jnA[q + 1u]);
+        let x2 = jnLoadH(jnA[q + 2u]);
+        let x3 = jnLoadH(jnA[q + 3u]);
+        let x4 = jnLoadH(jnA[q + 4u]);
         o0 += jnW[base + 0u] * x0.x;
         o1 += jnW[base + 1u] * x0.x;
         o0 += jnW[base + 2u] * x0.y;
@@ -188,8 +190,8 @@ fn csJnConv1(@builtin(global_invocation_id) id: vec3<u32>) {
         o1 += jnW[base + 35u] * x4.y;
     }
     let i = (id.y * dims.x + id.x) * 5u;
-    jnB[i + 0u] = jnPack(max(o0, vec4(0.)));
-    jnB[i + 1u] = jnPack(max(o1, vec4(0.)));
+    jnB[i + 0u] = jnStoreH(max(o0, vec4(0.)));
+    jnB[i + 1u] = jnStoreH(max(o1, vec4(0.)));
 }
 
 @compute @workgroup_size(8, 8)
@@ -202,8 +204,8 @@ fn csJnConv2(@builtin(global_invocation_id) id: vec3<u32>) {
         let p = clamp(vec2<i32>(id.xy) + vec2(i32(tap % 3u) - 1, i32(tap / 3u) - 1), vec2(0), vec2<i32>(dims) - vec2(1));
         let q = (u32(p.y) * dims.x + u32(p.x)) * 5u;
         let base = 326u + tap * 16u;
-        let x0 = jnUnpack(jnB[q + 0u]);
-        let x1 = jnUnpack(jnB[q + 1u]);
+        let x0 = jnLoadH(jnB[q + 0u]);
+        let x1 = jnLoadH(jnB[q + 1u]);
         o0 += jnW[base + 0u] * x0.x;
         o1 += jnW[base + 1u] * x0.x;
         o0 += jnW[base + 2u] * x0.y;
@@ -222,8 +224,8 @@ fn csJnConv2(@builtin(global_invocation_id) id: vec3<u32>) {
         o1 += jnW[base + 15u] * x1.w;
     }
     let i = (id.y * dims.x + id.x) * 5u;
-    jnA[i + 0u] = jnPack(max(o0, vec4(0.)));
-    jnA[i + 1u] = jnPack(max(o1, vec4(0.)));
+    jnA[i + 0u] = jnStoreH(max(o0, vec4(0.)));
+    jnA[i + 1u] = jnStoreH(max(o1, vec4(0.)));
 }
 
 @compute @workgroup_size(8, 8)
@@ -235,8 +237,8 @@ fn csJnBlend(@builtin(global_invocation_id) id: vec3<u32>) {
     let warp = jnUnpack(packed.xy);
     let current = jnUnpack(packed.zw).xyz;
     let h = (o.y / 2u) * jnHalf().x + o.x / 2u;
-    let hh0 = jnUnpack(jnA[h * 5u + 0u]);
-    let hh1 = jnUnpack(jnA[h * 5u + 1u]);
+    let hh0 = jnLoadH(jnA[h * 5u + 0u]);
+    let hh1 = jnLoadH(jnA[h * 5u + 1u]);
     let hf0 = jnUnpack(jnFeatures[i * 5u + 0u]);
     let hf1 = jnUnpack(jnFeatures[i * 5u + 1u]);
     let hf2 = jnUnpack(jnFeatures[i * 5u + 2u]);
@@ -253,8 +255,8 @@ fn csJnFilter0(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = jn.outputSize.x * jn.outputSize.y;
     let i = o.y * jn.outputSize.x + o.x;
     let h = (o.y / 2u) * jnHalf().x + o.x / 2u;
-    let hh0 = jnUnpack(jnA[h * 5u + 0u]);
-    let hh1 = jnUnpack(jnA[h * 5u + 1u]);
+    let hh0 = jnLoadH(jnA[h * 5u + 0u]);
+    let hh1 = jnLoadH(jnA[h * 5u + 1u]);
     let hf0 = jnUnpack(jnFeatures[i * 5u + 0u]);
     let hf1 = jnUnpack(jnFeatures[i * 5u + 1u]);
     let hf2 = jnUnpack(jnFeatures[i * 5u + 2u]);
@@ -289,8 +291,8 @@ fn csJnFilter1(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = jn.outputSize.x * jn.outputSize.y;
     let i = o.y * jn.outputSize.x + o.x;
     let h = (o.y / 2u) * jnHalf().x + o.x / 2u;
-    let hh0 = jnUnpack(jnA[h * 5u + 0u]);
-    let hh1 = jnUnpack(jnA[h * 5u + 1u]);
+    let hh0 = jnLoadH(jnA[h * 5u + 0u]);
+    let hh1 = jnLoadH(jnA[h * 5u + 1u]);
     let hf0 = jnUnpack(jnFeatures[i * 5u + 0u]);
     let hf1 = jnUnpack(jnFeatures[i * 5u + 1u]);
     let hf2 = jnUnpack(jnFeatures[i * 5u + 2u]);
@@ -325,8 +327,8 @@ fn csJnFilter2(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = jn.outputSize.x * jn.outputSize.y;
     let i = o.y * jn.outputSize.x + o.x;
     let h = (o.y / 2u) * jnHalf().x + o.x / 2u;
-    let hh0 = jnUnpack(jnA[h * 5u + 0u]);
-    let hh1 = jnUnpack(jnA[h * 5u + 1u]);
+    let hh0 = jnLoadH(jnA[h * 5u + 0u]);
+    let hh1 = jnLoadH(jnA[h * 5u + 1u]);
     let hf0 = jnUnpack(jnFeatures[i * 5u + 0u]);
     let hf1 = jnUnpack(jnFeatures[i * 5u + 1u]);
     let hf2 = jnUnpack(jnFeatures[i * 5u + 2u]);
