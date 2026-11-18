@@ -2087,9 +2087,32 @@ impl Raytracer {
     /// Primary-hit guides of the last traced frame, 12 floats per pixel.
     /// The primary-hit guides, 12 floats per pixel (without the emission slot).
     pub fn read_gbuffer(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
-        let mut guides = read_buffer(device, queue, &self.images.gbuffer);
-        guides.truncate(guides.len() / 16 * 12);
-        guides
+        let pixels = self.images.gbuffer.size() / 64;
+        self.read_rows(device, queue, &self.images.gbuffer, 12, pixels)
+    }
+
+    /// With a trace region, readbacks fetch only its rows (the rest of the returned
+    /// image stays zero): a 4K capture's window is a seventh of the frame.
+    fn read_rows(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &wgpu::Buffer,
+        floats: u64,
+        pixels: u64,
+    ) -> Vec<f32> {
+        let width = u64::from(self.latest_render_params.viewport_size.0);
+        if pixels < width {
+            return Vec::new();
+        }
+        let (first, rows) = self.trace_region.map_or((0, pixels / width), |r| {
+            (u64::from(r.1), u64::from(r.3).min(pixels / width - u64::from(r.1)))
+        });
+        let mut image = vec![0f32; (pixels * floats) as usize];
+        let from = (first * width * floats) as usize;
+        let part = read_buffer_range(device, queue, buffer, from as u64 * 4, rows * width * floats * 4);
+        image[from..from + part.len()].copy_from_slice(&part);
+        image
     }
 
     /// The displayed (filtered or denoised) radiance, 3 floats per pixel.
@@ -2114,10 +2137,10 @@ impl Raytracer {
     /// Mean radiance per pixel accumulated so far, 3 floats per pixel.
     pub fn read_radiance(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
         let samples = self.render_progress.accumulated_samples().max(1) as f32;
-        read_buffer(device, queue, self.images.accumulation.handle())
-            .into_iter()
-            .map(|v| v / samples)
-            .collect()
+        let buffer = self.images.accumulation.handle();
+        let mut image = self.read_rows(device, queue, buffer, 3, buffer.size() / 12);
+        image.iter_mut().for_each(|v| *v /= samples);
+        image
     }
 
     fn prepare_frame(&mut self, queue: &wgpu::Queue) -> GpuSamplingParams {
@@ -2599,7 +2622,16 @@ pub fn gbuffer_enabled() -> bool {
 }
 
 fn read_buffer(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Buffer) -> Vec<f32> {
-    let size = source.size();
+    read_buffer_range(device, queue, source, 0, source.size())
+}
+
+fn read_buffer_range(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Buffer,
+    offset: u64,
+    size: u64,
+) -> Vec<f32> {
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size,
@@ -2607,7 +2639,7 @@ fn read_buffer(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Buffer
         mapped_at_creation: false,
     });
     let mut encoder = device.create_command_encoder(&Default::default());
-    encoder.copy_buffer_to_buffer(source, 0, &buffer, 0, size);
+    encoder.copy_buffer_to_buffer(source, offset, &buffer, 0, size);
     queue.submit([encoder.finish()]);
     buffer
         .slice(..)

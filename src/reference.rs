@@ -196,6 +196,7 @@ async fn render() {
             trace(&device, &queue, &mut tracer, tiles[t], n / PASS);
             passes[t] = n / PASS;
         }
+        tracer.set_trace_region(None);
         add(&tracer, &mut sums[0], &all, n / PASS);
     } else {
         let mut active: Vec<usize> = (0..tiles.len()).collect();
@@ -208,6 +209,8 @@ async fn render() {
                 for &t in &active {
                     trace(&device, &queue, &mut tracer, tiles[t], count);
                 }
+                // Readbacks cover the trace region's rows only: read the whole frame.
+                tracer.set_trace_region(None);
                 add(&tracer, group, &active, count);
             }
             for &t in &active {

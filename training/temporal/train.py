@@ -28,6 +28,7 @@ p.add_argument("--batch", type=int, default=4)
 p.add_argument("--crop", type=int, default=128)
 p.add_argument("--lr", type=float, default=2e-3)
 p.add_argument("--holdout-scene", default="fireplace-room")
+p.add_argument("--val-sequences", type=int, default=2, help="last sequences of every scene directory held out for validation")
 p.add_argument("--temporal-weight", type=float, default=0.5)
 p.add_argument("--eval-every", type=int, default=400)
 p.add_argument("--channels", type=int, default=16)
@@ -65,15 +66,16 @@ def load(scene_dir):
 
 
 train, val, test = [], [], []
-for scene_dir in sorted(pathlib.Path(a.data).iterdir()):
+# --data takes several capture directories (e.g. one per output resolution).
+for scene_dir in sorted(d for data in a.data.split(",") for d in pathlib.Path(data).iterdir()):
     if not (scene_dir / "meta.json").exists():
         continue
     seqs = load(scene_dir)
     if scene_dir.name == a.holdout_scene:
         test += [(scene_dir.name, s) for s in seqs]
     else:
-        train += [(scene_dir.name, s) for s in seqs[:-2]]
-        val += [(scene_dir.name, s) for s in seqs[-2:]]
+        train += [(scene_dir.name, s) for s in seqs[: -a.val_sequences]]
+        val += [(scene_dir.name, s) for s in seqs[-a.val_sequences :]]
 print(f"train {len(train)} seqs, val {len(val)}, test ({a.holdout_scene}) {len(test)}, device {a.device}", flush=True)
 
 

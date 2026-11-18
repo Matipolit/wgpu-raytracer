@@ -8,7 +8,8 @@
 # 2. data (training/runs/v4-*): every benchmark view plus night Bistro, 6 moving
 #    objects, 15% fast-motion sequences; 1-spp inputs as the real-time renderer traces
 #    them (2 bounces, ReSTIR lamps + bounce reuse) at full size and at render scales
-#    0.5 / 0.67; references: the plain path tracer, 2 bounces, 1024 spp in 8 groups,
+#    0.5 / 0.67, as 320-pixel windows of 720p, 1080p, 1440p and 4K frames;
+#    references: the plain path tracer, 2 bounces, 1024 spp in 8 groups,
 #    finished by training/reference/finish_capture.py. Compute only (RT-core captures
 #    hung the GPU twice on 2026-11-18).
 # 3. train until 30 min before --end, in parallel: td-half16, td2-half24
@@ -45,25 +46,33 @@ cargo build --release --locked 2>&1 | tail -1 || exit 1
 
 FLAGS="--restir --bounces 2 --reference-bounces 2 --reference-groups 8"
 SCALES=0.5,0.67
+# Output resolutions: windows of 720p, 1080p, 1440p and 4K frames (a window costs the
+# same at any frame size), so the networks see pixels of every size on screen.
 if [ $SMOKE = 1 ]; then
     P=v4-smoke SCENES="--scenes fireplace-room,sponza-atrium"
-    SEQ=4 FRAMES=3 SPP=64 SIZE=640x400 CROP=128 EVAL_SEQ=1 EVAL_FRAMES=3 EVAL_SIZE=320x200
+    SIZES="640x400 1280x720" SEQ=3 FRAMES=3 SPP=64 CROP=128 EVAL_SEQ=1 EVAL_FRAMES=3 EVAL_SIZE=320x200
 else
     P=v4 SCENES=""
-    SEQ=${SEQ:-10} FRAMES=16 SPP=1024 SIZE=1280x720 CROP=320 EVAL_SEQ=2 EVAL_FRAMES=8 EVAL_SIZE=960x540
+    SIZES="1280x720 1920x1080 2560x1440 3840x2160" SEQ=${SEQ:-3} FRAMES=16 SPP=1024 CROP=320 EVAL_SEQ=2 EVAL_FRAMES=8 EVAL_SIZE=960x540
 fi
-TRAIN=$R/$P-train EVAL=$R/$P-eval
+EVAL=$R/$P-eval
+TRAIN=""
+for size in $SIZES; do TRAIN="$TRAIN${TRAIN:+,}$R/$P-train-${size#*x}"; done
 gpu_ok() { nvidia-smi > /dev/null 2>&1 && $PY -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; }
 
-stamp "capture training data into $TRAIN"
-python3 training/temporal/capture.py $TRAIN $SCENES --sequences $SEQ --frames $FRAMES --spp $SPP --size $SIZE --crop $CROP \
-    --seed-base 11000 --motion-range 0.03,1 --render-scale $SCALES --objects 6 --fast-fraction 0.15 --flags "$FLAGS" 2>&1 | grep -vE "^glTF: optional"
-gpu_ok || { stamp "GPU fault after the training capture"; exit 1; }
-stamp "finish the training references"
-$PY training/reference/finish_capture.py $TRAIN
+seed=11000
+for size in $SIZES; do
+    out=$R/$P-train-${size#*x}
+    stamp "capture training data into $out"
+    python3 training/temporal/capture.py $out $SCENES --sequences $SEQ --frames $FRAMES --spp $SPP --size $size --crop $CROP \
+        --seed-base $seed --motion-range 0.03,1 --render-scale $SCALES --objects 6 --fast-fraction 0.15 --flags "$FLAGS" 2>&1 | grep -vE "^glTF: optional|^SBVH|^Textures|^glTF"
+    gpu_ok || { stamp "GPU fault during the training capture"; exit 1; }
+    $PY training/reference/finish_capture.py $out
+    seed=$((seed + 100))
+done
 stamp "capture evaluation set into $EVAL"
 python3 training/temporal/capture.py $EVAL $SCENES --sequences $EVAL_SEQ --frames $EVAL_FRAMES --spp $SPP --size $EVAL_SIZE \
-    --seed-base 12500 --motion-range 0.05,0.12 --render-scale $SCALES --objects 6 --fast-fraction 0.25 --flags "$FLAGS" 2>&1 | grep -vE "^glTF: optional"
+    --seed-base 12500 --motion-range 0.05,0.12 --render-scale $SCALES --objects 6 --fast-fraction 0.25 --flags "$FLAGS" 2>&1 | grep -vE "^glTF: optional|^SBVH|^Textures|^glTF"
 gpu_ok || { stamp "GPU fault after the evaluation capture"; exit 1; }
 $PY training/reference/finish_capture.py $EVAL
 
@@ -72,8 +81,9 @@ STEPS=""
 [ $SMOKE = 1 ] && HRS=0.03
 stamp "train for $HRS h: td-half16, td2-half24$([ -f training/fast/train.py ] && echo ', fast network')"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-(cd training/temporal && $PY train.py --data ../../$TRAIN --out ../../$R/$P-td-half16 --hours $HRS --channels 16 --half > ../../$R/$P-td-half16.log 2>&1) &
-(cd training/temporal && $PY train.py --data ../../$TRAIN --out ../../$R/$P-td2-half24 --hours $HRS --channels 24 --half > ../../$R/$P-td2-half24.log 2>&1) &
+TD_DATA=$(echo "$TRAIN" | sed 's|training/runs|../../training/runs|g')
+(cd training/temporal && $PY train.py --data $TD_DATA --out ../../$R/$P-td-half16 --hours $HRS --channels 16 --half --val-sequences 1 > ../../$R/$P-td-half16.log 2>&1) &
+(cd training/temporal && $PY train.py --data $TD_DATA --out ../../$R/$P-td2-half24 --hours $HRS --channels 24 --half --val-sequences 1 > ../../$R/$P-td2-half24.log 2>&1) &
 if [ -f training/fast/train.py ]; then
     $PY training/fast/train.py --data $TRAIN --out $R/$P-fast --hours $HRS > $R/$P-fast.log 2>&1 &
 fi
