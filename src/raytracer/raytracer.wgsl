@@ -287,11 +287,13 @@ fn csOutputGuides(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_i
     if id.x >= frameData.x || id.y >= frameData.y {return;}
     gbufferPixel = frameData.x * id.y + id.x;
     var rng = initRng(id.xy, frameData.xy, frameData.z ^ 0x68e31da4u);
-    gbufferSample = vec2<f32>(id.xy) + frameJitter(frameData.z);
+    // Primary hits from the output-resolution raster when there is one (same jitter).
+    var jitter = frameJitter(frameData.z);
+    if VIS_PRIMARY {jitter = visibilityJitter(); visibilityPending = true;}
+    gbufferSample = vec2<f32>(id.xy) + jitter;
     let u = gbufferSample.x / f32(frameData.x);
     let v = gbufferSample.y / f32(frameData.y);
     if RAY_CONES {coneActive = false;}
-    if VIS_PRIMARY {visibilityPending = false;}
     let ray = cameraMakeRay(camera, &rng, u, 1. - v);
     var hit = Intersection();
     if intersection(ray, &hit) {writeGbufferHit(ray, hit);} else {writeGbufferMiss(ray);}
