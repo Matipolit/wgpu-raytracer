@@ -29,7 +29,8 @@ target; the shadow ray only gates the shaded sample.
 | fireplace room | 0.785 / 0.704 / 0.756 | 22.79 -> 24.01 dB |
 
 The DI first pass no longer traces a shadow ray; the frame time is unchanged.
-`RT_RESTIR_VISIBILITY_REUSE=1` restores the old behaviour.
+Superseded on 2026-11-18 (visibility-aware lamp reuse below): without any visibility
+the reservoirs keep proposing hidden lamps. The old switch is gone.
 
 ## GI bounce per 2x2 block (9642570)
 
@@ -75,34 +76,95 @@ Quality: 4x4 PSNR -0.6 dB (Bistro) / -0.5 dB (fireplace), and the noise is visib
 default. Trusting last frame's DI visibility instead (as GI does) saved only 1 ms:
 the winner usually comes from a neighbour's reservoir.
 
-## Bounded visible normals by default; lamp candidates (2026-11-18)
+## Raw-frame noise and bias (2026-11-18, 00bdfa7)
 
-Raw 1-spp frames as the real-time renderer traces them (ReSTIR DI + GI, 2 bounces, no
-denoiser or upscaler, 960x540, still camera, Iris Xe): `--render-output x.png
---raw-frames FILE` keeps every 32nd frame, `training/reference/raw_frames.py`
-measures the noise of one frame around the mean of 16. Repeated runs agree to 1%.
+Method: raw 1-spp frames as the real-time renderer traces them (ReSTIR DI + GI, 2
+bounces, no denoiser or upscaler, 960x540, still camera). `--render-output x.png
+--raw-frames FILE` keeps every 32nd frame; `training/reference/raw_frames.py
+--reference DIR` gives the noise of one frame around the mean of 16 (relative to an
+unbiased reference, `--reference-output` with 2 bounces), the share of lit pixels
+that got no light in a frame, and how far the 16-frame mean is from the reference per
+8x8 block (bias plus leftover noise). Noise and bias runs on the RTX PC (they match
+the laptop's to 1%); frame times on the Steam Deck (repeat to 0.5 ms).
 
-| scene | setting | noise per pixel (median) | noise per 8x8 block | pixels with no light | ms |
-|---|---|---:|---:|---:|---:|
-| Sponza | normal distribution (before) | 1.14 | 0.174 | 39.5% | 65.8 |
-| Sponza | bounded visible normals | 0.64 | 0.099 | 19.4% | 66.8 |
-| Bistro day | before | 1.04 | 0.158 | 29.5% | 208 |
-| Bistro day | bounded visible normals | 0.59 | 0.094 | 15.7% | 203 |
-| Bistro night | before | 1.73 | 0.356 | 32.7% | 188 |
-| Bistro night | bounded visible normals | 1.67 | 0.347 | 17.4% | 184 |
-| Bistro night | 16 / 4 lamp candidates | 1.70 | 0.341 | 31.1% | 186 |
-| Bistro night | 32 / 8 lamp candidates | 1.69 | 0.334 | | 189 |
-| Bistro night | 16 / 4 candidates + bounded | 1.64 | 0.334 | | 188 |
+Four changes, all defaults now:
+1. **Bounded visible normals** (`--ndf-sampling` goes back). Sampling the normal
+   distribution reflects many specular samples below the surface; the path dies.
+2. **Null bounce samples** (RT_GI_NULL=0). A pixel whose bounce sample failed
+   recorded nothing and skipped temporal and spatial reuse for the frame. It now
+   counts as a sample that found nothing and the pixel still reuses.
+3. **Unusable bounce samples dropped** (RT_GI_DROP=0). A neighbour's sample outside
+   the Jacobian's range was counted as a sample without light, and a pick found
+   hidden was kept with weight 0 and its full history length. Both dilute the good
+   samples. Now the neighbour is skipped and the hidden pick forgotten.
+4. **Visibility-aware lamp reuse** (RT_RESTIR_VIS=0). The winner of the fresh
+   candidates gets a shadow ray (hidden: the candidates enter the history as samples
+   that found nothing), and a final winner hidden at the shaded pixel is forgotten.
+   Before, reservoirs resampled a target without visibility and kept proposing bright
+   lamps behind walls: with direct light only, 72% of lit night Bistro pixels got no
+   light in a frame.
 
-- **Bounded visible normals are now the default** (`--ndf-sampling` goes back).
-  Sampling the normal distribution reflects many specular samples below the surface;
-  such a pixel then gets no bounce and no ReSTIR GI that frame. Mean brightness is
-  unchanged (within 1%). td2 + TAAU on still Sponza is unchanged (30.36 -> 30.40 dB,
-  flicker 0.0010): the denoiser was hiding this noise already.
-- **Lamp candidates stay at 4 / 2** (`--lamp-candidates N,M` or RT_LAMP_CANDIDATES):
-  16 / 4 lowers night Bistro's noise 2-4%, 32 / 8 2-6%. Frame times were within
-  run-to-run noise (179-188 ms for the same setting); the laptop was in use.
-- Still 16-19% of lit pixels get no light in a frame with ReSTIR GI on.
+| scene | | noise per pixel | noise per 8x8 block | no light | brightness | block error |
+|---|---|---:|---:|---:|---:|---:|
+| Sponza | before | 1.14 | 0.174 | 39.5% | | |
+| Sponza | 1 | 0.63 | 0.098 | 19.4% | 0.99 | |
+| Sponza | 1-2 | 0.40 | 0.062 | 9.2% | 0.987 | 0.080 |
+| Sponza | all | 0.42 | 0.068 | 9.0% | 1.002 | 0.056 |
+| Bistro day | before | 1.04 | 0.158 | 29.5% | | |
+| Bistro day | 1 | 0.59 | 0.094 | 15.7% | | |
+| Bistro day | 1-2 | 0.36 | 0.057 | 10.3% | 0.877 | 0.141 |
+| Bistro day | all | 0.39 | 0.071 | 5.5% | 0.996 | 0.035 |
+| Bistro night | 1-2 | 1.33 | 0.306 | 10.8% | 0.981 | 0.083 |
+| Bistro night | all | 0.36 | 0.120 | 5.7% | 0.970 | 0.073 |
+| fireplace room | 1-2 | 0.75 | 0.166 | 4.0% | 0.943 | 0.058 |
+| fireplace room | all | 0.29 | 0.109 | 1.7% | 0.945 | 0.060 |
+
+(Rows "before" and "1" normalize noise by the frames' own mean, the others by the
+reference; brightness leaves out the brightest 1% of blocks.)
+
+- Day Bistro was 12% too dark, up to 50% on facades and foliage: change 3. The block
+  error of 0.035 is at the noise floor of the unbiased path tracer's 16-frame mean.
+- Night Bistro's noise is direct lamp light: direct only 1.33, with the bounce 1.35.
+  Lamp candidates barely matter (16 / 4: 2-4% less noise for 3-4.5 ms on the Deck;
+  the default stays 4 / 2, `--lamp-candidates N,M`).
+- Variants measured and dropped: fresh candidates only every 2nd / 4th / 8th frame
+  (block noise 0.120 / 0.134 / 0.150 and a growing bright bias, little time saved);
+  keeping part of a hidden lamp winner's history (more bias); not counting temporal
+  bounce samples that cannot light the pixel (fixes day Bistro, 12% too bright in
+  Sponza's shade); a normal check on the temporal bounce reservoir (no effect).
+
+Frame time, Steam Deck, 1280x800 (ms; cumulative):
+
+| scene, preset | before | 1 | 1-2 | 1-3 | all |
+|---|---:|---:|---:|---:|---:|
+| Sponza Low | 17.7 | 19.0 | 19.1 | 19.1 | 19.1 |
+| Sponza Medium | 29.9 | 33.7 | 34.6 | 34.0 | 34.8 |
+| night Bistro Low | 43.2 | 44.2 | 44.2 | 44.2 | 45.5 |
+| night Bistro Medium | 75.9 | 78.1 | 79.4 | 79.0 | 79.5 |
+
+- Change 1 costs the most (Sponza Medium +13%): fewer paths die at the first hit, so
+  more bounce rays are traced. Changes 2 and 3 cost up to 1 ms.
+- Change 4: the lamp pass grows by 4-7.5 ms and the trace pass shrinks by 3-7 ms
+  (the shaded lamp is usually near and visible), +0.5 to +3% in total.
+- Laptop (Iris Xe, 1280x720, two quiet runs each): Sponza Medium 33-35 -> 39-40 ms,
+  night Bistro Low 42-43 -> 43-46 ms, Medium 73-83 -> 78 ms. Its timings while in
+  use are unusable (the lamp pass alone read 4.4 or 18 ms).
+
+Finished image (td2-half24 + TAAU, 1280x720 at 0.67, last of 96 still frames against
+a finished reference, exposure from the log-average luminance), before -> all:
+
+| scene | median error per pixel | median brightness | PSNR |
+|---|---|---|---|
+| Sponza | 0.191 -> 0.160 | 0.92 -> 1.00 | 20.85 -> 21.06 dB |
+| Bistro day | 0.201 -> 0.130 | 0.84 -> 0.99 | 23.19 -> 24.13 dB |
+| Bistro night | 0.175 -> 0.141 | 0.92 -> 0.98 | 14.55 -> 14.49 dB |
+| fireplace room | 0.101 -> 0.097 | 0.97 -> 0.99 | 14.76 -> 16.11 dB |
+
+Flicker (stability evaluation, still / slow / fast camera) is unchanged or slightly
+lower in all four scenes. The denoisers were trained on the old noise.
+
+The lamp and bounce reuse passes are now rebuilt with the calibrated kernel
+configuration; they kept the default stack before.
 
 ## Not adopted
 
