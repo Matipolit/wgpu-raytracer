@@ -113,6 +113,16 @@ pub fn joint_requested() -> bool {
     crate::argument_value("--joint-model").is_some()
 }
 
+/// `--detail-upscale`: the detail upscaler (detail.wgsl) instead of TAAU.
+pub fn detail_requested() -> bool {
+    crate::has_flag("--detail-upscale") && !joint_requested()
+}
+
+/// Whether the upscaler needs this frame's guides at output resolution.
+pub fn output_guides_requested() -> bool {
+    joint_requested() || detail_requested()
+}
+
 struct Joint {
     /// f16 variant: the f16 weight rows (binding 13).
     weights16: Option<wgpu::Buffer>,
@@ -126,6 +136,8 @@ struct Joint {
 pub struct Upscaler {
     pipeline: Option<wgpu::ComputePipeline>,
     joint: Option<Joint>,
+    /// `--detail-upscale` (detail.wgsl): csDetailCurrent, csDetailResolve.
+    detail: Option<[wgpu::ComputePipeline; 2]>,
     layout: wgpu::BindGroupLayout,
     params: wgpu::Buffer,
     /// Ping-pong history and the two bind groups reading one, writing the other.
@@ -156,6 +168,7 @@ impl Upscaler {
         render_size: (u32, u32),
         denoised: bool,
         joint_model: Option<&JointModel>,
+        detail: bool,
     ) -> Self {
         let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
@@ -184,6 +197,12 @@ impl Upscaler {
                 .chain((5..12).map(|b| storage(b, false)))
                 .chain([storage(12, true)])
                 .chain(model.weight_parts().1.map(|_| storage(13, true)))
+                .collect()
+        } else if detail {
+            [uniform]
+                .into_iter()
+                .chain([1, 2, 3, 4].map(|b| storage(b, true)))
+                .chain([5, 6, 7].map(|b| storage(b, false)))
                 .collect()
         } else {
             vec![
@@ -244,6 +263,8 @@ impl Upscaler {
                 hidden_groups: model.constant("JN_HIDDEN_GROUPS"),
             };
             (None, Some(joint))
+        } else if detail {
+            (None, None)
         } else {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("upscaler"),
@@ -251,6 +272,16 @@ impl Upscaler {
             });
             (Some(compute(&module, "csUpscale")), None)
         };
+        let detail = (joint.is_none() && detail).then(|| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("detail upscaler"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("detail.wgsl").into()),
+            });
+            [
+                compute(&module, "csDetailCurrent"),
+                compute(&module, "csDetailResolve"),
+            ]
+        });
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("upscaler parameters"),
             size: std::mem::size_of::<Params>() as u64,
@@ -263,6 +294,7 @@ impl Upscaler {
             &layout,
             &params,
             joint.as_ref(),
+            detail.is_some(),
             image,
             gbuffer,
             display_layout,
@@ -273,6 +305,7 @@ impl Upscaler {
         Self {
             pipeline,
             joint,
+            detail,
             layout,
             params,
             groups,
@@ -294,6 +327,7 @@ impl Upscaler {
         layout: &wgpu::BindGroupLayout,
         params: &wgpu::Buffer,
         joint: Option<&Joint>,
+        detail: bool,
         image: &wgpu::Buffer,
         gbuffer: &wgpu::Buffer,
         display_layout: &wgpu::BindGroupLayout,
@@ -369,6 +403,31 @@ impl Upscaler {
                 })
             });
             (groups, Some(out_guides))
+        } else if detail {
+            let out_guides = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("output-resolution guides"),
+                size: 48 * pixels,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let current = buffer("detail current colour", 8 * pixels);
+            let groups = std::array::from_fn(|parity| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("detail upscaler bindings"),
+                    layout,
+                    entries: &[
+                        entry(0, params),
+                        entry(1, image),
+                        entry(2, gbuffer),
+                        entry(3, &out_guides),
+                        entry(4, &history[parity]),
+                        entry(5, &history[1 - parity]),
+                        entry(6, &output),
+                        entry(7, &current),
+                    ],
+                })
+            });
+            (groups, Some(out_guides))
         } else {
             let groups = std::array::from_fn(|parity| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -415,6 +474,7 @@ impl Upscaler {
             &self.layout,
             &self.params,
             self.joint.as_ref(),
+            self.detail.is_some(),
             image,
             gbuffer,
             display_layout,
@@ -448,7 +508,14 @@ impl Upscaler {
         exposure_bits: u32,
         mut profiler: Option<&mut super::profiler::PassProfiler>,
     ) {
-        let (alpha_min, alpha_max) = if self.denoised {
+        let env = |name: &str, default: f32| {
+            std::env::var(name).map_or(default, |v| v.parse().expect(name))
+        };
+        // Detail mode: the blend floor and the variance-clipping width (in the
+        // alpha_max slot); RT_DETAIL_ALPHA / RT_DETAIL_GAMMA for experiments.
+        let (alpha_min, alpha_max) = if self.detail.is_some() {
+            (env("RT_DETAIL_ALPHA", 0.08), env("RT_DETAIL_GAMMA", 1.25))
+        } else if self.denoised {
             (0.1, 0.4)
         } else {
             (0.04, 0.15)
@@ -501,6 +568,16 @@ impl Upscaler {
                 if let Some(profiler) = profiler.as_deref_mut() {
                     profiler.mark(encoder, last);
                 }
+            }
+        } else if let Some(pipelines) = &self.detail {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("detail upscale pass"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, group, &[]);
+            for pipeline in pipelines {
+                pass.set_pipeline(pipeline);
+                pass.dispatch_workgroups(full.0, full.1, 1);
             }
         } else if let Some(pipeline) = &self.pipeline {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

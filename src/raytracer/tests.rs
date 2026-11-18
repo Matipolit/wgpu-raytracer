@@ -688,6 +688,7 @@ fn joint_network_matches_pytorch() {
             (w, h),
             false,
             Some(&model),
+            false,
         );
         let mut at = 0;
         let mut take = |n: usize| {

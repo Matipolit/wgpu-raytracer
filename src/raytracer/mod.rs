@@ -675,7 +675,7 @@ impl Raytracer {
             ("GI_BLOCKS", f64::from(gi_blocks())),
             (
                 "VIS_OUTPUT",
-                f64::from(vis_on && upscale::joint_requested()),
+                f64::from(vis_on && upscale::output_guides_requested()),
             ),
             ("DI_SHARED", f64::from(di_shared())),
             (
@@ -859,7 +859,7 @@ impl Raytracer {
             });
         // Joint network: this frame's guides at output resolution (primary rays; the
         // visibility buffer is render-sized).
-        let output_guides_pipeline = joint_model.is_some().then(|| {
+        let output_guides_pipeline = upscale::output_guides_requested().then(|| {
             let constants: Vec<(&str, f64)> = trace_constants
                 .iter()
                 .map(|&(name, value)| match name {
@@ -1044,7 +1044,7 @@ impl Raytracer {
         // Joint network: one raster at output resolution serves the tracer's primary
         // hits and the output guides (raytracer.wgsl VIS_OUTPUT).
         let visibility = vis_on.then(|| {
-            make_visibility(if joint_model.is_some() {
+            make_visibility(if upscale::output_guides_requested() {
                 output_size
             } else {
                 render_params.viewport_size
@@ -1067,6 +1067,7 @@ impl Raytracer {
                 render_params.viewport_size,
                 temporal_source.is_some(),
                 joint_model.as_ref(),
+                upscale::detail_requested(),
             )
         });
         // Bloom works on the image the display pass shows (the upscaler's output-size
@@ -2008,6 +2009,20 @@ impl Raytracer {
     /// The displayed (filtered or denoised) radiance, 3 floats per pixel.
     pub fn read_filtered(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
         read_buffer(device, queue, self.images.filtered.handle())
+    }
+
+    /// The image the display pass shows (before exposure and tonemapping): the
+    /// upscaler's output, or the filtered render. 3 floats per pixel.
+    pub fn read_display(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
+        self.upscaler.as_ref().map_or_else(
+            || self.read_filtered(device, queue),
+            |u| read_buffer(device, queue, u.output()),
+        )
+    }
+
+    /// Output and render resolution.
+    pub fn sizes(&self) -> ((u32, u32), (u32, u32)) {
+        (self.output_size, self.latest_render_params.viewport_size)
     }
 
     /// Mean radiance per pixel accumulated so far, 3 floats per pixel.

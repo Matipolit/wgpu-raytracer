@@ -69,8 +69,11 @@ async fn render() {
     };
     params.sampling.denoising_enabled = !std::env::args().any(|a| a == "--no-denoise")
         && !crate::raytracer::upscale::joint_requested();
-    params.sampling.restir =
-        crate::has_flag("--restir") || crate::raytracer::upscale::joint_requested();
+    // As the app (main.rs): a temporal denoiser or the joint network implies ReSTIR.
+    params.sampling.restir = (crate::has_flag("--restir")
+        || crate::has_flag("--temporal-model")
+        || crate::raytracer::upscale::joint_requested())
+        && !crate::has_flag("--no-restir");
     if let Some((position, direction, vfov)) = crate::camera_argument() {
         params.camera.eye_pos = position;
         params.camera.eye_dir = direction;
@@ -131,7 +134,21 @@ async fn render() {
     let setup = build.elapsed();
     let start = Instant::now();
     let mut gpu_ms = Vec::new();
+    let (output_size, render_size) = tracer.sizes();
+    let mut stability = crate::stability::Stability::from_args(output_size, render_size);
+    // `--eval-velocity X,Y,Z` (scene units per frame) and `--eval-yaw DEGREES` per frame.
+    let velocity = crate::argument_value("--eval-velocity").map(|v| {
+        let c: Vec<f32> = v.split(',').map(|x| x.parse().unwrap()).collect();
+        glm::vec3(c[0], c[1], c[2])
+    });
+    let yaw: f32 = crate::argument_value("--eval-yaw").map_or(0., |v| v.parse().unwrap());
     for frame in 0..samples {
+        if frame > 0 && (velocity.is_some() || yaw != 0.) {
+            params.camera.eye_pos += velocity.unwrap_or_default();
+            params.camera.eye_dir =
+                glm::rotate_vec3(&params.camera.eye_dir, yaw.to_radians(), &params.camera.up);
+            tracer.set_render_params(&device, &queue, &params).unwrap();
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         if let Some(query) = &query {
             encoder.write_timestamp(query, 0);
@@ -185,6 +202,13 @@ async fn render() {
                 }
             }
             timer.unmap();
+        }
+        if let Some(stability) = &mut stability {
+            stability.frame(
+                frame,
+                &tracer.read_display(&device, &queue),
+                &tracer.read_gbuffer(&device, &queue),
+            );
         }
         if samples >= 512 && (frame + 1) % 256 == 0 {
             eprintln!(
@@ -297,6 +321,10 @@ async fn render() {
     );
     if let Some(times) = tracer.pass_times() {
         eprintln!("{times}");
+    }
+    if let Some(stability) = &stability {
+        stability.dump();
+        println!("{}", stability.report());
     }
     eprintln!("Auto-tune: ended on {}", tracer.trace_variant());
     eprintln!(
