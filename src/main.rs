@@ -27,6 +27,7 @@ mod gui;
 mod launcher;
 mod offline;
 mod raytracer;
+mod reference;
 mod shapes;
 mod stability;
 
@@ -97,6 +98,10 @@ fn main() {
     }
     if has_flag("--capture") {
         capture::run();
+        return;
+    }
+    if has_flag("--reference-output") {
+        reference::run();
         return;
     }
     // No arguments: the launcher menu, which restarts the renderer with its choices.

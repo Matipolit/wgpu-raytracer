@@ -806,6 +806,10 @@ impl Raytracer {
             ),
             ("GBUFFER", f64::from(gbuffer_enabled())),
             (
+                "REFERENCE_GUIDES",
+                f64::from(crate::has_flag("--reference-output")),
+            ),
+            (
                 "COHERENCE_TEST",
                 f64::from(std::env::var("RT_COHERENCE_TEST").is_ok()),
             ),
@@ -2485,6 +2489,7 @@ fn create_module(device: &wgpu::Device, source: String) -> wgpu::ShaderModule {
 pub fn gbuffer_enabled() -> bool {
     crate::has_flag("--gbuffer")
         || crate::has_flag("--capture")
+        || crate::has_flag("--reference-output")
         || crate::has_flag("--temporal-model")
         || crate::has_flag("--restir")
         || upscale::joint_requested()
@@ -2541,7 +2546,10 @@ fn restir_blocks() -> bool {
 }
 
 fn auto_tune() -> bool {
-    !crate::has_flag("--no-auto-tune") && !crate::has_flag("--capture") && !cfg!(test)
+    !crate::has_flag("--no-auto-tune")
+        && !crate::has_flag("--capture")
+        && !crate::has_flag("--reference-output")
+        && !cfg!(test)
 }
 
 /// Trace-pass variants worth trying for this scene and device. Explicit flags force a

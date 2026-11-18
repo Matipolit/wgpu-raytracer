@@ -148,6 +148,9 @@ override SPARSE_DENOISE:bool=false;
 override TRAVERSAL_STATS:bool=false;
 // Write primary-hit guides and motion vectors (temporal denoiser input).
 override GBUFFER:bool=false;
+// Reference frames (reference.rs): after a dispatch the G-buffer's albedo and normal
+// are the means over its samples (pixel-integrated guides), not the last sample's.
+override REFERENCE_GUIDES:bool=false;
 override COHERENCE_TEST:bool=false;
 var<private> gbufferPixel:u32;
 var<private> gbufferSample:vec2<f32>;
@@ -565,6 +568,8 @@ fn samplePixel(x: u32, y: u32, rngState: ptr<function, u32>) -> vec3<f32> {
     let numSamples = samplingParams.numSamplesPerPixel;
     var color = vec3(0f);
     var emission = vec3(0f);
+    var guideAlbedo = vec3(0f);
+    var guideNormal = vec3(0f);
     for (var i = 0u; i < numSamples; i += 1u) {
         sampleIndex = i;
         if BLUE_NOISE_PATH {
@@ -593,6 +598,12 @@ fn samplePixel(x: u32, y: u32, rngState: ptr<function, u32>) -> vec3<f32> {
         primaryEmission = vec3(0.);
         color += rayColor(primaryRay, rngState);
         if DENOISER_INPUT {color -= primaryEmission;emission += primaryEmission;}
+        if REFERENCE_GUIDES {guideAlbedo += gbuffer[gbufferPixel * 3u].xyz;guideNormal += gbuffer[gbufferPixel * 3u + 1u].xyz;}
+    }
+    if REFERENCE_GUIDES && numSamples > 0u {
+        let n = 1. / f32(numSamples);
+        gbuffer[gbufferPixel * 3u] = vec4(guideAlbedo * n, gbuffer[gbufferPixel * 3u].w);
+        gbuffer[gbufferPixel * 3u + 1u] = vec4(guideNormal * n, gbuffer[gbufferPixel * 3u + 1u].w);
     }
     if DENOISER_INPUT && numSamples > 0u {
         let n = 1. / f32(numSamples);
