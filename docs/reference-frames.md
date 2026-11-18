@@ -121,7 +121,7 @@ With every surface a grey Lambertian (`--clay` on both sides), 960x540:
 | Sponza | 8 | 0.999 | 0.999 | 0.99-1.01 |
 | Bistro day | 2 | 0.978 | 0.982 | 0.93-1.02 |
 
-- **The comparison found an error, fixed in a2b3ce2's parent:** nothing scatters on
+- **The comparison found an error, fixed in e715840:** nothing scatters on
   from a path's last vertex, so it got sun and lamp light (light samples) but never
   the atmosphere; "N bounces" gave the sun one more path segment than the sky. The
   last vertex now takes one BSDF-sampled visibility ray toward the sky (SKY_LAST).
