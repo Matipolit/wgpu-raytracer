@@ -109,6 +109,15 @@ override GI_BLOCKS: bool = false;
 override GI_SPATIAL: u32 = 4u;
 const GI_RADIUS = 24.;
 const GI_CAP = 20.;
+// GI_VISIBILITY_REUSE: a borrowed winner that is occluded is stored with W = 0 (its M
+// still counts, diluting the next frame). Off: stored with its weight, visibility
+// applied to the shading only (no measurable difference: Sponza, living room).
+// GI_TEMPORAL_TRUST: the pixel's own reprojected history (tested when it was chosen)
+// gets its visibility ray only every 4th frame (staggered over 2x2 pixels), so a
+// moving occluder leaks its light for at most 4 frames. Steam Deck, Medium: GI pass
+// night Bistro 16.9 -> 8.6 ms (every frame skipped), Sponza 8.1 -> 5.8 ms.
+override GI_VISIBILITY_REUSE: bool = true;
+override GI_TEMPORAL_TRUST: bool = true;
 // Three vec4 per pixel of this frame's samples (primary point + normal, secondary
 // point + normal, radiance rg/b + pdf), then two sets (parity) of final reservoirs,
 // two vec4 per pixel (secondary point + normal, radiance rg/b|M, W, distance).
@@ -1573,7 +1582,7 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
     let f0=mix(vec3(0.04),base,metal);
     let surface=PbrSurface(base,metal,alpha*alpha,view,max(dot(hit.n,view),1e-6),f0,clamp(max(f0.r,max(f0.g,f0.b)),0.25,0.9),0.,1.5,true,vec3(0.),1.);
     // The pixel's own sample: W = 1 / pdf.
-    var pick=GiPick();var sum=0.;var m=0.;
+    var pick=GiPick();var sum=0.;var m=0.;var pickTemporal=false;
     if state==1u {
         pick=GiPick(own.secondary,own.secondaryNormal,own.radiance,giTarget(surface,hit,own.secondary,own.radiance),false);
         sum=pick.score/own.pdf;m=1.;
@@ -1590,7 +1599,7 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
             let score=giTarget(surface,hit,secondary,radiance);
             let w=score*bitcast<f32>(b.z)*rm;
             sum+=w;m+=rm;
-            if w>0. && rngNextFloat(&rng)*sum<w {pick=GiPick(secondary,decodeOct(a.w),radiance,score,true);}
+            if w>0. && rngNextFloat(&rng)*sum<w {pick=GiPick(secondary,decodeOct(a.w),radiance,score,true);pickTemporal=true;}
         }
     }
     // Spatial: this frame's samples of nearby pixels on a similar surface.
@@ -1606,18 +1615,22 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
         let score=giTarget(surface,hit,other.secondary,other.radiance);
         let w=score*jacobian/other.pdf;
         sum+=w;m+=1.;
-        if w>0. && rngNextFloat(&rng)*sum<w {pick=GiPick(other.secondary,other.secondaryNormal,other.radiance,score,true);}
+        if w>0. && rngNextFloat(&rng)*sum<w {pick=GiPick(other.secondary,other.secondaryNormal,other.radiance,score,true);pickTemporal=false;}
     }
     var weight=select(0.,sum/(m*pick.score),pick.score>0.);
     let toSecondary=pick.secondary-own.primary;let span=length(toSecondary);
     // Degenerate or non-finite picks contribute nothing (a NaN ray would traverse the
     // whole BVH: every box test passes).
     if !(span>1e-4 && span<1e6 && weight<1e30) {weight=0.;}
-    if pick.borrowed && weight>0. && occludedWithin(Ray(own.primary+own.primaryNormal*0.0001,toSecondary/span),span*0.999) {weight=0.;}
+    var visible=true;
+    let recheck=((id.x&1u)+2u*(id.y&1u)+samplingParams.restir)%4u==0u;
+    if pick.borrowed && weight>0. && !(GI_TEMPORAL_TRUST && GI_VISIBILITY_REUSE && pickTemporal && !recheck) {
+        visible=!occludedWithin(Ray(own.primary+own.primaryNormal*0.0001,toSecondary/span),span*0.999);
+    }
     let slot=giFinalSlot(parity,pixel);
     giData[slot]=vec4(bitcast<vec3<u32>>(pick.secondary),pack2x16snorm(encodeOct(pick.secondaryNormal)));
-    giData[slot+1u]=vec4(pack2x16float(pick.radiance.rg),pack2x16float(vec2(pick.radiance.b,min(m,GI_CAP))),bitcast<u32>(weight),bitcast<u32>(depth));
-    if weight<=0. {return;}
+    giData[slot+1u]=vec4(pack2x16float(pick.radiance.rg),pack2x16float(vec2(pick.radiance.b,min(m,GI_CAP))),bitcast<u32>(select(weight,0.,GI_VISIBILITY_REUSE && !visible)),bitcast<u32>(depth));
+    if weight<=0. || !visible {return;}
     let eval=evaluatePbr(surface,hit,toSecondary/span);
     let indirect=eval.rgb*pick.radiance*weight*select(1.,1./f32(max(samplingParams.numSamplesPerPixel,1u)),DENOISER_INPUT);
     let c=imageBuffer[pixel];
