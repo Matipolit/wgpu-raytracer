@@ -72,8 +72,8 @@ struct DisplayUniform {
 /// (whose base is level 1) would round down: level sizes come from the base instead.
 fn pyramid(size: (u32, u32)) -> Vec<(u32, u32)> {
     // At most LEVELS levels below the image, fewer for tiny images (as many mips as
-    // the half-resolution base allows, at least two).
-    let base = (size.0.div_ceil(2).max(1), size.1.div_ceil(2).max(1));
+    // the half-resolution base allows, at least two: the base is at least 2x2).
+    let base = (size.0.div_ceil(2).max(2), size.1.div_ceil(2).max(2));
     let mips = (32 - base.0.max(base.1).leading_zeros()).min(LEVELS as u32);
     let mut sizes = vec![size];
     for m in 0..mips.max(2) {

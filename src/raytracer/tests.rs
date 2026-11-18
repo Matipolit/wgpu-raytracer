@@ -599,3 +599,25 @@ fn night_sky_is_dark_and_sunless() {
         assert!(night.radiances[c] < 0.01 * day.radiances[c]);
     }
 }
+
+#[test]
+#[ignore = "requires a GPU"]
+fn tiny_viewports_render_with_bloom() {
+    // The bloom pyramid of a 1x1 or 2x2 image has single-texel levels.
+    let (device, queue) = gpu();
+    for size in [(1, 1), (2, 1), (2, 2), (3, 2)] {
+        let mut render_params = params();
+        render_params.viewport_size = size;
+        render_params.bloom = 0.04;
+        let mut tracer = Raytracer::new(
+            &device,
+            &queue,
+            &config(size),
+            &uniform_scene(),
+            &render_params,
+        )
+        .unwrap();
+        let pixels = render(&device, &queue, &mut tracer);
+        assert_eq!(pixels.len() as u32, size.0 * size.1 * 4, "{size:?}");
+    }
+}
