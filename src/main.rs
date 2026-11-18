@@ -100,6 +100,10 @@ fn main() {
         capture::run();
         return;
     }
+    if has_flag("--print-sky") {
+        println!("{}", scene_sky(&selected_scene()).json());
+        return;
+    }
     if has_flag("--reference-output") {
         reference::run();
         return;

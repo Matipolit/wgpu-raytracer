@@ -22,7 +22,8 @@ use std::time::Instant;
 
 const GROUPS: usize = 8;
 /// Samples per pixel per dispatch. Small: a dispatch that runs for more than about half
-/// a second is reset by the Intel driver (the work is silently dropped).
+/// a second is reset by the Intel driver (the work is silently dropped). Fast GPUs take
+/// larger tiles instead (`--reference-tile`).
 const PASS: u32 = 8;
 /// Least dispatches per tile and group in a round (fewer, larger readbacks).
 const ROUND: u32 = 4;

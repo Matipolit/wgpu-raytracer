@@ -2878,6 +2878,22 @@ impl Default for SkyParams {
 }
 
 impl SkyParams {
+    /// `--print-sky`: the sky as the shaders evaluate it, as JSON (the 27 model
+    /// parameters and 3 radiances of the atmosphere, the sun's direction, radiance
+    /// and solid angle), for rebuilding the same lighting in another renderer.
+    pub fn json(&self) -> String {
+        let state = self.to_sky_state().expect("valid sky parameters");
+        format!(
+            "{{\"params\":{:?},\"radiances\":{:?},\"sun_direction\":{:?},\"sun_radiance\":{:?},\"sun_solid_angle\":{},\"sun_angular_radius\":{}}}",
+            state.params,
+            state.radiances,
+            &state.sun_direction[..3],
+            &state.sun_radiance[..3],
+            state.sun_radiance[3],
+            SUN_ANGULAR_RADIUS
+        )
+    }
+
     fn to_sky_state(self: &SkyParams) -> Result<GpuSkyState, hw_skymodel::rgb::Error> {
         let azimuth = Angle::degrees(self.azimuth_degrees).as_radians();
         let zenith = Angle::degrees(self.zenith_degrees).as_radians();

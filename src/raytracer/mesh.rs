@@ -1123,6 +1123,16 @@ impl Mesh {
         for material in document.materials() {
             let mut words = import_material(&material)?;
             let mut optics = Optics::from_gltf(&material);
+            // `--clay`: every surface an opaque grey Lambertian (no textures, cutouts,
+            // emission, specular or glass): light transport alone, for comparing
+            // against other path tracers.
+            if option("--clay") {
+                words = plain_material([0.5; 3], 0., 1.);
+                optics = Optics {
+                    specular: 0.,
+                    ..Optics::default()
+                };
+            }
             apply_overrides(
                 &overrides,
                 &file_name,
