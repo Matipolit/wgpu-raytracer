@@ -2106,11 +2106,20 @@ impl Raytracer {
             return Vec::new();
         }
         let (first, rows) = self.trace_region.map_or((0, pixels / width), |r| {
-            (u64::from(r.1), u64::from(r.3).min(pixels / width - u64::from(r.1)))
+            (
+                u64::from(r.1),
+                u64::from(r.3).min(pixels / width - u64::from(r.1)),
+            )
         });
         let mut image = vec![0f32; (pixels * floats) as usize];
         let from = (first * width * floats) as usize;
-        let part = read_buffer_range(device, queue, buffer, from as u64 * 4, rows * width * floats * 4);
+        let part = read_buffer_range(
+            device,
+            queue,
+            buffer,
+            from as u64 * 4,
+            rows * width * floats * 4,
+        );
         image[from..from + part.len()].copy_from_slice(&part);
         image
     }

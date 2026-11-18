@@ -8,7 +8,8 @@
 # 2. data (training/runs/v4-*): every benchmark view plus night Bistro, 6 moving
 #    objects, 15% fast-motion sequences; 1-spp inputs as the real-time renderer traces
 #    them (2 bounces, ReSTIR lamps + bounce reuse) at full size and at render scales
-#    0.5 / 0.67, as 320-pixel windows of 720p, 1080p, 1440p and 4K frames;
+#    0.5 / 0.67, as 320-pixel windows of 720p, 1080p, 1440p and 4K frames, every
+#    sequence starting with settled reuse histories (24 warm-up frames);
 #    references: the plain path tracer, 2 bounces, 1024 spp in 8 groups,
 #    finished by training/reference/finish_capture.py. Compute only (RT-core captures
 #    hung the GPU twice on 2026-11-18).
@@ -44,7 +45,7 @@ BIN=$PWD/target/release/weekend-raytracer-wgpu
 stamp "start: until $(date -d @$end_epoch '+%a %H:%M'), python $PY"
 cargo build --release --locked 2>&1 | tail -1 || exit 1
 
-FLAGS="--restir --bounces 2 --reference-bounces 2 --reference-groups 8"
+FLAGS="--restir --bounces 2 --reference-bounces 2 --reference-groups 8 --warmup 24"
 SCALES=0.5,0.67
 # Output resolutions: windows of 720p, 1080p, 1440p and 4K frames (a window costs the
 # same at any frame size), so the networks see pixels of every size on screen.

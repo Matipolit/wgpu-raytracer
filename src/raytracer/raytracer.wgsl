@@ -1746,13 +1746,16 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
         sum=pick.score/own.pdf;m=1.;
     } else if state==3u {m=1.;}
     // Temporal: last frame's final reservoir along the motion.
+    var disoccluded=true;
     let previous=previousPixel(own.primary);
     if previous.x>=0. && previous.y>=0. && previous.x<f32(frameData.x) && previous.y<f32(frameData.y) {
         let slot=giFinalSlot(parity^1u,u32(previous.y)*frameData.x+u32(previous.x));
         let a=giData[slot];let b=giData[slot+1u];
         let rm=min(unpack2x16float(b.y).y,GI_CAP);
         let seenFrom=distance(prevCamera.eye,own.primary);
-        if rm>0. && abs(bitcast<f32>(b.w)-seenFrom)<=0.1*seenFrom {
+        // The same surface was on screen last frame (whatever became of its history).
+        disoccluded=abs(bitcast<f32>(b.w)-seenFrom)>0.1*seenFrom;
+        if rm>0. && !disoccluded {
             let secondary=bitcast<vec3<f32>>(a.xyz);let radiance=vec3(unpack2x16float(b.x),unpack2x16float(b.y).x);
             let score=giTarget(surface,hit,secondary,radiance);
             let w=score*bitcast<f32>(b.z)*rm;
@@ -1766,11 +1769,24 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
     // Neighbours only while the pixel's own history is short (after a disocclusion):
     // with a long history they add nothing measurable, and each costs a scattered read.
     let neighbours=select(0u,GI_SPATIAL,m<GI_SPATIAL_BELOW);
+    // A newly visible pixel without a sample of its own this frame looks at the pixels
+    // that hold this frame's samples, one per 2x2 block with GI_BLOCKS, starting with
+    // its own block's. Random pixels hold a sample one time in four, which left such
+    // pixels dark (20-28% under camera motion). Not for a pixel whose history was
+    // forgotten because its pick was hidden: refilling those brightens the image.
+    let turn=(samplingParams.restir+2u)&3u;
+    let empty=m<=0. && disoccluded;
     for(var k=0u;k<neighbours;k+=1u) {
-        let angle=6.2831853*rngNextFloat(&rng);
-        let at=here+GI_RADIUS*sqrt(rngNextFloat(&rng))*vec2(cos(angle),sin(angle));
+        var at=here;
+        if k>0u || !empty {
+            let angle=6.2831853*rngNextFloat(&rng);
+            at+=GI_RADIUS*sqrt(rngNextFloat(&rng))*vec2(cos(angle),sin(angle));
+        }
         if at.x<0. || at.y<0. || at.x>=f32(frameData.x) || at.y>=f32(frameData.y) {continue;}
-        let index=u32(at.y)*frameData.x+u32(at.x);
+        var holder=vec2<u32>(at);
+        if GI_BLOCKS && empty {holder=(holder&vec2(0xfffffffeu))|vec2(turn&1u,turn>>1u);}
+        if any(holder>=frameData.xy) || all(holder==id.xy) {continue;}
+        let index=holder.y*frameData.x+holder.x;
         let other=loadGiSample(index);
         let nothing=giData[index*3u+2u].w==3u;
         if (other.pdf<=0. && !nothing) || abs(distance(camera.eye,other.primary)-depth)>0.1*depth || dot(other.primaryNormal,own.primaryNormal)<0.9 {continue;}

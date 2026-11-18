@@ -75,6 +75,7 @@ async fn capture() {
     // sidecar per frame for the finishing step (docs/reference-frames.md).
     let reference_groups: u32 = number("--reference-groups", 1);
     assert!(reference_groups >= 1 && reference_spp % reference_groups == 0);
+    let warmup: u32 = number("--warmup", 0);
     let seed: u64 = number("--seed", 1);
     let size = crate::argument_value("--size").unwrap_or_else(|| "320x200".into());
     let (w, h) = size.split_once('x').expect("--size WxH");
@@ -374,6 +375,16 @@ async fn capture() {
                 params.sampling.num_bounces = crate::selected_bounces();
                 params.sampling.restir = crate::has_flag("--restir");
                 tracer.set_render_params(&device, &queue, &params).unwrap();
+                if frame == 0 {
+                    // `--warmup N`: the sequence starts from a still camera whose reuse
+                    // histories have settled, as in the running renderer (not from
+                    // empty reservoirs, which are darker for the first frames).
+                    for _ in 0..warmup {
+                        tracer.reset_accumulation();
+                        render(&device, &queue, &mut tracer, 1);
+                    }
+                    tracer.reset_accumulation();
+                }
                 render(&device, &queue, &mut tracer, 1);
                 let noisy = tracer.read_radiance(&device, &queue);
                 let guides = tracer.read_gbuffer(&device, &queue);
@@ -411,14 +422,24 @@ async fn capture() {
                         };
                         let mut sum = vec![0f32; noisy.len()];
                         let mut guide = vec![0f32; window * 6];
-                        let mut side = Vec::with_capacity(window * (reference_groups as usize * 3 + 6) * 2);
+                        let mut side =
+                            Vec::with_capacity(window * (reference_groups as usize * 3 + 6) * 2);
                         let mut half = |v: f32| {
-                            let v = if v.is_finite() { v.clamp(-65000., 65000.) } else { 0. };
+                            let v = if v.is_finite() {
+                                v.clamp(-65000., 65000.)
+                            } else {
+                                0.
+                            };
                             side.extend(half::f16::from_f32(v).to_le_bytes());
                         };
                         for _ in 0..reference_groups {
                             tracer.reset_accumulation();
-                            render(&device, &queue, &mut tracer, reference_spp / reference_groups / per_dispatch);
+                            render(
+                                &device,
+                                &queue,
+                                &mut tracer,
+                                reference_spp / reference_groups / per_dispatch,
+                            );
                             let mean = tracer.read_radiance(&device, &queue);
                             let surface = tracer.read_gbuffer(&device, &queue);
                             for q in 0..window {
@@ -426,13 +447,19 @@ async fn capture() {
                                 for c in 0..3 {
                                     half(mean[p * 3 + c]);
                                     sum[p * 3 + c] += mean[p * 3 + c] / reference_groups as f32;
-                                    guide[q * 6 + c] += surface[p * 12 + c] / reference_groups as f32;
-                                    guide[q * 6 + 3 + c] += surface[p * 12 + 4 + c] / reference_groups as f32;
+                                    guide[q * 6 + c] +=
+                                        surface[p * 12 + c] / reference_groups as f32;
+                                    guide[q * 6 + 3 + c] +=
+                                        surface[p * 12 + 4 + c] / reference_groups as f32;
                                 }
                             }
                         }
                         guide.iter().for_each(|&v| half(v));
-                        std::fs::write(directory.join(format!("frame_{frame:0digits$}.ref.f16")), side).unwrap();
+                        std::fs::write(
+                            directory.join(format!("frame_{frame:0digits$}.ref.f16")),
+                            side,
+                        )
+                        .unwrap();
                         sum
                     } else {
                         tracer.reset_accumulation();
@@ -475,6 +502,13 @@ async fn capture() {
                         &queue,
                         &movers.iter().map(Mover::transform).collect::<Vec<_>>(),
                     );
+                }
+                if frame == 0 {
+                    for _ in 0..warmup {
+                        low.tracer.reset_accumulation();
+                        render(&device, &queue, &mut low.tracer, 1);
+                    }
+                    low.tracer.reset_accumulation();
                 }
                 render(&device, &queue, &mut low.tracer, 1);
                 low.jitters.push(low.tracer.last_frame_jitter());
