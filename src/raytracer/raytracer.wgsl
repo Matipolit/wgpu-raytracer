@@ -1414,9 +1414,11 @@ fn restirTarget(point: LampPoint, normal: vec3<f32>) -> f32 {
 }
 struct Reservoir {triangle: u32, bary: vec2<f32>, w: f32, m: f32, depth: f32, normal: vec3<f32>}
 fn reservoirSlot(parity: u32, pixel: u32) -> u32 {return (parity*frameData.x*frameData.y+pixel)*3u;}
+// DI_SHARED final reservoirs keep their shadow-ray result in the triangle word's top bit.
+const RESERVOIR_VISIBLE = 0x80000000u;
 fn loadReservoir(slot: u32) -> Reservoir {
     let a=reservoirs[slot];let b=reservoirs[slot+1u];let c=reservoirs[slot+2u];
-    return Reservoir(a.x,unpack2x16unorm(a.y),bitcast<f32>(b.x),bitcast<f32>(b.y),bitcast<f32>(c.x),decodeOct(c.y));
+    return Reservoir(a.x&0x7fffffffu,unpack2x16unorm(a.y),bitcast<f32>(b.x),bitcast<f32>(b.y),bitcast<f32>(c.x),decodeOct(c.y));
 }
 fn storeReservoir(slot: u32, r: Reservoir) {
     reservoirs[slot]=vec2(r.triangle,pack2x16unorm(r.bary));
@@ -1501,7 +1503,8 @@ fn csRestirInitial(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_
         let previous=previousPixel(hit.p);
         if previous.x>=0. && previous.y>=0. && previous.x<f32(frameData.x) && previous.y<f32(frameData.y) {
             let seenFrom=distance(prevCamera.eye,hit.p);
-            let r=loadReservoir(reservoirSet((samplingParams.restir&1u)^1u,u32(previous.y)*frameData.x+u32(previous.x)));
+            let last=select(u32(previous.y)*frameData.x+u32(previous.x),restirBlock(u32(previous.x),u32(previous.y)),DI_SHARED);
+            let r=loadReservoir(reservoirSet((samplingParams.restir&1u)^1u,last));
             if r.m>0. && abs(r.depth-seenFrom)<=0.1*seenFrom && dot(r.normal,n)>=0.9 {
                 restirAdd(&merge,r,hit.p,n,cap,&rng);
             }
@@ -1510,12 +1513,13 @@ fn csRestirInitial(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_
     }
     storeReservoir(reservoirSet(RESTIR_INITIAL,slot),stored);
 }
-fn restirLamps(hit: Intersection, surface: PbrSurface, rng: ptr<function,u32>) -> vec3<f32> {
+// This frame's first-pass reservoirs of the block at `here` and RESTIR_SPATIAL random
+// neighbouring blocks on a similar surface, merged at `hit`.
+fn restirSpatialMerge(hit: Intersection, here: vec2<f32>, rng: ptr<function,u32>) -> RestirMerge {
     let n=hit.n;
     let cap=RESTIR_CAP*f32(LAMP_CANDIDATES);
     let seenFrom=distance(camera.eye,hit.p);
     var merge=RestirMerge();
-    let here=vec2(f32(gbufferPixel%frameData.x),f32(gbufferPixel/frameData.x))+vec2(0.5);
     for(var k=0u;k<=RESTIR_SPATIAL;k+=1u) {
         var at=here;
         if k>0u {
@@ -1527,12 +1531,67 @@ fn restirLamps(hit: Intersection, surface: PbrSurface, rng: ptr<function,u32>) -
         if r.m<=0. || abs(r.depth-seenFrom)>0.1*seenFrom || dot(r.normal,n)<0.9 {continue;}
         restirAdd(&merge,r,hit.p,n,cap,rng);
     }
+    return merge;
+}
+fn restirShade(point: LampPoint, surface: PbrSurface, hit: Intersection, w: f32) -> vec3<f32> {
+    let eval=evaluatePbr(surface,hit,point.direction);
+    return lampRadiance(point)*eval.rgb*point.cosLight/max(point.distance*point.distance,1e-12)*w;
+}
+// DI_SHARED (with RESTIR_BLOCKS): the spatial merge and the shadow ray run once per 2x2
+// block, at the block's first-pass pixel (csRestirShared); pixels on a similar surface
+// shade the block's sample with its weight and visibility, others (edges) merge and
+// trace their own. Opt-in (mod.rs di_shared: faster, 2x2-correlated noise).
+override DI_SHARED: bool = false;
+fn restirLamps(hit: Intersection, surface: PbrSurface, rng: ptr<function,u32>) -> vec3<f32> {
+    let cap=RESTIR_CAP*f32(LAMP_CANDIDATES);
+    let seenFrom=distance(camera.eye,hit.p);
+    let here=vec2(f32(gbufferPixel%frameData.x),f32(gbufferPixel/frameData.x))+vec2(0.5);
+    if DI_SHARED {
+        let slot=reservoirSet(samplingParams.restir&1u,restirBlock(gbufferPixel%frameData.x,gbufferPixel/frameData.x));
+        let r=loadReservoir(slot);
+        if r.m>0. && abs(r.depth-seenFrom)<=0.1*seenFrom && dot(r.normal,hit.n)>=0.9 {
+            if (reservoirs[slot].x&RESERVOIR_VISIBLE)==0u || r.w<=0. {return vec3(0.);}
+            return restirShade(lampAt(r.triangle,r.bary,hit.p),surface,hit,r.w);
+        }
+        // An edge: this pixel's own merge and shadow ray (nothing stored).
+        let merge=restirSpatialMerge(hit,here,rng);
+        if !restirVisible(merge,hit) {return vec3(0.);}
+        return restirShade(merge.chosen,surface,hit,restirResolve(merge,hit,cap,seenFrom,true).w);
+    }
+    let merge=restirSpatialMerge(hit,here,rng);
     let visible=restirVisible(merge,hit);
     let stored=restirResolve(merge,hit,cap,seenFrom,visible || !RESTIR_VISIBILITY_REUSE);
     storeReservoir(reservoirSet(samplingParams.restir&1u,gbufferPixel),stored);
     if stored.w<=0. || !visible {return vec3(0.);}
-    let eval=evaluatePbr(surface,hit,merge.chosen.direction);
-    return lampRadiance(merge.chosen)*eval.rgb*merge.chosen.cosLight/max(merge.chosen.distance*merge.chosen.distance,1e-12)*stored.w;
+    return restirShade(merge.chosen,surface,hit,stored.w);
+}
+@compute @workgroup_size(8, 8)
+fn csRestirShared(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
+    quadLane = lane;
+    let turn=samplingParams.restir&3u;
+    let at=id.xy*2u+vec2(turn&1u,turn>>1u);
+    if !RESTIR || !DI_SHARED || at.x>=frameData.x || at.y>=frameData.y {return;}
+    let pixel=frameData.x*at.y+at.x;
+    var rng=initRng(at,frameData.xy,frameData.z^0x1b873593u);
+    var jitter=vec2(0.5);
+    if SHARED_JITTER {jitter=frameJitter(frameData.z);}
+    if VIS_PRIMARY {jitter=visibilityJitter();gbufferPixel=pixel;visibilityPending=true;}
+    let u=(f32(at.x)+jitter.x)/f32(frameData.x);let v=(f32(at.y)+jitter.y)/f32(frameData.y);
+    if RAY_CONES {coneActive=false;}
+    let ray=cameraMakeRay(camera,&rng,u,1.-v);
+    var hit=Intersection();
+    var stored=Reservoir();
+    var flags=0u;
+    if intersection(ray,&hit) && hit.sphereIdx==0xffffffffu {
+        let merge=restirSpatialMerge(hit,vec2<f32>(at)+vec2(0.5),&rng);
+        let cap=RESTIR_CAP*f32(LAMP_CANDIDATES);
+        // History keeps the visibility-free weight; the shadow ray's result is a flag.
+        stored=restirResolve(merge,hit,cap,distance(camera.eye,hit.p),true);
+        flags=select(0u,RESERVOIR_VISIBLE,restirVisible(merge,hit));
+    }
+    let slot=reservoirSet(samplingParams.restir&1u,restirBlock(at.x,at.y));
+    storeReservoir(slot,stored);
+    reservoirs[slot].x|=flags;
 }
 
 // ReSTIR GI reuse (Ouyang et al. 2021), after the path tracer. The pixel's own sample,

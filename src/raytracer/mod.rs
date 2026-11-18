@@ -132,7 +132,7 @@ pub struct Raytracer {
     source_suffix: String,
     trace_layout: wgpu::PipelineLayout,
     /// ReSTIR's first pass (raytracer.wgsl csRestirInitial), when the scene has lamps.
-    restir_pipeline: Option<wgpu::ComputePipeline>,
+    restir_pipeline: Option<(wgpu::ComputePipeline, Option<wgpu::ComputePipeline>)>,
     /// ReSTIR GI reuse (raytracer.wgsl csRestirGi), for mesh scenes.
     gi_pipeline: Option<wgpu::ComputePipeline>,
     bloom: bloom::Bloom,
@@ -667,6 +667,7 @@ impl Raytracer {
             ("RESTIR", f64::from(scene.mesh.lamp_count() > 0)),
             ("RESTIR_BLOCKS", f64::from(restir_blocks())),
             ("GI_BLOCKS", f64::from(gi_blocks())),
+            ("DI_SHARED", f64::from(di_shared())),
             (
                 "GI_VISIBILITY_REUSE",
                 std::env::var("RT_GI_VISIBILITY_REUSE").map_or(1., |v| v.parse().unwrap()),
@@ -814,7 +815,8 @@ impl Raytracer {
             &variants,
             module_config,
         );
-        // ReSTIR's first pass (lamp candidates, temporal reuse, visibility).
+        // ReSTIR's first pass (lamp candidates, temporal reuse) and, with DI_SHARED, the
+        // per-block spatial merge and shadow ray.
         let restir_pipeline = trace_constants
             .iter()
             .any(|&(name, value)| name == "RESTIR" && value != 0.)
@@ -828,11 +830,21 @@ impl Raytracer {
                         _ => (name, value),
                     })
                     .collect();
-                create_compute(
-                    &pipeline_layout,
-                    "csRestirInitial",
-                    "ReSTIR initial reservoirs",
-                    &constants,
+                (
+                    create_compute(
+                        &pipeline_layout,
+                        "csRestirInitial",
+                        "ReSTIR initial reservoirs",
+                        &constants,
+                    ),
+                    di_shared().then(|| {
+                        create_compute(
+                            &pipeline_layout,
+                            "csRestirShared",
+                            "ReSTIR shared block reservoirs",
+                            &constants,
+                        )
+                    }),
                 )
             });
         // ReSTIR GI reuse, after the path tracer (mesh scenes).
@@ -1510,27 +1522,32 @@ impl Raytracer {
         self.mark(encoder, "visibility raster");
         if params.num_samples_per_pixel != 0
             && params.restir != 0
-            && let Some(pipeline) = &self.restir_pipeline
+            && let Some((initial, shared)) = &self.restir_pipeline
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("ReSTIR initial pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &self.vertex_uniform_bind_group, &[]);
-            pass.set_bind_group(1, &self.images.trace, &[]);
-            pass.set_bind_group(2, &self.parameter_bind_group, &[]);
-            pass.set_bind_group(3, &self.scene_bind_group, &[]);
-            if let Some(visibility) = &self.visibility {
-                pass.set_bind_group(6, visibility.trace_group(), &[]);
-            }
             // One pixel per 2x2 block (raytracer.wgsl RESTIR_BLOCKS) unless RT_RESTIR_FULL.
             let (w, h) = if restir_blocks() {
                 (width.div_ceil(2), height.div_ceil(2))
             } else {
                 (width, height)
             };
-            pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
+            for (pipeline, label) in [(initial, "ReSTIR initial pass")]
+                .into_iter()
+                .chain(shared.as_ref().map(|p| (p, "ReSTIR shared pass")))
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(label),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &self.vertex_uniform_bind_group, &[]);
+                pass.set_bind_group(1, &self.images.trace, &[]);
+                pass.set_bind_group(2, &self.parameter_bind_group, &[]);
+                pass.set_bind_group(3, &self.scene_bind_group, &[]);
+                if let Some(visibility) = &self.visibility {
+                    pass.set_bind_group(6, visibility.trace_group(), &[]);
+                }
+                pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
+            }
         }
         self.mark(encoder, "restir");
         if params.num_samples_per_pixel != 0 {
@@ -2369,6 +2386,15 @@ fn scene_stages(visibility: bool) -> wgpu::ShaderStages {
 /// (no GI: 76 and 30 ms); Sponza 4x4-averaged PSNR 25.8 -> 24.6 dB (no GI: 20.8).
 fn gi_blocks() -> bool {
     std::env::var_os("RT_GI_FULL").is_none() && !crate::has_flag("--restir-full")
+}
+
+/// ReSTIR DI's spatial merge and shadow ray once per 2x2 block (raytracer.wgsl
+/// DI_SHARED; `--di-shared` or RT_DI_SHARED, with the blocks). Steam Deck, night Bistro
+/// Medium: 75.7 -> 60.1 ms per frame; captures: 4x4 PSNR -0.5 to -0.6 dB and visibly
+/// 2x2-correlated noise, which the current denoisers were not trained on. Opt-in.
+fn di_shared() -> bool {
+    restir_blocks()
+        && (crate::has_flag("--di-shared") || std::env::var_os("RT_DI_SHARED").is_some())
 }
 
 fn restir_blocks() -> bool {
