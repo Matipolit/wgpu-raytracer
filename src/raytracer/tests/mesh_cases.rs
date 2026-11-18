@@ -900,3 +900,46 @@ fn gi_block_planes_trace_every_pixel_once() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires a GPU"]
+fn restir_history_buffers_only_when_restir_can_run_and_sizes_are_validated() {
+    let (device, queue) = gpu();
+    let scene = Scene {
+        mesh: lamps(),
+        ..Default::default()
+    };
+    let mut render_params = params();
+    // Without ReSTIR the reservoirs and GI samples are stubs (184 bytes per pixel saved).
+    let tracer = Raytracer::new(
+        &device,
+        &queue,
+        &config(render_params.viewport_size),
+        &scene,
+        &render_params,
+    )
+    .unwrap();
+    assert!(tracer.images.reservoirs.size() <= 32 && tracer.images.gi.size() <= 32);
+    render_params.sampling.restir = true;
+    let tracer = Raytracer::new(
+        &device,
+        &queue,
+        &config(render_params.viewport_size),
+        &scene,
+        &render_params,
+    )
+    .unwrap();
+    let pixels = u64::from(render_params.viewport_size.0 * render_params.viewport_size.1);
+    assert_eq!(tracer.images.gi.size(), pixels * 112);
+    // The largest per-pixel buffer (GI, 112 bytes) is checked against the device limits.
+    let limits = device.limits();
+    let max_bytes = limits
+        .max_buffer_size
+        .min(u64::from(limits.max_storage_buffer_binding_size));
+    let side = ((max_bytes / 100) as f64).sqrt() as u32;
+    render_params.viewport_size = (side, side);
+    assert!(matches!(
+        Raytracer::new(&device, &queue, &config((16, 16)), &scene, &render_params),
+        Err(RenderParamsValidationError::ViewportBufferTooLarge { .. })
+    ));
+}

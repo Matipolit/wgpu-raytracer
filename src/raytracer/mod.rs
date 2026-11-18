@@ -218,11 +218,23 @@ impl Raytracer {
         let frame_data_buffer =
             UniformBuffer::new(device, 16_u64, 0_u32, Some("frame data buffer"));
 
+        // ReSTIR history only where ReSTIR can run (the flags, or these parameters).
+        let restir_possible = !crate::has_flag("--no-restir")
+            && (crate::has_flag("--restir")
+                || crate::has_flag("--temporal-model")
+                || render_params.sampling.restir);
+        let history = image_buffers::History {
+            reservoirs: restir_possible && scene.mesh.lamp_count() > 0,
+            gi: restir_possible
+                && !scene.mesh.triangles.is_empty()
+                && !crate::has_flag("--no-restir-gi"),
+        };
         let images = image_buffers::ImageBuffers::new(
             device,
             &frame_data_buffer,
-            image_buffer_size(device, render_params.viewport_size)?,
+            image_buffer_size(device, render_params.viewport_size, history)?,
             render_params.auto_exposure,
+            history,
         );
         let camera_buffer = {
             let camera = GpuCamera::new(&render_params.camera, render_params.viewport_size);
@@ -1996,7 +2008,8 @@ impl Raytracer {
             self.latest_render_params = *render_params;
             return Ok(());
         }
-        let buffer_size = image_buffer_size(device, render_params.viewport_size)?;
+        let buffer_size =
+            image_buffer_size(device, render_params.viewport_size, self.images.history)?;
         let sky_state = if render_params.sky != self.latest_render_params.sky {
             Some(render_params.sky.to_sky_state()?)
         } else {
@@ -2077,18 +2090,22 @@ impl Raytracer {
     }
 }
 
+/// Bytes of the 12-byte-per-pixel image buffers; an error when the largest per-pixel
+/// buffer (guides or ReSTIR history) would exceed the device's buffer limits.
 fn image_buffer_size(
     device: &wgpu::Device,
     (width, height): (u32, u32),
+    history: image_buffers::History,
 ) -> Result<u64, RenderParamsValidationError> {
     let limits = device.limits();
     let max_bytes = limits
         .max_buffer_size
         .min(u64::from(limits.max_storage_buffer_binding_size));
-    u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|pixels| pixels.checked_mul(std::mem::size_of::<[f32; 3]>() as u64))
-        .filter(|&bytes| bytes <= max_bytes)
+    let pixels = u64::from(width) * u64::from(height);
+    pixels
+        .checked_mul(history.max_bytes_per_pixel())
+        .filter(|&largest| largest <= max_bytes)
+        .map(|_| pixels * std::mem::size_of::<[f32; 3]>() as u64)
         .ok_or(RenderParamsValidationError::ViewportBufferTooLarge {
             width,
             height,

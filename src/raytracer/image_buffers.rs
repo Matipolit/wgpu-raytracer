@@ -9,9 +9,11 @@ pub(super) struct ImageBuffers {
     /// Primary-hit guides, 48 bytes per pixel, then 16 per pixel of emission (see
     /// raytracer.wgsl `gbuffer`, `DENOISER_INPUT`).
     pub gbuffer: wgpu::Buffer,
-    /// ReSTIR DI reservoirs and ReSTIR GI samples (history: cleared by `clear_history`).
+    /// ReSTIR DI reservoirs and ReSTIR GI samples (history: cleared by `clear_history`);
+    /// 16-byte stubs when `history` says the renderer never uses them.
     pub reservoirs: wgpu::Buffer,
     pub gi: wgpu::Buffer,
+    pub history: History,
     pub trace_layout: wgpu::BindGroupLayout,
     pub filter_layout: wgpu::BindGroupLayout,
     pub display_layout: wgpu::BindGroupLayout,
@@ -20,12 +22,32 @@ pub(super) struct ImageBuffers {
     pub display: wgpu::BindGroup,
 }
 
+/// Which ReSTIR history buffers a renderer allocates.
+#[derive(Clone, Copy, Debug)]
+pub struct History {
+    pub reservoirs: bool,
+    pub gi: bool,
+}
+
+impl History {
+    /// Bytes per pixel of the largest per-pixel buffer (the guides take 64).
+    pub fn max_bytes_per_pixel(self) -> u64 {
+        [(true, 64), (self.reservoirs, 72), (self.gi, 112)]
+            .into_iter()
+            .filter(|&(on, _)| on)
+            .map(|(_, b)| b)
+            .max()
+            .unwrap()
+    }
+}
+
 impl ImageBuffers {
     pub fn new(
         device: &wgpu::Device,
         frame: &UniformBuffer,
         bytes: u64,
         auto_exposure: bool,
+        history: History,
     ) -> Self {
         let trace_stages = super::tracing_stages();
         let storage = |binding, visibility, read_only| wgpu::BindGroupLayoutEntry {
@@ -77,6 +99,7 @@ impl ImageBuffers {
                 frame,
                 &exposure,
                 bytes,
+                history,
                 &trace_layout,
                 &filter_layout,
                 &display_layout,
@@ -88,6 +111,7 @@ impl ImageBuffers {
             gbuffer,
             reservoirs,
             gi,
+            history,
             trace_layout,
             filter_layout,
             display_layout,
@@ -107,6 +131,7 @@ impl ImageBuffers {
                 frame,
                 &self.exposure,
                 bytes,
+                self.history,
                 &self.trace_layout,
                 &self.filter_layout,
                 &self.display_layout,
@@ -126,6 +151,7 @@ impl ImageBuffers {
         frame: &UniformBuffer,
         exposure: &StorageBuffer,
         bytes: u64,
+        history: History,
         trace_layout: &wgpu::BindGroupLayout,
         filter_layout: &wgpu::BindGroupLayout,
         display_layout: &wgpu::BindGroupLayout,
@@ -148,7 +174,11 @@ impl ImageBuffers {
         // ReSTIR reservoirs: three sets x 24 bytes per pixel (raytracer.wgsl `reservoirs`).
         let reservoirs = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ReSTIR reservoirs"),
-            size: bytes / 12 * 72,
+            size: if history.reservoirs {
+                bytes / 12 * 72
+            } else {
+                16
+            },
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -156,7 +186,7 @@ impl ImageBuffers {
         // reservoirs (32 each) (raytracer.wgsl `giData`).
         let gi = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ReSTIR GI samples and reservoirs"),
-            size: bytes / 12 * 112,
+            size: if history.gi { bytes / 12 * 112 } else { 16 },
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
