@@ -277,6 +277,26 @@ fn csAccumulate(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_inv
     imageBuffer[idx] = array<f32, 3>(pixel.r, pixel.g, pixel.b);
 }
 
+// Joint network (upscale.rs): this frame's guides at output resolution, bound with an
+// output-sized frameData and the output guide buffer in place of `gbuffer`. Primary
+// rays with the frame's shared jitter (as the full-resolution guides of the training
+// captures, SHARED_JITTER); motion in output pixels.
+@compute @workgroup_size(8, 8)
+fn csOutputGuides(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
+    quadLane = lane;
+    if id.x >= frameData.x || id.y >= frameData.y {return;}
+    gbufferPixel = frameData.x * id.y + id.x;
+    var rng = initRng(id.xy, frameData.xy, frameData.z ^ 0x68e31da4u);
+    gbufferSample = vec2<f32>(id.xy) + frameJitter(frameData.z);
+    let u = gbufferSample.x / f32(frameData.x);
+    let v = gbufferSample.y / f32(frameData.y);
+    if RAY_CONES {coneActive = false;}
+    if VIS_PRIMARY {visibilityPending = false;}
+    let ray = cameraMakeRay(camera, &rng, u, 1. - v);
+    var hit = Intersection();
+    if intersection(ray, &hit) {writeGbufferHit(ray, hit);} else {writeGbufferMiss(ray);}
+}
+
 fn averagePixel(x: u32, y: u32) -> vec3<f32> {
     let pixel = accumulatedImage[frameData.x * y + x];
     let invN = 1f / f32(max(1u, samplingParams.accumulatedSamplesPerPixel));

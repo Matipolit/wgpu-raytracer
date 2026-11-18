@@ -28,6 +28,9 @@ pub enum Denoiser {
     Spatial,
     /// A temporal neural denoiser: `models/<stem>.wgsl`.
     Neural(String),
+    /// The joint denoise + upscale network (replaces the denoiser and the upscaler):
+    /// `models/jn-<tier>.wgsl`.
+    Joint(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +123,7 @@ impl Denoiser {
             Self::Off => "Off (progressive accumulation)".to_owned(),
             Self::Spatial => "Spatial filter".to_owned(),
             Self::Neural(stem) => format!("Neural: {stem}"),
+            Self::Joint(stem) => format!("Joint network: {}", stem.trim_start_matches("jn-")),
         }
     }
 }
@@ -133,7 +137,8 @@ impl Settings {
                 Denoiser::Neural(stem.to_owned())
             } else {
                 models
-                    .last()
+                    .iter()
+                    .rfind(|m| !is_joint(m))
                     .map_or(Denoiser::Spatial, |m| Denoiser::Neural(m.clone()))
             }
         };
@@ -173,6 +178,7 @@ impl Settings {
             Denoiser::Off => push("--no-denoise", None),
             Denoiser::Spatial => {}
             Denoiser::Neural(stem) => push("--temporal-model", Some(format!("models/{stem}.wgsl"))),
+            Denoiser::Joint(stem) => push("--joint-model", Some(format!("models/{stem}.wgsl"))),
         }
         push("--bounces", Some(self.bounces.to_string()));
         if !self.gi {
@@ -213,6 +219,7 @@ impl Settings {
             Denoiser::Off => "off".to_owned(),
             Denoiser::Spatial => "spatial".to_owned(),
             Denoiser::Neural(stem) => format!("neural:{stem}"),
+            Denoiser::Joint(stem) => format!("joint:{stem}"),
         };
         format!(
             "scene={}\npreset={}\nsize={}x{}\nfullscreen={}\nrender_scale={}\ndenoiser={denoiser}\n\
@@ -276,6 +283,10 @@ impl Settings {
                             && !stem.is_empty()
                         {
                             s.denoiser = Denoiser::Neural(stem.to_owned());
+                        } else if let Some(stem) = value.strip_prefix("joint:")
+                            && !stem.is_empty()
+                        {
+                            s.denoiser = Denoiser::Joint(stem.to_owned());
                         }
                     }
                 },
@@ -365,6 +376,11 @@ pub fn scenes(root: &Path) -> Vec<SceneEntry> {
 }
 
 /// Temporal denoisers in `models/` (a `.wgsl` with its `.bin`), by file stem.
+/// Joint denoise + upscale networks are exported as `models/jn-<tier>.wgsl`.
+fn is_joint(stem: &str) -> bool {
+    stem.starts_with("jn-")
+}
+
 pub fn models(root: &Path) -> Vec<String> {
     let mut stems: Vec<String> = std::fs::read_dir(root.join("models"))
         .into_iter()
@@ -537,7 +553,7 @@ impl winit::application::ApplicationHandler for LauncherApp {
         if !scenes.iter().any(|s| s.name == settings.scene) {
             settings.scene.clone_from(&scenes[0].name);
         }
-        if let Denoiser::Neural(stem) = &settings.denoiser
+        if let Denoiser::Neural(stem) | Denoiser::Joint(stem) = &settings.denoiser
             && !models.contains(stem)
         {
             settings.denoiser = Denoiser::Spatial;
@@ -831,9 +847,16 @@ fn graphics(
     egui::ComboBox::from_id_salt("denoiser")
         .selected_text(settings.denoiser.label())
         .show_ui(ui, |ui| {
-            let options = [Denoiser::Off, Denoiser::Spatial]
-                .into_iter()
-                .chain(models.iter().cloned().map(Denoiser::Neural));
+            let options =
+                [Denoiser::Off, Denoiser::Spatial]
+                    .into_iter()
+                    .chain(models.iter().cloned().map(|m| {
+                        if is_joint(&m) {
+                            Denoiser::Joint(m)
+                        } else {
+                            Denoiser::Neural(m)
+                        }
+                    }));
             for option in options {
                 let label = option.label();
                 ui.selectable_value(&mut settings.denoiser, option, label);
@@ -853,7 +876,7 @@ fn graphics(
     // accumulates up to this many samples per pixel.
     ui.label("Samples to accumulate");
     ui.add_enabled(
-        !matches!(settings.denoiser, Denoiser::Neural(_)),
+        !matches!(settings.denoiser, Denoiser::Neural(_) | Denoiser::Joint(_)),
         egui::Slider::new(&mut settings.max_samples, 1..=4096).logarithmic(true),
     );
     ui.end_row();
@@ -976,6 +999,25 @@ mod tests {
             sun_azimuth: 135.,
         };
         assert_eq!(Settings::parse(&settings.serialize()), settings);
+    }
+
+    #[test]
+    fn joint_networks_are_their_own_choice() {
+        let mut settings = Settings::default();
+        settings.denoiser = Denoiser::Joint("jn-small".to_owned());
+        let args = settings.args(&[]);
+        let at = args.iter().position(|a| a == "--joint-model").unwrap();
+        assert_eq!(args[at + 1], "models/jn-small.wgsl");
+        assert!(!args.iter().any(|a| a == "--temporal-model"));
+        assert_eq!(Settings::parse(&settings.serialize()), settings);
+        // A preset whose temporal denoiser is missing never falls back to a joint network.
+        let models = [
+            "jn-tiny".to_owned(),
+            "td-half16".to_owned(),
+            "jn-ultra".to_owned(),
+        ];
+        settings.apply_preset(Preset::Medium, &models);
+        assert_eq!(settings.denoiser, Denoiser::Neural("td-half16".to_owned()));
     }
 
     #[test]

@@ -19,7 +19,7 @@ mod profiler;
 mod temporal;
 mod texture;
 mod tuner;
-mod upscale;
+pub(crate) mod upscale;
 mod visibility;
 mod wavefront;
 
@@ -133,6 +133,10 @@ pub struct Raytracer {
     trace_layout: wgpu::PipelineLayout,
     /// ReSTIR's first pass (raytracer.wgsl csRestirInitial), when the scene has lamps.
     restir_pipeline: Option<(wgpu::ComputePipeline, Option<wgpu::ComputePipeline>)>,
+    /// Joint network: csOutputGuides and its output-sized frame data.
+    output_guides_pipeline: Option<wgpu::ComputePipeline>,
+    output_frame: UniformBuffer,
+    output_guides_group: Option<wgpu::BindGroup>,
     /// ReSTIR GI reuse (raytracer.wgsl csRestirGi), for mesh scenes.
     gi_pipeline: Option<wgpu::ComputePipeline>,
     bloom: bloom::Bloom,
@@ -188,7 +192,8 @@ impl Raytracer {
             ..*render_params
         };
         let render_params = &scaled_params;
-        let upscaling = upscale::render_scale() < 1.;
+        let joint_model = upscale::JointModel::from_args();
+        let upscaling = upscale::render_scale() < 1. || joint_model.is_some();
         let variants = trace_variants(device, scene);
         // The visibility raster: G-buffer experiments, or a variant starting paths from it.
         let vis_on = device.features().contains(wgpu::Features::PRIMITIVE_INDEX)
@@ -222,6 +227,7 @@ impl Raytracer {
         let restir_possible = !crate::has_flag("--no-restir")
             && (crate::has_flag("--restir")
                 || crate::has_flag("--temporal-model")
+                || upscale::joint_requested()
                 || render_params.sampling.restir);
         let history = image_buffers::History {
             reservoirs: restir_possible && scene.mesh.lamp_count() > 0,
@@ -847,6 +853,24 @@ impl Raytracer {
                     }),
                 )
             });
+        // Joint network: this frame's guides at output resolution (primary rays; the
+        // visibility buffer is render-sized).
+        let output_guides_pipeline = joint_model.is_some().then(|| {
+            let constants: Vec<(&str, f64)> = trace_constants
+                .iter()
+                .map(|&(name, value)| match name {
+                    "VIS_PRIMARY" => (name, 0.),
+                    _ => (name, value),
+                })
+                .collect();
+            create_compute(
+                &pipeline_layout,
+                "csOutputGuides",
+                "output-resolution guides",
+                &constants,
+            )
+        });
+        let output_frame = UniformBuffer::new(device, 16, 0, Some("output frame data"));
         // ReSTIR GI reuse, after the path tracer (mesh scenes).
         let gi_pipeline = (!scene.mesh.triangles.is_empty() && !crate::has_flag("--no-restir-gi"))
             .then(|| {
@@ -1029,6 +1053,7 @@ impl Raytracer {
                 output_size,
                 render_params.viewport_size,
                 temporal_source.is_some(),
+                joint_model.as_ref(),
             )
         });
         // Bloom works on the image the display pass shows (the upscaler's output-size
@@ -1069,7 +1094,7 @@ impl Raytracer {
             )
             .expect("sample offset overflow");
 
-        Ok(Self {
+        let mut tracer = Self {
             vertex_uniform_bind_group,
             frame_data_buffer,
             images,
@@ -1089,6 +1114,9 @@ impl Raytracer {
             vertex_buffer,
             trace_pipelines,
             restir_pipeline,
+            output_guides_group: None,
+            output_guides_pipeline,
+            output_frame,
             gi_pipeline,
             bloom,
             profiler: profiler::PassProfiler::new(device, queue),
@@ -1124,7 +1152,12 @@ impl Raytracer {
             frame_number,
             restir_frames: 0,
             last_trace_ms: 0.,
-        })
+        };
+        tracer.output_guides_group = tracer
+            .upscaler
+            .as_ref()
+            .and_then(|u| output_guides_group(device, &tracer.images, &tracer.output_frame, u));
+        Ok(tracer)
     }
 
     /// Startup level of the auto-tuner: choose the trace kernel's traversal stack and
@@ -1658,6 +1691,34 @@ impl Raytracer {
         self.mark(encoder, "spatial filter");
         if let Some(upscaler) = &mut self.upscaler {
             if params.num_samples_per_pixel != 0 {
+                if let (Some(pipeline), Some(group)) =
+                    (&self.output_guides_pipeline, &self.output_guides_group)
+                {
+                    let (w, h) = upscaler.output_size();
+                    queue.write_buffer(
+                        self.output_frame.handle(),
+                        0,
+                        bytemuck::cast_slice(&[
+                            w,
+                            h,
+                            frame_index,
+                            self.latest_render_params.exposure.to_bits(),
+                        ]),
+                    );
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("output guides pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &self.vertex_uniform_bind_group, &[]);
+                    pass.set_bind_group(1, group, &[]);
+                    pass.set_bind_group(2, &self.parameter_bind_group, &[]);
+                    pass.set_bind_group(3, &self.scene_bind_group, &[]);
+                    if let Some(visibility) = &self.visibility {
+                        pass.set_bind_group(6, visibility.trace_group(), &[]);
+                    }
+                    pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
+                }
                 upscaler.record(
                     queue,
                     encoder,
@@ -2087,6 +2148,11 @@ impl Raytracer {
             );
             self.bloom.resize(device, source, size);
         }
+        // The image buffers or the upscaler's may have been reallocated.
+        self.output_guides_group = self
+            .upscaler
+            .as_ref()
+            .and_then(|u| output_guides_group(device, &self.images, &self.output_frame, u));
         self.output_size = output_size;
         if let Some(temporal) = &mut self.temporal {
             if render_params.viewport_size != self.latest_render_params.viewport_size {
@@ -2146,6 +2212,34 @@ fn image_buffer_size(
             height,
             max_bytes,
         })
+}
+
+/// csOutputGuides' trace-images group: output-sized frame data, the output guides in
+/// place of the G-buffer (joint network only).
+fn output_guides_group(
+    device: &wgpu::Device,
+    images: &image_buffers::ImageBuffers,
+    frame: &UniformBuffer,
+    upscaler: &upscale::Upscaler,
+) -> Option<wgpu::BindGroup> {
+    let guides = upscaler.out_guides()?;
+    fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+        wgpu::BindGroupEntry {
+            binding,
+            resource: buffer.as_entire_binding(),
+        }
+    }
+    Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("output guides bindings"),
+        layout: &images.trace_layout,
+        entries: &[
+            frame.binding(),
+            images.accumulation.binding(),
+            entry(7, guides),
+            entry(8, &images.reservoirs),
+            entry(9, &images.gi),
+        ],
+    }))
 }
 
 fn set_auto_exposure(queue: &wgpu::Queue, images: &image_buffers::ImageBuffers, enabled: bool) {
@@ -2349,6 +2443,7 @@ pub fn gbuffer_enabled() -> bool {
         || crate::has_flag("--capture")
         || crate::has_flag("--temporal-model")
         || crate::has_flag("--restir")
+        || upscale::joint_requested()
         || upscale::render_scale() < 1.
 }
 

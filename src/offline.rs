@@ -67,8 +67,10 @@ async fn render() {
         },
         viewport_size: (width, height),
     };
-    params.sampling.denoising_enabled = !std::env::args().any(|a| a == "--no-denoise");
-    params.sampling.restir = crate::has_flag("--restir");
+    params.sampling.denoising_enabled = !std::env::args().any(|a| a == "--no-denoise")
+        && !crate::raytracer::upscale::joint_requested();
+    params.sampling.restir =
+        crate::has_flag("--restir") || crate::raytracer::upscale::joint_requested();
     if let Some((position, direction, vfov)) = crate::camera_argument() {
         params.camera.eye_pos = position;
         params.camera.eye_dir = direction;

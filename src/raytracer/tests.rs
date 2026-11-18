@@ -621,3 +621,101 @@ fn tiny_viewports_render_with_bloom() {
         assert_eq!(pixels.len() as u32, size.0 * size.1 * 4, "{size:?}");
     }
 }
+
+#[test]
+#[ignore = "requires a GPU"]
+fn joint_network_matches_pytorch() {
+    // training/upscale/parity_vector.py: model.step on a small random scene; the WGSL
+    // (training/upscale/export.py) must agree over several frames of history.
+    use wgpu::util::DeviceExt;
+    let (device, queue) = gpu();
+    for tier in ["tiny", "medium"] {
+        let data = std::fs::read(format!("tests/assets/joint-parity-{tier}.bin")).unwrap();
+        let words: Vec<u32> = bytemuck::pod_collect_to_vec(&data[..20]);
+        let [w, h, ow, oh, frames] = words[..] else {
+            panic!()
+        };
+        let floats: Vec<f32> = bytemuck::pod_collect_to_vec(&data[20..]);
+        let model = upscale::JointModel {
+            source: std::fs::read_to_string(format!("models/jn-{tier}.wgsl")).unwrap(),
+            weights: std::fs::read(format!("models/jn-{tier}.bin")).unwrap(),
+        };
+        let (low, high) = ((w * h) as usize, (ow * oh) as usize);
+        let storage = |size: usize| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: size as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let image = storage(low * 12);
+        let gbuffer = storage(low * 48);
+        let exposure = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: &[0u8; 16],
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let display_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[0, 4, 6].map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: if binding == 0 {
+                        wgpu::BufferBindingType::Uniform
+                    } else {
+                        wgpu::BufferBindingType::Storage { read_only: true }
+                    },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }),
+        });
+        let mut upscaler = upscale::Upscaler::new(
+            &device,
+            &image,
+            &gbuffer,
+            &display_layout,
+            &exposure,
+            (ow, oh),
+            (w, h),
+            false,
+            Some(&model),
+        );
+        let mut at = 0;
+        let mut take = |n: usize| {
+            let slice = &floats[at..at + n];
+            at += n;
+            slice.to_vec()
+        };
+        for frame in 0..frames {
+            let jitter = take(2);
+            queue.write_buffer(&image, 0, bytemuck::cast_slice(&take(low * 3)));
+            queue.write_buffer(&gbuffer, 0, bytemuck::cast_slice(&take(low * 12)));
+            queue.write_buffer(
+                upscaler.out_guides().unwrap(),
+                0,
+                bytemuck::cast_slice(&take(high * 12)),
+            );
+            let expected = take(high * 3);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            upscaler.record(&queue, &mut encoder, [jitter[0], jitter[1]], frame, 0);
+            queue.submit([encoder.finish()]);
+            let got = read_buffer(&device, &queue, upscaler.output());
+            // Intermediates are f16: compare in log space.
+            let errors: Vec<f32> = got
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (a.max(0.).ln_1p() - b.max(0.).ln_1p()).abs())
+                .collect();
+            let max = errors.iter().copied().fold(0f32, f32::max);
+            let mean = errors.iter().sum::<f32>() / errors.len() as f32;
+            assert!(
+                max < 2e-2 && mean < 2e-3,
+                "{tier} frame {frame}: max {max}, mean {mean}"
+            );
+        }
+    }
+}

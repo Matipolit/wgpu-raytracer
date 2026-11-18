@@ -312,9 +312,13 @@ impl AppState {
                     .map_or(SamplingParams::default().max_samples_per_pixel, |v| {
                         v.parse().expect("--max-samples must be a positive integer")
                     }),
-                denoising_enabled: !has_flag("--no-denoise"),
+                // The joint network takes raw 1-spp samples (as captured for training).
+                denoising_enabled: !has_flag("--no-denoise")
+                    && !raytracer::upscale::joint_requested(),
                 // Real-time frames (a temporal denoiser) reuse lamp samples (ReSTIR).
-                restir: (has_flag("--temporal-model") || has_flag("--restir"))
+                restir: (has_flag("--temporal-model")
+                    || has_flag("--restir")
+                    || raytracer::upscale::joint_requested())
                     && !has_flag("--no-restir"),
                 ..Default::default()
             },
