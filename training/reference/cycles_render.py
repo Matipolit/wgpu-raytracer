@@ -30,6 +30,7 @@ p.add_argument("--bounces", type=int, default=2)
 p.add_argument("--samples", type=int, default=1024)
 p.add_argument("--out", required=True)
 p.add_argument("--clay", action="store_true")
+p.add_argument("--opaque-glass-shadows", action="store_true")
 a = p.parse_args(sys.argv[sys.argv.index("--") + 1 :])
 width, height = map(int, a.size.split("x"))
 sky = json.load(open(a.sky))
@@ -142,6 +143,30 @@ if os.path.exists(overrides) and not a.clay:
                     put("Roughness", float(value))
                 elif key == "base":
                     put("Base Color", (*[float(x) for x in value.split(",")], 1))
+
+# The renderer's shadow rays pass through transmissive surfaces (lamps behind glass
+# light their surroundings directly). Cycles' light samples do not cross glass, so
+# glass becomes transparent for shadow rays here too (`--opaque-glass-shadows`: not).
+if not a.clay and not a.opaque_glass_shadows:
+    for material in bpy.data.materials:
+        if not material.use_nodes:
+            continue
+        tree = material.node_tree
+        principled = next((n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        output = next((n for n in tree.nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output), None)
+        if principled is None or output is None:
+            continue
+        transmission = principled.inputs.get("Transmission Weight")
+        if transmission is None or (not transmission.is_linked and transmission.default_value <= 0):
+            continue
+        surface = output.inputs["Surface"].links[0].from_socket
+        path = tree.nodes.new("ShaderNodeLightPath")
+        transparent = tree.nodes.new("ShaderNodeBsdfTransparent")
+        mix = tree.nodes.new("ShaderNodeMixShader")
+        tree.links.new(path.outputs["Is Shadow Ray"], mix.inputs["Fac"])
+        tree.links.new(surface, mix.inputs[1])
+        tree.links.new(transparent.outputs["BSDF"], mix.inputs[2])
+        tree.links.new(mix.outputs["Shader"], output.inputs["Surface"])
 
 if a.clay:
     clay = bpy.data.materials.new("clay")
