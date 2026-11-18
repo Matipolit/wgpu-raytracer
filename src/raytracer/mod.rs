@@ -646,6 +646,10 @@ impl Raytracer {
             ("RESTIR_BLOCKS", f64::from(restir_blocks())),
             ("GI_BLOCKS", f64::from(gi_blocks())),
             (
+                "RESTIR_VISIBILITY_REUSE",
+                f64::from(std::env::var_os("RT_RESTIR_VISIBILITY_REUSE").is_some()),
+            ),
+            (
                 "GI_SPATIAL",
                 std::env::var("RT_GI_SPATIAL")
                     .map_or(if gi_blocks() { 8. } else { 4. }, |v| v.parse().unwrap()),

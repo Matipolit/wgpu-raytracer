@@ -1438,12 +1438,19 @@ fn restirAdd(merge: ptr<function,RestirMerge>, r: Reservoir, origin: vec3<f32>, 
     (*merge).sum+=w;(*merge).m+=rm;
     if w>0. && rngNextFloat(rng)*(*merge).sum<w {(*merge).chosen=candidate;(*merge).score=score;}
 }
-// Shadow-tests the merged winner; returns its reservoir (W = 0 if occluded or none).
-fn restirResolve(merge: RestirMerge, hit: Intersection, cap: f32, depth: f32) -> Reservoir {
+// RESTIR_VISIBILITY_REUSE: an occluded winner is stored with W = 0 while its M still
+// counts (Bitterli et al.'s visibility reuse). It darkens penumbras: a zero-W history
+// of M = 80 dilutes the next frame's fresh candidates to 4/84 of their weight (night
+// Bistro and the fireplace room 3-10% darker overall). Off: reservoirs resample the
+// visibility-free target and visibility is applied once, to the shaded sample.
+override RESTIR_VISIBILITY_REUSE: bool = false;
+fn restirVisible(merge: RestirMerge, hit: Intersection) -> bool {
+    return merge.score>0. && !occludedWithin(Ray(hit.p+hit.geometricNormal*0.0001,merge.chosen.direction),merge.chosen.distance*0.999);
+}
+// The merged winner's reservoir (W = 0 if none, or if `visible` is false).
+fn restirResolve(merge: RestirMerge, hit: Intersection, cap: f32, depth: f32, visible: bool) -> Reservoir {
     var stored=Reservoir(merge.chosen.triangle,merge.chosen.bary,0.,min(merge.m,cap),depth,hit.n);
-    if merge.score>0. && !occludedWithin(Ray(hit.p+hit.geometricNormal*0.0001,merge.chosen.direction),merge.chosen.distance*0.999) {
-        stored.w=merge.sum/(merge.m*merge.score);
-    }
+    if merge.score>0. && visible {stored.w=merge.sum/(merge.m*merge.score);}
     return stored;
 }
 @compute @workgroup_size(8, 8)
@@ -1488,7 +1495,7 @@ fn csRestirInitial(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_
                 restirAdd(&merge,r,hit.p,n,cap,&rng);
             }
         }
-        stored=restirResolve(merge,hit,cap,distance(camera.eye,hit.p));
+        stored=restirResolve(merge,hit,cap,distance(camera.eye,hit.p),!RESTIR_VISIBILITY_REUSE || restirVisible(merge,hit));
     }
     storeReservoir(reservoirSet(RESTIR_INITIAL,slot),stored);
 }
@@ -1509,9 +1516,10 @@ fn restirLamps(hit: Intersection, surface: PbrSurface, rng: ptr<function,u32>) -
         if r.m<=0. || abs(r.depth-seenFrom)>0.1*seenFrom || dot(r.normal,n)<0.9 {continue;}
         restirAdd(&merge,r,hit.p,n,cap,rng);
     }
-    let stored=restirResolve(merge,hit,cap,seenFrom);
+    let visible=restirVisible(merge,hit);
+    let stored=restirResolve(merge,hit,cap,seenFrom,visible || !RESTIR_VISIBILITY_REUSE);
     storeReservoir(reservoirSet(samplingParams.restir&1u,gbufferPixel),stored);
-    if stored.w<=0. {return vec3(0.);}
+    if stored.w<=0. || !visible {return vec3(0.);}
     let eval=evaluatePbr(surface,hit,merge.chosen.direction);
     return lampRadiance(merge.chosen)*eval.rgb*merge.chosen.cosLight/max(merge.chosen.distance*merge.chosen.distance,1e-12)*stored.w;
 }
