@@ -202,6 +202,14 @@ override CENTER_JITTER:bool=false;
 // (visibility.wgsl) instead of tracing the primary ray; all pixels share the raster's
 // per-frame sub-pixel jitter.
 override VIS_PRIMARY:bool=false;
+// VIS_OUTPUT (joint network): the visibility raster is at output resolution with its own
+// jitter; render-resolution samples keep the shared frame jitter and read the texel under
+// their position (visibility.wgsl visibilityCandidate).
+override VIS_OUTPUT:bool=false;
+fn primaryJitter() -> vec2<f32> {
+    if VIS_OUTPUT {return frameJitter(frameData.z);}
+    return visibilityJitter();
+}
 // Upscaling (`--render-scale`): every pixel uses this frame's sub-pixel jitter, so the
 // upscaler knows where each sample lies (frameJitter, identical to Rust's frame_jitter).
 override SHARED_JITTER:bool=false;
@@ -567,7 +575,7 @@ fn samplePixel(x: u32, y: u32, rngState: ptr<function, u32>) -> vec3<f32> {
         var jitter=vec2(rngNextFloat(rngState),rngNextFloat(rngState));
         if CENTER_JITTER {jitter=vec2(0.5);}
         if SHARED_JITTER {jitter=frameJitter(frameData.z);}
-        if VIS_PRIMARY {jitter=visibilityJitter();}
+        if VIS_PRIMARY {jitter=primaryJitter();}
         if BLUE_NOISE_JITTER {
             let mask=unpack2x16unorm(meshData[meshData[14u]+(y%64u)*64u+(x%64u)]);
             let sequence=fract(vec2(0.7548776662,0.569840291)*f32(frameData.z%65536u));
@@ -1502,7 +1510,8 @@ fn csRestirInitial(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_
     var jitter=vec2(0.5);
     if SHARED_JITTER {jitter=frameJitter(frameData.z);}
     // With the visibility raster, the primary hit comes from it (same jitter).
-    if VIS_PRIMARY {jitter=visibilityJitter();gbufferPixel=pixel;visibilityPending=true;}
+    if VIS_PRIMARY {jitter=primaryJitter();gbufferPixel=pixel;visibilityPending=true;}
+    gbufferSample=vec2<f32>(at)+jitter;
     let u=(f32(at.x)+jitter.x)/f32(frameData.x);let v=(f32(at.y)+jitter.y)/f32(frameData.y);
     if RAY_CONES {coneActive=false;}
     let ray=cameraMakeRay(camera,&rng,u,1.-v);
@@ -1597,7 +1606,8 @@ fn csRestirShared(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_i
     var rng=initRng(at,frameData.xy,frameData.z^0x1b873593u);
     var jitter=vec2(0.5);
     if SHARED_JITTER {jitter=frameJitter(frameData.z);}
-    if VIS_PRIMARY {jitter=visibilityJitter();gbufferPixel=pixel;visibilityPending=true;}
+    if VIS_PRIMARY {jitter=primaryJitter();gbufferPixel=pixel;visibilityPending=true;}
+    gbufferSample=vec2<f32>(at)+jitter;
     let u=(f32(at.x)+jitter.x)/f32(frameData.x);let v=(f32(at.y)+jitter.y)/f32(frameData.y);
     if RAY_CONES {coneActive=false;}
     let ray=cameraMakeRay(camera,&rng,u,1.-v);

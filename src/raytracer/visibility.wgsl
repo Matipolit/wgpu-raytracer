@@ -104,6 +104,11 @@ fn visibilityJitter() -> vec2<f32> { return visFrame.jitter; }
 // intersected exactly with the ray (Moller-Trumbore); barycentrics are clamped because
 // raster coverage rules decide edge pixels.
 fn visibilityCandidate(ray: Ray, tmax: f32, best: ptr<function, MeshCandidate>) -> bool {
+    if VIS_OUTPUT {
+        // The raster is at output resolution: the texel under this sample's position.
+        let texel = gbufferSample * visFrame.size / vec2<f32>(frameData.xy);
+        return visibilityCandidateAt(ray, min(vec2<u32>(max(texel, vec2(0.))), vec2<u32>(visFrame.size) - vec2(1u)), tmax, best);
+    }
     return visibilityCandidateAt(ray, vec2(gbufferPixel % frameData.x, gbufferPixel / frameData.x), tmax, best);
 }
 

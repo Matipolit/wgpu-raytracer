@@ -137,8 +137,6 @@ pub struct Raytracer {
     output_guides_pipeline: Option<wgpu::ComputePipeline>,
     output_frame: UniformBuffer,
     output_guides_group: Option<wgpu::BindGroup>,
-    /// The visibility raster at output resolution (primary hits of csOutputGuides).
-    output_visibility: Option<visibility::Visibility>,
     /// ReSTIR GI reuse (raytracer.wgsl csRestirGi), for mesh scenes.
     gi_pipeline: Option<wgpu::ComputePipeline>,
     bloom: bloom::Bloom,
@@ -675,6 +673,10 @@ impl Raytracer {
             ("RESTIR", f64::from(scene.mesh.lamp_count() > 0)),
             ("RESTIR_BLOCKS", f64::from(restir_blocks())),
             ("GI_BLOCKS", f64::from(gi_blocks())),
+            (
+                "VIS_OUTPUT",
+                f64::from(vis_on && upscale::joint_requested()),
+            ),
             ("DI_SHARED", f64::from(di_shared())),
             (
                 "GI_VISIBILITY_REUSE",
@@ -1039,10 +1041,15 @@ impl Raytracer {
                 &parameter_bind_group_layout,
             )
         };
-        let visibility = vis_on.then(|| make_visibility(render_params.viewport_size));
-        // Joint network: a second raster at output resolution for csOutputGuides.
-        let output_visibility =
-            (vis_on && joint_model.is_some()).then(|| make_visibility(output_size));
+        // Joint network: one raster at output resolution serves the tracer's primary
+        // hits and the output guides (raytracer.wgsl VIS_OUTPUT).
+        let visibility = vis_on.then(|| {
+            make_visibility(if joint_model.is_some() {
+                output_size
+            } else {
+                render_params.viewport_size
+            })
+        });
         let exposure_pipeline = create_compute(
             &filter_pipeline_layout,
             "csExposure",
@@ -1121,7 +1128,6 @@ impl Raytracer {
             trace_pipelines,
             restir_pipeline,
             output_guides_group: None,
-            output_visibility,
             output_guides_pipeline,
             output_frame,
             gi_pipeline,
@@ -1337,12 +1343,9 @@ impl Raytracer {
         if self.tuner.variants[variant].visibility_primary
             && let Some(visibility) = &self.visibility
         {
-            visibility.set_frame(queue, frame_jitter(self.frame_number));
-            let planes = GpuCamera::new(
-                &self.latest_render_params.camera,
-                self.latest_render_params.viewport_size,
-            )
-            .frustum_planes();
+            let (size, jitter) = self.visibility_frame(self.frame_number);
+            visibility.set_frame(queue, jitter);
+            let planes = GpuCamera::new(&self.latest_render_params.camera, size).frustum_planes();
             let mut encoder = device.create_command_encoder(&Default::default());
             visibility.raster(
                 &mut encoder,
@@ -1462,6 +1465,23 @@ impl Raytracer {
     }
 
     /// RT_PASS_TIMES: timestamp the end of a pass group.
+    /// The visibility raster's size and jitter. Joint network: output resolution, with
+    /// the render jitter scaled so that at integer ratios (render scale 0.5) every
+    /// render-resolution sample lies exactly on a raster sample.
+    fn visibility_frame(&self, frame: u32) -> ((u32, u32), [f32; 2]) {
+        let render = self.latest_render_params.viewport_size;
+        let jitter = frame_jitter(frame);
+        if self.output_guides_pipeline.is_none() {
+            return (render, jitter);
+        }
+        let out = self.output_size;
+        let ratio = [
+            out.0 as f32 / render.0 as f32,
+            out.1 as f32 / render.1 as f32,
+        ];
+        (out, std::array::from_fn(|a| (jitter[a] * ratio[a]).fract()))
+    }
+
     fn mark(&mut self, encoder: &mut wgpu::CommandEncoder, label: &'static str) {
         if let Some(profiler) = &mut self.profiler {
             profiler.mark(encoder, label);
@@ -1528,9 +1548,11 @@ impl Raytracer {
             None
         };
         if let Some(visibility) = self.visibility.as_ref().filter(|_| {
-            // ReSTIR's first pass takes its primary hits from the raster too.
+            // ReSTIR's first pass takes its primary hits from the raster too, and the
+            // joint network's output guides.
             self.tuner.variants[variant].visibility_primary
                 || (params.restir != 0 && self.restir_pipeline.is_some())
+                || self.output_guides_pipeline.is_some()
         }) {
             // RT_VIS_RASTER_ONCE: keep the first frame's visibility buffer (static camera,
             // profiling the tracing pass alone).
@@ -1538,19 +1560,10 @@ impl Raytracer {
             if params.num_samples_per_pixel != 0 && (!once || !self.visibility_rastered) {
                 self.visibility_rastered = true;
                 let centred = crate::has_flag("--center-jitter") || once;
-                visibility.set_frame(
-                    queue,
-                    if centred {
-                        [0.5, 0.5]
-                    } else {
-                        frame_jitter(frame_index)
-                    },
-                );
-                let planes = GpuCamera::new(
-                    &self.latest_render_params.camera,
-                    self.latest_render_params.viewport_size,
-                )
-                .frustum_planes();
+                let (size, jitter) = self.visibility_frame(frame_index);
+                visibility.set_frame(queue, if centred { [0.5, 0.5] } else { jitter });
+                let planes =
+                    GpuCamera::new(&self.latest_render_params.camera, size).frustum_planes();
                 visibility.raster(
                     encoder,
                     &self.parameter_bind_group,
@@ -1714,17 +1727,6 @@ impl Raytracer {
                     self.latest_render_params.exposure.to_bits(),
                 ]),
             );
-            if let Some(visibility) = &self.output_visibility {
-                visibility.set_frame(queue, frame_jitter(frame_index));
-                let planes =
-                    GpuCamera::new(&self.latest_render_params.camera, (w, h)).frustum_planes();
-                visibility.raster(
-                    encoder,
-                    &self.parameter_bind_group,
-                    &self.scene_bind_group,
-                    &planes,
-                );
-            }
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("output guides pass"),
                 timestamp_writes: None,
@@ -1734,7 +1736,7 @@ impl Raytracer {
             pass.set_bind_group(1, group, &[]);
             pass.set_bind_group(2, &self.parameter_bind_group, &[]);
             pass.set_bind_group(3, &self.scene_bind_group, &[]);
-            if let Some(visibility) = &self.output_visibility {
+            if let Some(visibility) = &self.visibility {
                 pass.set_bind_group(6, visibility.trace_group(), &[]);
             }
             pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
@@ -2143,8 +2145,18 @@ impl Raytracer {
             );
         }
         if let Some(visibility) = &mut self.visibility {
-            if render_params.viewport_size != self.latest_render_params.viewport_size {
-                visibility.resize(device, render_params.viewport_size);
+            let joint = self.output_guides_pipeline.is_some();
+            if (!joint && render_params.viewport_size != self.latest_render_params.viewport_size)
+                || (joint && output_size != self.output_size)
+            {
+                visibility.resize(
+                    device,
+                    if joint {
+                        output_size
+                    } else {
+                        render_params.viewport_size
+                    },
+                );
             }
         }
         if let Some(upscaler) = &mut self.upscaler {
@@ -2170,11 +2182,6 @@ impl Raytracer {
                 |u| (u.output(), output_size),
             );
             self.bloom.resize(device, source, size);
-        }
-        if let Some(visibility) = &mut self.output_visibility
-            && output_size != self.output_size
-        {
-            visibility.resize(device, output_size);
         }
         // The image buffers or the upscaler's may have been reallocated.
         self.output_guides_group = self
