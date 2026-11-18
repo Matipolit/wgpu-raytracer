@@ -107,6 +107,9 @@ override RESTIR_GI: bool = false;
 // their indirect light from reuse alone (records with only the primary point).
 override GI_BLOCKS: bool = false;
 override GI_SPATIAL: u32 = 4u;
+// History length (M) below which the neighbours are consulted (RT_GI_SPATIAL_BELOW;
+// 1e9: always, as before).
+override GI_SPATIAL_BELOW: f32 = 8.;
 const GI_RADIUS = 24.;
 const GI_CAP = 20.;
 // GI_VISIBILITY_REUSE: a borrowed winner that is occluded is stored with W = 0 (its M
@@ -203,6 +206,12 @@ override PACKED_SHADING:bool=false;
 override STOCHASTIC_TEXTURE:u32=0u;
 override PACKED_DIRECTIONS:bool=false;
 override SKIP_FINAL_SCATTER:bool=false;
+// With SKIP_FINAL_SCATTER the path's last vertex had no normal at all, so its light
+// sample evaluated to nothing: without bounce reuse (the Low preset) a path's bounce
+// brought back only sky and emission, and Sponza's shade was at 4% of its brightness.
+// The last vertex is now lit with its geometric normal; the bounce-reuse sample's
+// secondary point uses the same cheap resolve. RT_FLAT_LAST=0: the old behaviour.
+override FLAT_LAST:bool=true;
 override BLUE_NOISE_JITTER:bool=false;
 // `--blue-noise-path`: the first BLUE_NOISE_DIMS random numbers of every path (pixel
 // jitter, lens, bounce-0 lobe and direction) come from the 64x64 blue-noise masks,
@@ -668,7 +677,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
         if RAY_CONES {coneActive=!CONES_PRIMARY_ONLY || bounce==0u;}
         var hit = Intersection();
         if VIS_PRIMARY {visibilityPending = bounce == 0u;}
-        pathKeepLast = giRecorded && bounce == 1u;
+        pathKeepLast = giRecorded && bounce == 1u && !FLAT_LAST;
 
         if intersection(ray, &hit) {
             if pathInside {throughput *= exp(-pathSigma * hit.t * length(ray.direction));}
@@ -1411,7 +1420,7 @@ fn lampRis(origin: vec3<f32>, normal: vec3<f32>, candidates: u32, rng: ptr<funct
     var chosen=LampPoint();var chosenTarget=0.;var sum=0.;
     for(var k=0u;k<candidates;k+=1u) {
         let candidate=sampleLampPoint(origin,rng);
-        let score=meshFloat(meshMaterialOffset(candidate.material)+12u)*max(dot(normal,candidate.direction),0.);
+        let score=candidate.weight*max(dot(normal,candidate.direction),0.);
         let w=select(0.,score/candidate.pdf,candidate.pdf>0.);
         sum+=w;
         if w>0. && rngNextFloat(rng)*sum<w {chosen=candidate;chosenTarget=score;}
@@ -1419,12 +1428,13 @@ fn lampRis(origin: vec3<f32>, normal: vec3<f32>, candidates: u32, rng: ptr<funct
     if chosenTarget<=0. {return LampChoice();}
     return LampChoice(chosen.direction,chosen.distance,lampRadiance(chosen),chosen.pdf,sum/(f32(candidates)*chosenTarget));
 }
-struct LampPoint {direction: vec3<f32>, distance: f32, pdf: f32, material: u32, triangle: u32, bary: vec2<f32>, cosLight: f32}
+// `lamp` is the lamp's index in the lamp table (mesh.rs lamp_table).
+struct LampPoint {direction: vec3<f32>, distance: f32, pdf: f32, material: u32, lamp: u32, bary: vec2<f32>, cosLight: f32, weight: f32}
 fn lampRadiance(point: LampPoint) -> vec3<f32> {
     let m=meshMaterialOffset(point.material);
     let emission=meshVec3(m+4u);
     if meshData[m+32u]==0u {return emission;}
-    let tri=meshData[2u]+point.triangle*4u;
+    let tri=meshData[2u]+meshData[meshData[meshData[12u]+2u]+point.lamp*16u+11u]*4u;
     let va=vertexOffset(meshData[tri]);let vb=vertexOffset(meshData[tri+1u]);let vc=vertexOffset(meshData[tri+2u]);
     let w=vec3(1.-point.bary.x-point.bary.y,point.bary.x,point.bary.y);
     let uv0=w.x*vertexUV0(va)+w.y*vertexUV0(vb)+w.z*vertexUV0(vc);
@@ -1441,43 +1451,42 @@ fn sampleLamp(origin: vec3<f32>, rng: ptr<function,u32>) -> LampSample {
 fn sampleLampPoint(origin: vec3<f32>, rng: ptr<function,u32>) -> LampPoint {
     let table=meshData[12u];let count=meshData[table];
     let x=rngNextFloat(rng)*f32(count);let slot=min(u32(x),count-1u);
-    let entry=table+2u+slot*4u;
+    let entry=table+3u+slot*2u;
     let pick=select(meshData[entry+1u],slot,fract(x)<meshFloat(entry));
-    let triangle=meshData[table+2u+pick*4u+2u];
     let r=sqrt(rngNextFloat(rng));let s=rngNextFloat(rng);
-    return lampAt(triangle,vec2(r*(1.-s),r*s),origin);
+    return lampAt(pick,vec2(r*(1.-s),r*s),origin);
 }
-// The point with barycentrics (b1, b2) on lamp triangle `triangle`, seen from `origin`.
-fn lampAt(triangle: u32, bary: vec2<f32>, origin: vec3<f32>) -> LampPoint {
-    let tri=meshData[2u]+triangle*4u;
-    let va=vertexOffset(meshData[tri]);let vb=vertexOffset(meshData[tri+1u]);let vc=vertexOffset(meshData[tri+2u]);
-    let w=vec3(1.-bary.x-bary.y,bary.x,bary.y);
-    let a=meshVec3(va);let b=meshVec3(vb);let c=meshVec3(vc);
-    let point=w.x*a+w.y*b+w.z*c;
-    let normal=cross(b-a,c-a);
-    let toLight=point-origin;let distance=length(toLight);let direction=toLight/max(distance,1e-20);
-    let material=meshData[tri+3u];
-    let cosLight=abs(dot(normal,direction))/max(length(normal),1e-20);
-    // Texture coordinates are fetched only for the winner (lampRadiance).
-    return LampPoint(direction,distance,lampPdfAt(material,distance,cosLight),material,triangle,bary,cosLight);
+// The point with barycentrics (b1, b2) on lamp `lamp`, seen from `origin`: one 64-byte
+// record (corner + material, edge + weight, edge + triangle, unit normal).
+fn lampAt(lamp: u32, bary: vec2<f32>, origin: vec3<f32>) -> LampPoint {
+    let table=meshData[12u];
+    let record=meshData[table+2u]+lamp*16u;
+    let a=meshVec4(record);let e1=meshVec4(record+4u);let e2=meshVec3(record+8u);let normal=meshVec3(record+12u);
+    let toLight=a.xyz+bary.x*e1.xyz+bary.y*e2-origin;
+    let distance=length(toLight);let direction=toLight/max(distance,1e-20);
+    let cosLight=abs(dot(normal,direction));
+    // Source pdf in solid angle: selection (weight x area / total) x the uniform area
+    // pdf (1 / area) x the area-to-solid-angle factor. Texture coordinates are fetched
+    // only for the winner (lampRadiance).
+    let pdf=e1.w/meshFloat(table+1u)*distance*distance/max(cosLight,1e-8);
+    return LampPoint(direction,distance,pdf,bitcast<u32>(a.w),lamp,bary,cosLight,e1.w);
 }
 
 // ReSTIR in area measure: target = lamp weight x max(n.w, 0) x cosLight / d^2 (no
 // BSDF, texture or visibility); the source pdf of a fresh candidate is weight / total.
 fn restirTarget(point: LampPoint, normal: vec3<f32>) -> f32 {
-    let weight=meshFloat(meshMaterialOffset(point.material)+12u);
-    return weight*max(dot(normal,point.direction),0.)*point.cosLight/max(point.distance*point.distance,1e-12);
+    return point.weight*max(dot(normal,point.direction),0.)*point.cosLight/max(point.distance*point.distance,1e-12);
 }
-struct Reservoir {triangle: u32, bary: vec2<f32>, w: f32, m: f32, depth: f32, normal: vec3<f32>}
+struct Reservoir {lamp: u32, bary: vec2<f32>, w: f32, m: f32, depth: f32, normal: vec3<f32>}
 fn reservoirSlot(parity: u32, pixel: u32) -> u32 {return (parity*frameData.x*frameData.y+pixel)*3u;}
-// DI_SHARED final reservoirs keep their shadow-ray result in the triangle word's top bit.
+// DI_SHARED final reservoirs keep their shadow-ray result in the lamp word's top bit.
 const RESERVOIR_VISIBLE = 0x80000000u;
 fn loadReservoir(slot: u32) -> Reservoir {
     let a=reservoirs[slot];let b=reservoirs[slot+1u];let c=reservoirs[slot+2u];
     return Reservoir(a.x&0x7fffffffu,unpack2x16unorm(a.y),bitcast<f32>(b.x),bitcast<f32>(b.y),bitcast<f32>(c.x),decodeOct(c.y));
 }
 fn storeReservoir(slot: u32, r: Reservoir) {
-    reservoirs[slot]=vec2(r.triangle,pack2x16unorm(r.bary));
+    reservoirs[slot]=vec2(r.lamp,pack2x16unorm(r.bary));
     reservoirs[slot+1u]=vec2(bitcast<u32>(r.w),bitcast<u32>(r.m));
     reservoirs[slot+2u]=vec2(bitcast<u32>(r.depth),pack2x16snorm(encodeOct(r.normal)));
 }
@@ -1500,7 +1509,7 @@ fn restirBlock(x: u32, y: u32) -> u32 {
 fn reservoirSet(group: u32, pixel: u32) -> u32 {return reservoirSlot(group,pixel);}
 struct RestirMerge {chosen: LampPoint, score: f32, sum: f32, m: f32}
 fn restirAdd(merge: ptr<function,RestirMerge>, r: Reservoir, origin: vec3<f32>, n: vec3<f32>, cap: f32, rng: ptr<function,u32>) {
-    let candidate=lampAt(r.triangle,r.bary,origin);
+    let candidate=lampAt(r.lamp,r.bary,origin);
     let score=restirTarget(candidate,n);
     let rm=min(r.m,cap);
     let w=score*r.w*rm;
@@ -1523,7 +1532,7 @@ fn restirVisible(merge: RestirMerge, hit: Intersection) -> bool {
 }
 // The merged winner's reservoir (W = 0 if none, or if `visible` is false).
 fn restirResolve(merge: RestirMerge, hit: Intersection, cap: f32, depth: f32, visible: bool) -> Reservoir {
-    var stored=Reservoir(merge.chosen.triangle,merge.chosen.bary,0.,min(merge.m,cap),depth,hit.n);
+    var stored=Reservoir(merge.chosen.lamp,merge.chosen.bary,0.,min(merge.m,cap),depth,hit.n);
     if merge.score>0. && visible {stored.w=merge.sum/(merge.m*merge.score);}
     return stored;
 }
@@ -1565,7 +1574,7 @@ fn csRestirInitial(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_
         for(var k=0u;k<LAMP_CANDIDATES;k+=1u) {
             let candidate=sampleLampPoint(hit.p,&rng);
             let score=restirTarget(candidate,n);
-            let w=score*total/max(meshFloat(meshMaterialOffset(candidate.material)+12u),1e-30);
+            let w=score*total/max(candidate.weight,1e-30);
             merge.sum+=w;
             if w>0. && rngNextFloat(&rng)*merge.sum<w {merge.chosen=candidate;merge.score=score;}
         }
@@ -1618,7 +1627,7 @@ fn restirLamps(hit: Intersection, surface: PbrSurface, rng: ptr<function,u32>) -
         let r=loadReservoir(slot);
         if r.m>0. && abs(r.depth-seenFrom)<=0.1*seenFrom && dot(r.normal,hit.n)>=0.9 {
             if (reservoirs[slot].x&RESERVOIR_VISIBLE)==0u || r.w<=0. {return vec3(0.);}
-            return restirShade(lampAt(r.triangle,r.bary,hit.p),surface,hit,r.w);
+            return restirShade(lampAt(r.lamp,r.bary,hit.p),surface,hit,r.w);
         }
         // An edge: this pixel's own merge and shadow ray (nothing stored).
         let merge=restirSpatialMerge(hit,here,rng);
@@ -1737,7 +1746,10 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
     // Spatial: this frame's samples of nearby pixels on a similar surface.
     let here=vec2(f32(id.x),f32(id.y))+vec2(0.5);
     let depth=distance(camera.eye,own.primary);
-    for(var k=0u;k<GI_SPATIAL;k+=1u) {
+    // Neighbours only while the pixel's own history is short (after a disocclusion):
+    // with a long history they add nothing measurable, and each costs a scattered read.
+    let neighbours=select(0u,GI_SPATIAL,m<GI_SPATIAL_BELOW);
+    for(var k=0u;k<neighbours;k+=1u) {
         let angle=6.2831853*rngNextFloat(&rng);
         let at=here+GI_RADIUS*sqrt(rngNextFloat(&rng))*vec2(cos(angle),sin(angle));
         if at.x<0. || at.y<0. || at.x>=f32(frameData.x) || at.y>=f32(frameData.y) {continue;}

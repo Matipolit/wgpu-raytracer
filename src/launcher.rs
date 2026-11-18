@@ -97,7 +97,7 @@ impl Preset {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Low => "half resolution, 2 bounces, small neural denoiser",
+            Self::Low => "half resolution, 2 bounces + ReSTIR GI, small neural denoiser",
             Self::Medium => "67% resolution, 2 bounces + ReSTIR GI, best neural denoiser",
             Self::High => "full resolution, 2 bounces + ReSTIR GI, best neural denoiser",
             Self::Reference => "full resolution, 8 bounces, progressive (hold the camera still)",
@@ -144,7 +144,9 @@ impl Settings {
         };
         self.preset = preset;
         // 2 bounces + ReSTIR GI beats 3 plain bounces in quality and cost (Deck:
-        // Sponza 33 vs 36 ms per frame); Low drops GI for speed.
+        // Sponza 33 vs 36 ms per frame). Low keeps it too: tracing and lighting every
+        // pixel's own bounce costs more (Deck, Sponza 25.4 vs 19.1 ms, night Bistro
+        // 64.5 vs 45.1 ms) and is far noisier.
         (
             self.render_scale,
             self.bounces,
@@ -152,7 +154,7 @@ impl Settings {
             self.denoiser,
             self.max_samples,
         ) = match preset {
-            Preset::Low => (0.5, 2, false, neural("td-half16"), 1),
+            Preset::Low => (0.5, 2, true, neural("td-half16"), 1),
             Preset::Medium => (0.67, 2, true, neural("td2-half24"), 1),
             Preset::High => (1., 2, true, neural("td2-half24"), 1),
             Preset::Reference => (1., 8, false, Denoiser::Off, 4096),

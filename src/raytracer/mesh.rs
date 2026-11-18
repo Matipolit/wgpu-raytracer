@@ -940,10 +940,14 @@ impl Mesh {
         self.lamp_triangles(&self.lamp_weights()).len()
     }
 
-    /// Lamp table: count, total weight (f32 bits), then per entry an alias-method
-    /// record (threshold f32, alias index, triangle, 0) selecting triangles in
-    /// proportion to weight × area.
-    fn lamp_table(&self, weights: &[f32]) -> Vec<u32> {
+    /// Lamp table, placed at word `base` of the mesh data: count, total weight (f32
+    /// bits), the word offset of the lamp records; per lamp an alias-method entry
+    /// (threshold f32, alias index) selecting lamps in proportion to weight × area;
+    /// then, aligned to 16 words (one 64-byte cache line each), per lamp a record:
+    /// corner a + material index, edge b - a + weight, edge c - a + triangle index,
+    /// unit normal + 0. A lamp point needs this one record instead of the triangle,
+    /// its three vertices and its material (five scattered reads).
+    fn lamp_table(&self, weights: &[f32], base: usize) -> Vec<u32> {
         let lamps = self.lamp_triangles(weights);
         let total: f64 = lamps.iter().map(|l| l.1).sum();
         let n = lamps.len();
@@ -963,9 +967,24 @@ impl Mesh {
         for i in small.into_iter().chain(large) {
             scaled[i] = 1.;
         }
-        let mut words = vec![n as u32, (total as f32).to_bits()];
-        for (i, &(triangle, _)) in lamps.iter().enumerate() {
-            words.extend([(scaled[i] as f32).to_bits(), alias[i], triangle, 0]);
+        let mut words = vec![n as u32, (total as f32).to_bits(), 0];
+        for i in 0..n {
+            words.extend([(scaled[i] as f32).to_bits(), alias[i]]);
+        }
+        words.resize((base + words.len()).next_multiple_of(16) - base, 0);
+        words[2] = (base + words.len()) as u32;
+        for &(triangle, _) in &lamps {
+            let t = &self.triangles[triangle as usize];
+            let [a, b, c] = t
+                .vertices
+                .map(|v| glm::Vec3::from(self.vertices[v as usize].position));
+            let (e1, e2) = (b - a, c - a);
+            let normal = glm::normalize(&glm::cross(&e1, &e2));
+            let bits = |v: glm::Vec3, w: u32| [v.x.to_bits(), v.y.to_bits(), v.z.to_bits(), w];
+            words.extend(bits(a, t.material));
+            words.extend(bits(e1, weights[t.material as usize].to_bits()));
+            words.extend(bits(e2, triangle));
+            words.extend(bits(normal, 0));
         }
         words
     }
@@ -1529,7 +1548,7 @@ impl Mesh {
             words.extend(shaded);
         }
         if lamp_weights.iter().any(|&w| w > 0.) {
-            let table = self.lamp_table(&lamp_weights);
+            let table = self.lamp_table(&lamp_weights, words.len());
             if table[0] > 0 {
                 words[12] = words.len() as u32;
                 words.extend(table);

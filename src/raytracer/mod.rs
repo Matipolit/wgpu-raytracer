@@ -673,6 +673,14 @@ impl Raytracer {
             ("RESTIR_BLOCKS", f64::from(restir_blocks())),
             ("GI_BLOCKS", f64::from(gi_blocks())),
             (
+                "GI_SPATIAL_BELOW",
+                std::env::var("RT_GI_SPATIAL_BELOW").map_or(8., |v| v.parse().unwrap()),
+            ),
+            (
+                "FLAT_LAST",
+                f64::from(std::env::var("RT_FLAT_LAST").map_or(true, |v| v != "0")),
+            ),
+            (
                 "GI_DROP_UNUSABLE",
                 f64::from(std::env::var("RT_GI_DROP").map_or(true, |v| v != "0")),
             ),
