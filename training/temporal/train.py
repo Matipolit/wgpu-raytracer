@@ -57,7 +57,8 @@ def load(scene_dir):
     h, w = meta["height"], meta["width"]
     seqs = []
     for seq in sorted(scene_dir.glob("seq_*")):
-        files = sorted(seq.glob("frame_*.f16"))
+        # Frame files only: not the render-scale inputs (.lowN) or reference sidecars.
+        files = sorted(f for f in seq.glob("frame_*.f16") if f.name.count(".") == 1)
         if len(files) == meta["frames"]:
             seqs.append([np.memmap(f, dtype="<f2", mode="r", shape=(h, w, 18)) for f in files])
     return seqs

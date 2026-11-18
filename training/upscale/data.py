@@ -17,7 +17,7 @@ class Sequence:
         self.scene = scene
         h, w = meta["height"], meta["width"]
         self.size = (h, w)
-        frames = sorted(f for f in directory.glob("frame_*.f16") if ".low" not in f.name)
+        frames = sorted(f for f in directory.glob("frame_*.f16") if f.name.count(".") == 1)
         self.frames = [np.memmap(f, dtype="<f2", mode="r", shape=(h, w, 18)) for f in frames]
         crop = json.loads((directory / "crop.json").read_text())
         self.origin = (crop["x"], crop["y"])

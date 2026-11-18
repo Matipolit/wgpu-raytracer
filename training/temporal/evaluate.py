@@ -80,7 +80,7 @@ for scene_dir in scenes:
     stats = {m: dict(l1=0.0, mse=0.0, flicker=0.0, n=0, nf=0) for m in ("raw", "ema", "network")}
     for si, seq in enumerate(held):
         frames = [torch.from_numpy(np.fromfile(f, "<f2").reshape(h, w, 18).transpose(2, 0, 1).astype(np.float32)).unsqueeze(0)
-                  for f in sorted(seq.glob("frame_*.f16"))]
+                  for f in sorted(seq.glob("frame_*.f16")) if f.name.count(".") == 1]
         frames = [torch.nan_to_num(f, nan=0.0, posinf=0.0, neginf=0.0).to(a.device) for f in frames]
         state = {"ema": (None, None), "network": (None, None)}
         prev_out = {}
