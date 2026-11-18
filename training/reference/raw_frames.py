@@ -5,7 +5,9 @@
 Each file holds near-independent 1-spp frames of a still camera. Per file: the mean
 image's brightness against the first file's (a shift means bias), the noise of one
 frame around that file's mean image (relative, per pixel and per 8x8 block; RMS in
-exposure-normalized log space) and the share of very bright outlier samples. The
+exposure-normalized log space), the share of very bright outlier samples and of
+samples with no light at all (among pixels that receive some). `--reference DIR`
+(a `--reference-output` render of the same view): brightness against it instead. The
 montage shows the first frame of every file.
 """
 import argparse
@@ -20,11 +22,25 @@ p.add_argument("files", nargs="+")
 p.add_argument("--montage")
 p.add_argument("--crop", default="")
 p.add_argument("--zoom", type=int, default=2)
+p.add_argument("--reference", help="a --reference-output directory of the same view and size: brightness and block error against it")
 a = p.parse_args()
 w, h = map(int, a.size.split("x"))
 LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 k = None
 panels = []
+truth = None
+if a.reference:
+    import json
+
+    d = pathlib.Path(a.reference)
+    groups = json.loads((d / "meta.json").read_text())["groups"]
+    truth = np.fromfile(d / "groups.f32", dtype=np.float32).reshape(groups, h, w, 3).mean(0) @ LUMA
+    k, base = 0.18 / truth.mean(), truth.mean()
+
+
+def blocks8(image):
+    return image[..., : h // 8 * 8, : w // 8 * 8].reshape(*image.shape[:-2], h // 8, 8, w // 8, 8).mean((-3, -1))
+
 for name in a.files:
     frames = np.fromfile(name, dtype=np.float32).reshape(-1, h, w, 3)
     lum = frames @ LUMA
@@ -32,14 +48,28 @@ for name in a.files:
     if k is None:
         k, base = 0.18 / mean.mean(), mean.mean()
     ok = mean > 1e-6
-    rel = lum.std(0, ddof=1)[ok] / mean[ok]
-    blocks = lum[:, : h // 8 * 8, : w // 8 * 8].reshape(len(lum), h // 8, 8, w // 8, 8).mean((2, 4))
-    block = blocks.std(0, ddof=1) / np.maximum(blocks.mean(0), 1e-6)
+    # Noise relative to the reference image when there is one (comparable between
+    # settings that change the brightness, e.g. direct light only), else to the mean.
+    level = truth if truth is not None else mean
+    visible = level > 0.02 * level.mean()
+    rel = lum.std(0, ddof=1)[visible] / level[visible]
+    blocks = blocks8(lum)
+    block_level = blocks8(level)
+    block = (blocks.std(0, ddof=1) / np.maximum(block_level, 1e-9))[block_level > 0.02 * level.mean()]
     log = np.log1p(k * np.maximum(frames, 0))
     noise = np.sqrt(((log - np.log1p(k * np.maximum(frames.mean(0), 0))) ** 2).mean())
     bright = (lum > 8 * np.maximum(mean, 1e-6)).mean()
+    black = (lum[:, ok] == 0).mean()
+    against = ""
+    if truth is not None:
+        # The mean image's 8x8 blocks against the reference's (bias plus the mean's
+        # leftover noise).
+        tb, mb = blocks8(truth), blocks8(mean)
+        lit = tb > 0.02 * tb.mean()
+        off = np.abs(mb[lit] - tb[lit]) / tb[lit]
+        against = f"  block error vs reference median {np.median(off):.3f} p90 {np.quantile(off, 0.9):.3f}"
     print(f"{pathlib.Path(name).stem:16s} {len(frames)} frames  brightness {mean.mean() / base:.3f}  noise/pixel median {np.median(rel):.2f} p90 {np.quantile(rel, 0.9):.2f}"
-          f"  noise/8x8 block median {np.median(block):.3f} p90 {np.quantile(block, 0.9):.3f}  log RMS {noise:.4f}  outliers {100 * bright:.3f}%")
+          f"  noise/8x8 block median {np.median(block):.3f} p90 {np.quantile(block, 0.9):.3f}  log RMS {noise:.4f}  outliers {100 * bright:.3f}%  no light {100 * black:.1f}%{against}")
     x = np.maximum(frames[0], 0) * k
     panels.append((pathlib.Path(name).stem, Image.fromarray(((x / (1 + x)) ** (1 / 2.2) * 255 + 0.5).astype(np.uint8))))
 if a.montage:

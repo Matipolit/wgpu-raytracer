@@ -118,6 +118,10 @@ const GI_CAP = 20.;
 // night Bistro 16.9 -> 8.6 ms (every frame skipped), Sponza 8.1 -> 5.8 ms.
 override GI_VISIBILITY_REUSE: bool = true;
 override GI_TEMPORAL_TRUST: bool = true;
+// A bounce sample that carries nothing (it left the hemisphere, or was never traced)
+// counts as the pixel's sample with weight 0, and the pixel still reuses its history
+// and its neighbours. Off (RT_GI_NULL=0): such a pixel gets no bounce light that frame.
+override GI_NULL_SAMPLES: bool = true;
 // Three vec4 per pixel of this frame's samples (primary point + normal, secondary
 // point + normal, radiance rg/b + pdf), then two sets (parity) of final reservoirs,
 // two vec4 per pixel (secondary point + normal, radiance rg/b|M, W, distance).
@@ -638,7 +642,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
     var vertexSunShare = sunShare;
     var lampsCovered = false;
     let giActive = RESTIR_GI && sampleIndex == 0u && samplingParams.restir != 0u;
-    var giRecorded = false;var giHasSecondary = false;var giPrimaryOnly = false;
+    var giRecorded = false;var giHasSecondary = false;var giPrimaryOnly = false;var giNull = false;
     let giTurn = (samplingParams.restir + 2u) & 3u;
     let giOwner = !GI_BLOCKS || ((gbufferPixel % frameData.x) & 1u) == (giTurn & 1u) && ((gbufferPixel / frameData.x) & 1u) == (giTurn >> 1u);
     var giColor0 = vec3(0.);var giThroughput = vec3(0.);var giPdf = 0.;
@@ -761,11 +765,16 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                     gbufferPending = false;
                     writeGbuffer(shadedBase, hit.t * length(ray.direction), hit.n, shadedRough, shadedMetal, meshPrevious, 1.);
                 }
-                if giActive && bounce == 0u && lastBsdfPdf > 0. && lastBsdfPdf < 1e7 && meshFloat(m+48u) <= 0. {
+                if giActive && bounce == 0u && lastBsdfPdf < 1e7 && meshFloat(m+48u) <= 0. && (GI_NULL_SAMPLES || lastBsdfPdf > 0.) {
                     giPrimary = hit.p;giPrimaryNormal = hit.n;
                     // Not this block's owner this frame: the bounce comes from reuse.
                     if !giOwner {giPrimaryOnly = true;break;}
-                    giRecorded = true;giColor0 = color;giThroughput = scatter.throughput;giPdf = lastBsdfPdf;
+                    // A sample that carries nothing (below the surface: no pdf or no
+                    // throughput) is still this pixel's sample: recorded as a null one,
+                    // so the pixel keeps reusing instead of going black for the frame.
+                    if lastBsdfPdf > 0. && max(scatter.throughput.r,max(scatter.throughput.g,scatter.throughput.b)) > 0. {
+                        giRecorded = true;giColor0 = color;giThroughput = scatter.throughput;giPdf = lastBsdfPdf;
+                    } else {giNull = true;}
                 }
                 ray = scatter.ray;
                 if RAY_CONES {coneSpread=min(1.,coneSpread+0.25*meshFloat(m+8u));}
@@ -813,9 +822,9 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                 vec4(pack2x16float(min(max(outgoing.rg, vec2(0.)), vec2(60000.))), pack2x16float(vec2(min(max(outgoing.b, 0.), 60000.), 0.)), bitcast<u32>(giPdf), 1u),
             );
             color = giColor0;
-        } else if giPrimaryOnly {
+        } else if giPrimaryOnly || (GI_NULL_SAMPLES && (giNull || giRecorded)) {
             record[0] = vec4(bitcast<vec3<u32>>(giPrimary), pack2x16snorm(encodeOct(giPrimaryNormal)));
-            record[2] = vec4(0u, 0u, 0u, 2u);
+            record[2] = vec4(0u, 0u, 0u, select(3u, 2u, giPrimaryOnly));
         }
         for (var k = 0u; k < 3u; k += 1u) {giData[gbufferPixel * 3u + k] = record[k];}
     }
@@ -1672,7 +1681,8 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
     let pixel=frameData.x*id.y+id.x;
     let parity=samplingParams.restir&1u;
     let own=loadGiSample(pixel);
-    // Records: 0 none, 1 a sample, 2 the primary point only (GI_BLOCKS).
+    // Records: 0 none, 1 a sample, 2 the primary point only (GI_BLOCKS), 3 a null
+    // sample (GI_NULL_SAMPLES).
     let state=giData[pixel*3u+2u].w;
     if state==0u {
         giData[giFinalSlot(parity,pixel)]=vec4(0u);giData[giFinalSlot(parity,pixel)+1u]=vec4(0u);
@@ -1690,7 +1700,7 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
     if state==1u {
         pick=GiPick(own.secondary,own.secondaryNormal,own.radiance,giTarget(surface,hit,own.secondary,own.radiance),false);
         sum=pick.score/own.pdf;m=1.;
-    }
+    } else if state==3u {m=1.;}
     // Temporal: last frame's final reservoir along the motion.
     let previous=previousPixel(own.primary);
     if previous.x>=0. && previous.y>=0. && previous.x<f32(frameData.x) && previous.y<f32(frameData.y) {
@@ -1713,8 +1723,12 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
         let angle=6.2831853*rngNextFloat(&rng);
         let at=here+GI_RADIUS*sqrt(rngNextFloat(&rng))*vec2(cos(angle),sin(angle));
         if at.x<0. || at.y<0. || at.x>=f32(frameData.x) || at.y>=f32(frameData.y) {continue;}
-        let other=loadGiSample(u32(at.y)*frameData.x+u32(at.x));
-        if other.pdf<=0. || abs(distance(camera.eye,other.primary)-depth)>0.1*depth || dot(other.primaryNormal,own.primaryNormal)<0.9 {continue;}
+        let index=u32(at.y)*frameData.x+u32(at.x);
+        let other=loadGiSample(index);
+        let nothing=giData[index*3u+2u].w==3u;
+        if (other.pdf<=0. && !nothing) || abs(distance(camera.eye,other.primary)-depth)>0.1*depth || dot(other.primaryNormal,own.primaryNormal)<0.9 {continue;}
+        // A neighbour's null sample: one more sample that found nothing.
+        if nothing {m+=1.;continue;}
         let jacobian=giJacobian(other.secondary,other.secondaryNormal,other.primary,own.primary);
         let score=giTarget(surface,hit,other.secondary,other.radiance);
         let w=score*jacobian/other.pdf;

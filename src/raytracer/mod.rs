@@ -671,6 +671,10 @@ impl Raytracer {
             ("RESTIR_BLOCKS", f64::from(restir_blocks())),
             ("GI_BLOCKS", f64::from(gi_blocks())),
             (
+                "GI_NULL_SAMPLES",
+                f64::from(std::env::var("RT_GI_NULL").map_or(true, |v| v != "0")),
+            ),
+            (
                 "VIS_OUTPUT",
                 f64::from(vis_on && upscale::output_guides_requested()),
             ),
