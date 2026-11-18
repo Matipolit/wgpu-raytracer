@@ -12,9 +12,9 @@ struct JnParams { renderSize: vec2<u32>, outputSize: vec2<u32>, jitter: vec2<f32
 @group(0) @binding(2) var<storage, read> lowGuides: array<vec4<f32>>;
 // The same guides at output resolution (raytracer.wgsl csOutputGuides).
 @group(0) @binding(3) var<storage, read> outGuides: array<vec4<f32>>;
-// History (ping-pong): demodulated rgb + distance, normal + kind.
-@group(0) @binding(4) var<storage, read> historyIn: array<vec4<f32>>;
-@group(0) @binding(5) var<storage, read_write> historyOut: array<vec4<f32>>;
+// History (ping-pong), packed f16: demodulated rgb + distance (.xy), normal + kind (.zw).
+@group(0) @binding(4) var<storage, read> historyIn: array<vec4<u32>>;
+@group(0) @binding(5) var<storage, read_write> historyOut: array<vec4<u32>>;
 @group(0) @binding(6) var<storage, read_write> output: array<array<f32, 3>>;
 // Intermediates as packed f16 vec4s: features (output res), hidden layers (half res),
 // the a-trous ping-pong and the warp record (warped rgb + validity, gathered rgb).
@@ -41,10 +41,14 @@ fn jnRenderIndex(r: vec2<i32>) -> u32 {
     return u32(c.y) * jn.renderSize.x + u32(c.x);
 }
 
+// The features of an 8x8 tile, for the 2x2 pool (half-resolution conv input).
+var<workgroup> jnTile: array<array<vec4<f32>, 5>, 64>;
 @compute @workgroup_size(8, 8)
-fn csJnFeatures(@builtin(global_invocation_id) id: vec3<u32>) {
-    let o = id.xy;
-    if o.x >= jn.outputSize.x || o.y >= jn.outputSize.y { return; }
+fn csJnFeatures(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    // Threads past the edge compute the edge pixel's features (the pool replicates the
+    // last row / column of odd sizes) and write nothing per pixel.
+    let owned = id.x < jn.outputSize.x && id.y < jn.outputSize.y;
+    let o = min(id.xy, jn.outputSize - vec2(1u));
     let i = o.y * jn.outputSize.x + o.x;
     // This frame's samples near the pixel centre (render pixel r's sample lies at
     // r + jitter), demodulated by the render-resolution albedo.
@@ -91,46 +95,44 @@ fn csJnFeatures(@builtin(global_invocation_id) id: vec3<u32>) {
             let p = b + e;
             if p.x < 0 || p.y < 0 || p.x >= i32(jn.outputSize.x) || p.y >= i32(jn.outputSize.y) { continue; }
             let w = select(1. - t.x, t.x, e.x == 1) * select(1. - t.y, t.y, e.y == 1);
-            let j = u32(p.y) * jn.outputSize.x + u32(p.x);
-            s0 += w * historyIn[j * 2u];
-            s1 += w * historyIn[j * 2u + 1u];
+            let packed = historyIn[u32(p.y) * jn.outputSize.x + u32(p.x)];
+            s0 += w * jnUnpack(packed.xy);
+            s1 += w * jnUnpack(packed.zw);
         }
         warped = s0.xyz;
         let agree = abs(s0.w - dist) <= 0.1 * dist + 1e-3 && dot(s1.xyz, normal) >= 0.8 && abs(s1.w - kind) < 0.5;
         valid = select(0., 1., inside && agree);
     }
-    jnWarp[i] = vec4(jnPack(vec4(warped, valid)), jnPack(vec4(current, 0.)));
     let a = log(vec3(1.) + max(current, vec3(0.)));
     let h = log(vec3(1.) + max(warped, vec3(0.))) * valid;
     let al = clamp(g0.xyz, vec3(0.), vec3(4.));
     let inverseScale = 2. / (scale.x + scale.y);
-    jnFeatures[i * 5u] = jnPack(vec4(a, min(weight, 4.)));
-    jnFeatures[i * 5u + 1u] = jnPack(vec4(min(sqrt(nearest), 2.), h));
-    jnFeatures[i * 5u + 2u] = jnPack(vec4(valid, al));
-    jnFeatures[i * 5u + 3u] = jnPack(vec4(normal, g1.w));
-    jnFeatures[i * 5u + 4u] = jnPack(vec4(log(1. + max(dist, 0.)), inverseScale, 0., 0.));
-}
-
-// 2x2 mean of the features (the last row / column replicated for odd sizes).
-@compute @workgroup_size(8, 8)
-fn csJnPool(@builtin(global_invocation_id) id: vec3<u32>) {
-    let dims = jnHalf();
-    if id.x >= dims.x || id.y >= dims.y { return; }
-    let last = jn.outputSize - vec2(1u);
-    let q0 = min(id.xy * 2u, last);
-    let q1 = min(id.xy * 2u + vec2(1u, 0u), last);
-    let q2 = min(id.xy * 2u + vec2(0u, 1u), last);
-    let q3 = min(id.xy * 2u + vec2(1u, 1u), last);
-    let i0 = (q0.y * jn.outputSize.x + q0.x) * 5u;
-    let i1 = (q1.y * jn.outputSize.x + q1.x) * 5u;
-    let i2 = (q2.y * jn.outputSize.x + q2.x) * 5u;
-    let i3 = (q3.y * jn.outputSize.x + q3.x) * 5u;
-    let o = (id.y * dims.x + id.x) * 5u;
-    jnA[o + 0u] = jnPack(0.25 * (jnUnpack(jnFeatures[i0 + 0u]) + jnUnpack(jnFeatures[i1 + 0u]) + jnUnpack(jnFeatures[i2 + 0u]) + jnUnpack(jnFeatures[i3 + 0u])));
-    jnA[o + 1u] = jnPack(0.25 * (jnUnpack(jnFeatures[i0 + 1u]) + jnUnpack(jnFeatures[i1 + 1u]) + jnUnpack(jnFeatures[i2 + 1u]) + jnUnpack(jnFeatures[i3 + 1u])));
-    jnA[o + 2u] = jnPack(0.25 * (jnUnpack(jnFeatures[i0 + 2u]) + jnUnpack(jnFeatures[i1 + 2u]) + jnUnpack(jnFeatures[i2 + 2u]) + jnUnpack(jnFeatures[i3 + 2u])));
-    jnA[o + 3u] = jnPack(0.25 * (jnUnpack(jnFeatures[i0 + 3u]) + jnUnpack(jnFeatures[i1 + 3u]) + jnUnpack(jnFeatures[i2 + 3u]) + jnUnpack(jnFeatures[i3 + 3u])));
-    jnA[o + 4u] = jnPack(0.25 * (jnUnpack(jnFeatures[i0 + 4u]) + jnUnpack(jnFeatures[i1 + 4u]) + jnUnpack(jnFeatures[i2 + 4u]) + jnUnpack(jnFeatures[i3 + 4u])));
+    let features = array(
+        vec4(a, min(weight, 4.)),
+        vec4(min(sqrt(nearest), 2.), h),
+        vec4(valid, al),
+        vec4(normal, g1.w),
+        vec4(log(1. + max(dist, 0.)), inverseScale, 0., 0.),
+    );
+    if owned {
+        jnWarp[i] = vec4(jnPack(vec4(warped, valid)), jnPack(vec4(current, 0.)));
+        // This frame's history guides (the last filter level adds rgb + distance).
+        let guides = jnPack(vec4(normal, kind));
+        historyOut[i].z = guides.x;
+        historyOut[i].w = guides.y;
+        for (var g = 0u; g < 5u; g += 1u) { jnFeatures[i * 5u + g] = jnPack(features[g]); }
+    }
+    // 2x2 mean into the half-resolution grid (8x8 tiles start on even pixels).
+    jnTile[lid.y * 8u + lid.x] = features;
+    workgroupBarrier();
+    let halfPixel = id.xy / 2u;
+    if (lid.x & 1u) == 0u && (lid.y & 1u) == 0u && all(halfPixel < jnHalf()) {
+        let t = lid.y * 8u + lid.x;
+        let out = (halfPixel.y * jnHalf().x + halfPixel.x) * 5u;
+        for (var g = 0u; g < 5u; g += 1u) {
+            jnA[out + g] = jnPack(0.25 * (jnTile[t][g] + jnTile[t + 1u][g] + jnTile[t + 8u][g] + jnTile[t + 9u][g]));
+        }
+    }
 }
 
 @compute @workgroup_size(8, 8)
@@ -351,10 +353,9 @@ fn csJnFilter2(@builtin(global_invocation_id) id: vec3<u32>) {
     let e8 = exp(l8 - m);
     let x = (e0 * jnUnpack(jnX[0u * n + jnTap(o, -4, -4)]).xyz + e1 * jnUnpack(jnX[0u * n + jnTap(o, 0, -4)]).xyz + e2 * jnUnpack(jnX[0u * n + jnTap(o, 4, -4)]).xyz + e3 * jnUnpack(jnX[0u * n + jnTap(o, -4, 0)]).xyz + e4 * jnUnpack(jnX[0u * n + jnTap(o, 0, 0)]).xyz + e5 * jnUnpack(jnX[0u * n + jnTap(o, 4, 0)]).xyz + e6 * jnUnpack(jnX[0u * n + jnTap(o, -4, 4)]).xyz + e7 * jnUnpack(jnX[0u * n + jnTap(o, 0, 4)]).xyz + e8 * jnUnpack(jnX[0u * n + jnTap(o, 4, 4)]).xyz) / (e0 + e1 + e2 + e3 + e4 + e5 + e6 + e7 + e8);
     let g0 = outGuides[i * 3u];
-    let g1 = outGuides[i * 3u + 1u];
-    let g2 = outGuides[i * 3u + 2u];
     let radiance = x * (g0.xyz + vec3(JN_EPS));
     output[i] = array<f32, 3>(radiance.r, radiance.g, radiance.b);
-    historyOut[i * 2u] = vec4(x, g0.w);
-    historyOut[i * 2u + 1u] = vec4(g1.xyz, g2.w);
+    let rgbd = jnPack(vec4(x, g0.w));
+    historyOut[i].x = rgbd.x;
+    historyOut[i].y = rgbd.y;
 }

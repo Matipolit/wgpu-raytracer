@@ -281,8 +281,8 @@ impl Upscaler {
                 mapped_at_creation: false,
             })
         };
-        // History: TAAU rgb + depth (16 bytes); joint rgb + distance, normal + kind (32).
-        let history_bytes = if joint.is_some() { 32 } else { 16 };
+        // History: TAAU rgb + depth; joint rgb + distance, normal + kind as packed f16.
+        let history_bytes = 16;
         let history: [wgpu::Buffer; 2] =
             std::array::from_fn(|_| buffer("upscaler history", history_bytes * pixels));
         let output = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
