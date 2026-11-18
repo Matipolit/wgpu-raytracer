@@ -701,7 +701,7 @@ fn joint_network_matches_pytorch() {
             );
             let expected = take(high * 3);
             let mut encoder = device.create_command_encoder(&Default::default());
-            upscaler.record(&queue, &mut encoder, [jitter[0], jitter[1]], frame, 0);
+            upscaler.record(&queue, &mut encoder, [jitter[0], jitter[1]], frame, 0, None);
             queue.submit([encoder.finish()]);
             let got = read_buffer(&device, &queue, upscaler.output());
             // Intermediates are f16: compare in log space.

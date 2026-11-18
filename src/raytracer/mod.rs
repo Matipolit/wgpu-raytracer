@@ -15,7 +15,7 @@ pub mod gpu_textures;
 mod hwrt;
 mod image_buffers;
 pub mod mesh;
-mod profiler;
+pub(crate) mod profiler;
 mod temporal;
 mod texture;
 mod tuner;
@@ -1750,6 +1750,7 @@ impl Raytracer {
                     frame_jitter(frame_index),
                     frame_index,
                     self.latest_render_params.exposure.to_bits(),
+                    self.profiler.as_mut(),
                 );
             }
         }

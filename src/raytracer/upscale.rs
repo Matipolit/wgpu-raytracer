@@ -89,7 +89,8 @@ pub fn joint_requested() -> bool {
 }
 
 struct Joint {
-    pipelines: Vec<(wgpu::ComputePipeline, bool)>,
+    /// Kernel, whether it runs on the half-resolution grid, its name (profiler label).
+    pipelines: Vec<(wgpu::ComputePipeline, bool, &'static str)>,
     weights: wgpu::Buffer,
     feature_groups: u64,
     hidden_groups: u64,
@@ -194,7 +195,10 @@ impl Upscaler {
                 pipelines: model
                     .kernels()
                     .iter()
-                    .map(|(name, half)| (compute(&module, name), *half))
+                    .map(|(name, half)| {
+                        let label: &'static str = Box::leak(name.clone().into_boxed_str());
+                        (compute(&module, name), *half, label)
+                    })
                     .collect(),
                 weights: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("joint network weights"),
@@ -405,6 +409,7 @@ impl Upscaler {
         jitter: [f32; 2],
         frame: u32,
         exposure_bits: u32,
+        mut profiler: Option<&mut super::profiler::PassProfiler>,
     ) {
         let (alpha_min, alpha_max) = if self.denoised {
             (0.1, 0.4)
@@ -427,11 +432,6 @@ impl Upscaler {
             0,
             bytemuck::cast_slice(&[self.output_size.0, self.output_size.1, frame, exposure_bits]),
         );
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("upscale pass"),
-            timestamp_writes: None,
-        });
-        pass.set_bind_group(0, &self.groups[self.parity], &[]);
         let full = (
             self.output_size.0.div_ceil(8),
             self.output_size.1.div_ceil(8),
@@ -440,13 +440,37 @@ impl Upscaler {
             self.output_size.0.div_ceil(2).div_ceil(8),
             self.output_size.1.div_ceil(2).div_ceil(8),
         );
+        let group = &self.groups[self.parity];
         if let Some(joint) = &self.joint {
-            for (pipeline, on_half) in &joint.pipelines {
-                let groups = if *on_half { half } else { full };
-                pass.set_pipeline(pipeline);
-                pass.dispatch_workgroups(groups.0, groups.1, 1);
+            // One pass for all kernels, or (RT_PASS_TIMES) one timed pass per kernel.
+            let mut kernels = joint.pipelines.iter().peekable();
+            while kernels.peek().is_some() {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("joint network pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_bind_group(0, group, &[]);
+                let mut last = "";
+                for (pipeline, on_half, label) in kernels.by_ref() {
+                    let groups = if *on_half { half } else { full };
+                    pass.set_pipeline(pipeline);
+                    pass.dispatch_workgroups(groups.0, groups.1, 1);
+                    last = label;
+                    if profiler.is_some() {
+                        break;
+                    }
+                }
+                drop(pass);
+                if let Some(profiler) = profiler.as_deref_mut() {
+                    profiler.mark(encoder, last);
+                }
             }
         } else if let Some(pipeline) = &self.pipeline {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("upscale pass"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, group, &[]);
             pass.set_pipeline(pipeline);
             pass.dispatch_workgroups(full.0, full.1, 1);
         }
