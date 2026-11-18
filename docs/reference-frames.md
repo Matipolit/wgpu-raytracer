@@ -2,7 +2,8 @@
 
 Written 2026-11-18. How training and evaluation targets are rendered:
 `--reference-output DIR` (src/reference.rs) and `training/reference/finish.py`.
-Status: single still frames; not yet wired into `--capture` (see "Not done").
+Status: used for still frames and for training captures; checked against Blender
+Cycles (see below).
 
 ## What was wrong with "N spp at every pixel"
 
@@ -101,12 +102,62 @@ use during the runs, so times and samples per second are rough.
 - The cross-check's split between old and new error is good to about 10% (new mean
   vs old in Sponza should differ by sqrt(2475/2048), not come out equal).
 
+## Checked against Blender Cycles (2026-11-18)
+
+`training/reference/cycles_render.py` renders the same view in Cycles 5.2 (OptiX):
+the glTF imported as is, the camera from `--camera`, the atmosphere as an environment
+texture evaluated with the renderer's formula (`--print-sky`), the sun as a sun lamp
+with the same irradiance and angular size; no clamping, no adaptive sampling, box
+filter. Our `--bounces N` (path vertices on surfaces, each with a light sample) is
+Cycles' max bounces N - 1. `compare_renders.py` gives ours / theirs per 8x8 block.
+
+With every surface a grey Lambertian (`--clay` on both sides), 960x540:
+
+| scene | bounces | mean | median block | 10th-90th percentile |
+|---|---:|---:|---:|---:|
+| Sponza, before the sky fix | 2 | 0.974 | 0.962 | 0.83-0.98 |
+| Sponza | 1 | 0.999 | 0.997 | 0.94-1.03 |
+| Sponza | 2 | 0.999 | 1.000 | 0.99-1.01 |
+| Sponza | 8 | 0.999 | 0.999 | 0.99-1.01 |
+| Bistro day | 2 | 0.978 | 0.982 | 0.93-1.02 |
+
+- **The comparison found an error, fixed in a2b3ce2's parent:** nothing scatters on
+  from a path's last vertex, so it got sun and lamp light (light samples) but never
+  the atmosphere; "N bounces" gave the sun one more path segment than the sky. The
+  last vertex now takes one BSDF-sampled visibility ray toward the sky (SKY_LAST).
+  This also holds for the real-time renderer.
+- Transport, camera, sky and sun agree to about 1% in Sponza and 2% in Bistro.
+
+With the scenes' own materials (2 bounces; Cycles' Principled BSDF against our
+Lambert + GGX, not yet reconciled):
+
+| scene | mean | median block | 10th-90th percentile |
+|---|---:|---:|---:|
+| Sponza | 0.952 | 0.954 | 0.86-1.00 |
+| Bistro day | 1.045 | 1.040 | 0.99-1.18 |
+| Bistro night, glass opaque to Cycles' light samples | 1.026 | 1.330 | 1.08-1.66 |
+| Bistro night, glass transparent to shadow rays | 1.010 | 1.092 | 1.00-1.29 |
+| fireplace room, glass transparent to shadow rays | 0.957 | 0.894 | 0.58-1.00 |
+
+- Our shadow rays pass through transmissive surfaces, so lamps behind glass light
+  their surroundings directly. Cycles' light samples do not cross glass; with glass
+  made transparent to shadow rays there, night Bistro's gap drops from 33% to 9%.
+- Open: Sponza's curtains are 20-30% darker in ours; the fireplace room is 10% darker
+  at the median with a wide spread; night Bistro is still 9% brighter. These are
+  material and lamp differences still to be traced (pictures:
+  training/runs/cycles-compare/).
+
+## In captures
+
+`--capture --reference-groups 8` renders each frame's reference in 8 groups and writes
+them with pixel-integrated albedo and normal to a sidecar; `finish_capture.py` writes
+the finished reference into the frame files. `--warmup N` starts every sequence with
+settled reuse histories. `scripts/overnight_v4.sh` uses both (1024 spp, 2 bounces as
+the renderer, windows of 720p to 4K frames).
+
 ## Not done
 
-- **Not in `--capture` yet**: moving sequences, crops and the frame files still use
-  the old references.
-- **Bounce count**: the comparison used 4 bounces for both; whether targets should
-  match the runtime's 2 bounces or be the full transport is still open.
+- The material and lamp differences against Cycles above.
 - **Heavy tails**: rare bright samples dominate what error is left. Candidates: a
   robust per-pixel estimator over more groups, or path regularization.
 - **Allocation**: spend by need (samples proportional to a tile's noise) instead of
