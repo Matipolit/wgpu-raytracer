@@ -99,3 +99,40 @@ files: raytracer.wgsl (GI_SPATIAL_BELOW), mod.rs
 
 ### 4. The material's F0 / F90 in the bounce reuse  [REVERTED]
 No effect on day Bistro's brightness (0.955 either way).
+
+### 5. Coarse material at the last vertex  [REVERTED]
+hypothesis: the last vertex's material is read from random texels of full-size
+textures; a 16 x 16 mip would stay in the cache.
+result: Sponza Medium 31.91 -> 31.94 ms, night 75.90 -> 75.83, day 81.82 -> 82.07: no
+effect (image unchanged too). Those texture reads are not a bottleneck.
+
+## Breakdown after changes 0-2 (Deck, Medium, ms)
+- Sponza (31.9): trace 18.9 = primary shading 4.2 + primary sun rays 4.4 + bounce ray
+  and resolve 5.2 + light sample at the bounce vertex 5.1 (a quarter of the pixels
+  trace a bounce: 45 ns each for the ray, 44 ns for the light sample); reuse 5.7;
+  denoiser 4.8; upscale 1.5. The bounce costs 15.5 ms in total, 48% of the frame.
+- night Bistro (76.0): trace 47.1, of which the bounce 21.1 (183 ns per bounce);
+  reuse 12.1 (the temporal picks' visibility rays, every 4th frame, about 3 ms);
+  lamps 8.5; denoiser 4.8. The bounce costs 32.7 ms, 43% of the frame, for about 1%
+  of this scene's light.
+- the lamp reservoir merge with 6 neighbours is down to 0.4 ms (it was 3.5).
+
+## Final (this pass)
+Deck, 1280x800, baseline 00bdfa7 -> now:
+- Sponza Medium 33.9 -> 31.9 ms (-5.9%); night Bistro Medium 79.8 -> 76.0 (-4.8%).
+- Low: 19.05 -> 18.5 ms (Sponza) and 45.4 -> 44.4 (night), now with the bounce light
+  it was missing.
+kept: lamp records; bounce-reuse neighbours for short histories; the last-vertex fix
+with bounce reuse in Low.
+reverted: fewer lamp neighbours (noise), coarse last-vertex material (no effect),
+material F0/F90 in the reuse (no effect).
+next steps (payoff / cost):
+1. Sun shadow rays from a shadow map where it is unambiguous (a min/max depth
+   pyramid from the sun; rays only near shadow edges): primary sun rays are 4.4 ms
+   and bounce-vertex light samples 5.1 ms of Sponza Medium's 31.9. Up to -15% in sun
+   scenes; a new raster pass and classification, a day or two.
+2. Fewer bounce owners (one per 2x4 or 3x3 pixels instead of 2x2): the bounce is
+   43-48% of the frame; halving the owners is about -13 to -15%, at a slower response
+   of bounce light to change. Needs a motion-quality check.
+3. Night Bistro's reuse pass: 11.6 ms without neighbours against 5.2 in Sponza for the
+   same pixel count; only 3 ms are explained (recheck rays). Unexplained.
