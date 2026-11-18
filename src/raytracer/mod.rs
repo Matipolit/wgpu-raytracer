@@ -451,7 +451,14 @@ impl Raytracer {
             )
         };
 
-        let temporal_source = temporal::model_source();
+        let mut temporal_source = temporal::model_source(device);
+        // An f16 model needs `enable f16;` at the start of the module.
+        let model_f16 = temporal_source
+            .as_deref()
+            .is_some_and(|source| source.lines().any(|line| line == "enable f16;"));
+        if let Some(source) = temporal_source.as_mut().filter(|_| model_f16) {
+            *source = source.replacen("enable f16;\n", "", 1);
+        }
         let neural = crate::argument_value("--neural-model")
             .map(|path| std::fs::read_to_string(path).expect("cannot read neural WGSL model"));
         let mut trace_source = include_str!("raytracer.wgsl").to_owned();
@@ -487,6 +494,9 @@ impl Raytracer {
                 }
             }
             trace_source.replace_range(start..end, &result);
+            trace_source = format!("enable f16;\n{trace_source}");
+        }
+        if model_f16 && !crate::has_flag("--fp16-state") {
             trace_source = format!("enable f16;\n{trace_source}");
         }
         // Hardware ray queries need the WGSL extension and the real implementation;

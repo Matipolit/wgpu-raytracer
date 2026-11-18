@@ -60,6 +60,9 @@ pub fn device_requirements(adapter: &wgpu::Adapter) -> (wgpu::Features, wgpu::Li
     (
         required_features() | ray_query | (available & wgpu::Features::TEXTURE_COMPRESSION_BC)
             // Optional: the visibility raster, and frame timing for the auto-tuner.
+            // Optional: f16 math (neural denoiser models exported with --f16; naga lowers
+            // the f16 bitcasts through 16-bit integers).
+            | (available & (wgpu::Features::SHADER_F16 | wgpu::Features::SHADER_I16))
             | (available & (wgpu::Features::PRIMITIVE_INDEX | wgpu::Features::INDIRECT_FIRST_INSTANCE | wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS))
             // RT_SPIRV_TRACE experiments load the trace kernel as raw SPIR-V.
             | if std::env::var("RT_SPIRV_TRACE").is_ok() { wgpu::Features::PASSTHROUGH_SHADERS } else { wgpu::Features::empty() },

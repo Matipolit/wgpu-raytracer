@@ -375,6 +375,8 @@ pub fn models(root: &Path) -> Vec<String> {
             path.extension().is_some_and(|e| e == "wgsl") && path.with_extension("bin").exists()
         })
         .filter_map(|path| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        // FILE.f16.wgsl is FILE's f16 variant (the renderer picks it), not a model.
+        .filter(|stem| !stem.ends_with(".f16"))
         .collect();
     stems.sort();
     stems
@@ -998,6 +1000,9 @@ mod tests {
         std::fs::write(root.join("models/a.wgsl"), "").unwrap();
         std::fs::write(root.join("models/b.wgsl"), "").unwrap();
         std::fs::write(root.join("models/b.bin"), "").unwrap();
+        // f16 variants are picked by the renderer, not listed.
+        std::fs::write(root.join("models/b.f16.wgsl"), "").unwrap();
+        std::fs::write(root.join("models/b.f16.bin"), "").unwrap();
         assert_eq!(models(&root), vec!["b".to_owned()]);
         let _ = std::fs::remove_dir_all(&root);
     }

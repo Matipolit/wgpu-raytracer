@@ -59,6 +59,8 @@ pub struct TemporalDenoiser {
     layout: wgpu::BindGroupLayout,
     params: wgpu::Buffer,
     weights: wgpu::Buffer,
+    /// Byte ranges (offset, size) of the f32 weights (binding 9) and f16 weights (11).
+    weight_ranges: [(u64, u64); 2],
     group: wgpu::BindGroup,
     pub empty_group: wgpu::BindGroup,
     pipelines: Vec<wgpu::ComputePipeline>,
@@ -75,16 +77,37 @@ pub struct TemporalDenoiser {
     half: bool,
 }
 
-pub fn model_source() -> Option<String> {
-    crate::argument_value("--temporal-model").map(|path| {
-        std::fs::read_to_string(path).expect("cannot read temporal model WGSL") + EMISSION_KERNEL
+/// `--temporal-model FILE.wgsl`, or its f16 variant `FILE.f16.wgsl` (export.py --f16:
+/// the conv layers in packed f16 math) when the device has SHADER_F16 and the file
+/// exists and 16-bit integers are available too (RT_TD_F32 keeps f32).
+fn model_path(device: &wgpu::Device) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(crate::argument_value("--temporal-model")?);
+    let half = path.with_extension("f16.wgsl");
+    Some(
+        if device
+            .features()
+            .contains(wgpu::Features::SHADER_F16 | wgpu::Features::SHADER_I16)
+            && std::env::var_os("RT_TD_F32").is_none()
+            && half.exists()
+        {
+            half
+        } else {
+            path
+        },
+    )
+}
+
+/// The model's WGSL. An f16 model's `enable f16;` line is left for the caller to move
+/// to the start of the shader module.
+pub fn model_source(device: &wgpu::Device) -> Option<String> {
+    model_path(device).map(|path| {
+        std::fs::read_to_string(&path).expect("cannot read temporal model WGSL") + EMISSION_KERNEL
     })
 }
 
 /// The model's weights: little-endian f32 vec4s next to the WGSL (same stem, `.bin`).
-fn model_weights() -> Vec<u8> {
-    let path = std::path::PathBuf::from(crate::argument_value("--temporal-model").unwrap())
-        .with_extension("bin");
+fn model_weights(device: &wgpu::Device) -> Vec<u8> {
+    let path = model_path(device).unwrap().with_extension("bin");
     std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
@@ -104,16 +127,19 @@ impl TemporalDenoiser {
                 count: None,
             })
             .collect();
-        entries.push(wgpu::BindGroupLayoutEntry {
-            binding: 9,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        });
+        // 9 the f32 weights, 11 the f16 conv weights of f16 models.
+        for binding in [9, 11] {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+        }
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: 8,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -143,9 +169,26 @@ impl TemporalDenoiser {
         let conv_pixels = constant(source, "TD_CONV_PIXELS", 1);
         let half = constant(source, "TD_HALF", 0) != 0;
         use wgpu::util::DeviceExt;
+        // f16 models (TD_W32 f32 rows, then the f16 row pairs): the f16 part starts at
+        // the next uniform offset alignment. f32 models bind 16 unused bytes at 11.
+        let mut contents = model_weights(device);
+        let f32_bytes = match u64::from(constant(source, "TD_W32", 0)) * 16 {
+            0 => contents.len() as u64,
+            n => n,
+        };
+        let weight_ranges = if f32_bytes < contents.len() as u64 {
+            let align = u64::from(device.limits().min_uniform_buffer_offset_alignment);
+            let start = f32_bytes.div_ceil(align) * align;
+            let half = contents.split_off(f32_bytes as usize);
+            contents.resize(start as usize, 0);
+            contents.extend_from_slice(&half);
+            [(0, f32_bytes), (start, half.len() as u64)]
+        } else {
+            [(0, f32_bytes), (0, 16)]
+        };
         let weights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("temporal denoiser weights"),
-            contents: &model_weights(),
+            contents: &contents,
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let params = device.create_buffer(&wgpu::BufferDescriptor {
@@ -154,7 +197,15 @@ impl TemporalDenoiser {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let group = Self::bind(device, &layout, &params, &weights, output, pixels, hidden);
+        let group = Self::bind(
+            device,
+            &layout,
+            &params,
+            (&weights, weight_ranges),
+            output,
+            pixels,
+            hidden,
+        );
         let empty_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: empty_layout,
@@ -164,6 +215,7 @@ impl TemporalDenoiser {
             layout,
             params,
             weights,
+            weight_ranges,
             group,
             empty_group,
             pipelines,
@@ -180,7 +232,7 @@ impl TemporalDenoiser {
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         params: &wgpu::Buffer,
-        weights: &wgpu::Buffer,
+        (weights, ranges): (&wgpu::Buffer, [(u64, u64); 2]),
         output: &wgpu::Buffer,
         pixels: u32,
         hidden: u64,
@@ -225,10 +277,16 @@ impl TemporalDenoiser {
             binding: 8,
             resource: params.as_entire_binding(),
         });
-        entries.push(wgpu::BindGroupEntry {
-            binding: 9,
-            resource: weights.as_entire_binding(),
-        });
+        for (binding, (offset, size)) in [9, 11].into_iter().zip(ranges) {
+            entries.push(wgpu::BindGroupEntry {
+                binding,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: weights,
+                    offset,
+                    size: wgpu::BufferSize::new(size),
+                }),
+            });
+        }
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("temporal denoiser bindings"),
             layout,
@@ -242,7 +300,7 @@ impl TemporalDenoiser {
             device,
             &self.layout,
             &self.params,
-            &self.weights,
+            (&self.weights, self.weight_ranges),
             output,
             pixels,
             self.hidden,
