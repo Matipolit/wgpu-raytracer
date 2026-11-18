@@ -248,11 +248,13 @@ fn csAccumulate(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_inv
     quadLane = lane;
     let origin = vec2(samplingParams.traceOrigin & 0xffffu, samplingParams.traceOrigin >> 16u);
     var at = id.xy;
-    if GI_BLOCKS && RESTIR_GI && samplingParams.restir != 0u && TRACE_WIDTH % 2u == 0u && TRACE_HEIGHT % 2u == 0u {
+    let grid = groups.xy * vec2(TRACE_WIDTH, TRACE_HEIGHT);
+    // The host dispatches an even grid for this (any workgroup shape).
+    if GI_BLOCKS && RESTIR_GI && samplingParams.restir != 0u && all(grid % vec2(2u) == vec2(0u)) {
         // The grid as four quarter-resolution planes, one per position in the 2x2
         // blocks, the GI owners first: a wave holds owners only (they trace the
         // bounce) or none, instead of one busy lane in four.
-        let half = groups.xy * vec2(TRACE_WIDTH, TRACE_HEIGHT) / 2u;
+        let half = grid / 2u;
         let side = vec2<u32>(id.xy >= half);
         let turn = (samplingParams.restir + 2u) & 3u;
         let owner = ((turn & 1u) ^ (origin.x & 1u)) + 2u * ((turn >> 1u) ^ (origin.y & 1u));

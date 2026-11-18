@@ -1130,8 +1130,20 @@ impl Raytracer {
         }
         // Revision 2: back-to-back measurement (earlier entries measured idle clocks);
         // RADV's wave size changes the best configuration.
+        // The kernel's constants (ReSTIR, GI blocks, ...) and the sampling setup change
+        // the best configuration too (review M7).
+        let kernel = {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            for (name, value) in &self.trace_constants {
+                (name, value.to_bits()).hash(&mut hash);
+            }
+            let sampling = &self.latest_render_params.sampling;
+            (sampling.num_bounces, sampling.restir).hash(&mut hash);
+            hash.finish()
+        };
         let key = format!(
-            "{adapter}|{}|{}|c2{}{}",
+            "{adapter}|{}|{}|c2{}{}|k{kernel:x}",
             self.scene_key,
             env!("CARGO_PKG_VERSION"),
             if mesh::hw_rt() { "|hw" } else { "" },
@@ -1547,11 +1559,17 @@ impl Raytracer {
                 );
             } else {
                 let (w, h) = self.trace_region.map_or((width, height), |r| (r.2, r.3));
-                pass.dispatch_workgroups(
-                    w.div_ceil(self.module_config.workgroup[0]),
-                    h.div_ceil(self.module_config.workgroup[1]),
-                    1,
-                );
+                let [wx, wy] = self.module_config.workgroup;
+                // GI blocks remap the thread grid into 2x2 planes: an even grid of
+                // threads (a 64x1 workgroup over an odd height gets one more row).
+                let even = |groups: u32, size: u32| {
+                    if params.restir != 0 && gi_blocks() && groups * size % 2 == 1 {
+                        groups + 1
+                    } else {
+                        groups
+                    }
+                };
+                pass.dispatch_workgroups(even(w.div_ceil(wx), wx), even(h.div_ceil(wy), wy), 1);
             }
             self.filter_dirty = true;
         }

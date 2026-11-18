@@ -877,7 +877,19 @@ fn gi_block_planes_trace_every_pixel_once() {
     tracer
         .set_render_params(&device, &queue, &render_params)
         .unwrap();
-    for region in [None, Some((3, 1, 13, 9))] {
+    // Every workgroup shape calibration may pick (a height of 1 included).
+    let shapes = [[8, 8], [16, 4], [32, 2], [64, 1]];
+    for (workgroup, region) in shapes
+        .into_iter()
+        .flat_map(|w| [(w, None), (w, Some((3, 1, 13, 9)))])
+    {
+        let config = crate::raytracer::tuner::ModuleConfig {
+            workgroup,
+            ..tracer.module_config
+        };
+        tracer.trace_pipelines =
+            tracer.trace_pipelines_for(&device, config, &tracer.tuner.variants.clone());
+        tracer.module_config = config;
         tracer.set_trace_region(region);
         // Several frames: the block owner rotates with the ReSTIR frame counter.
         for _ in 0..4 {
@@ -893,7 +905,7 @@ fn gi_block_planes_trace_every_pixel_once() {
                     let p = ((y * width + x) * 3) as usize;
                     assert!(
                         radiance[p..p + 3].iter().sum::<f32>() > 0.,
-                        "pixel ({x}, {y}) not traced in {region:?}"
+                        "pixel ({x}, {y}) not traced in {region:?}, workgroup {workgroup:?}"
                     );
                 }
             }
