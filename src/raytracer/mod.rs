@@ -722,6 +722,18 @@ impl Raytracer {
                 "RESTIR_GI",
                 f64::from(!scene.mesh.triangles.is_empty() && !crate::has_flag("--no-restir-gi")),
             ),
+            (
+                "GI_CAP",
+                std::env::var("RT_GI_CAP").map_or(20., |v| v.parse().unwrap()),
+            ),
+            (
+                "GI_SHADE",
+                std::env::var("RT_GI_SHADE").map_or(3., |v| v.parse().unwrap()),
+            ),
+            (
+                "GI_SHADE_RADIUS",
+                std::env::var("RT_GI_SHADE_RADIUS").map_or(24., |v| v.parse().unwrap()),
+            ),
             // Experiments: RT_RESTIR_SPATIAL, RT_RESTIR_RADIUS, RT_RESTIR_CAP.
             (
                 "RESTIR_SPATIAL",

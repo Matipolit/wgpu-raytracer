@@ -114,7 +114,23 @@ override GI_SPATIAL: u32 = 4u;
 // 1e9: always, as before).
 override GI_SPATIAL_BELOW: f32 = 8.;
 const GI_RADIUS = 24.;
-const GI_CAP = 20.;
+// History length cap (M), in samples (RT_GI_CAP).
+override GI_CAP: f32 = 20.;
+// Shading reuse (RT_GI_SHADE neighbours, 0: off). A pixel's reservoir keeps a sample for
+// about 4 x GI_CAP frames, and a bright one for seconds (its weight decays by 20/21 per
+// new sample), so the 1-spp frames repeat their error: in the living room a pixel's
+// noise is 88% the same one frame later and 62% the same 16 frames later, and a
+// 64-frame average looks like one frame. The denoiser turns those standing bright
+// pixels into blobs that crawl as the reservoirs change. With this, what a pixel shows
+// is resampled each frame from its own reservoir and those of GI_SHADE random pixels
+// within GI_SHADE_RADIUS on the same surface (last frame's, around where the pixel
+// was), with a visibility ray when a neighbour's sample wins. The stored history is
+// not touched (fed back, the pooled weights grow without bound). Living room, error
+// left after averaging 16 frames: per pixel -38%, per 8x8 block -34%; overall
+// brightness -3% (light a pixel sees and its neighbours do not is under-counted).
+// Steam Deck: +13-15% frame time.
+override GI_SHADE: u32 = 3u;
+override GI_SHADE_RADIUS: f32 = 24.;
 // GI_VISIBILITY_REUSE: a borrowed winner that is occluded is stored with W = 0 (its M
 // still counts, diluting the next frame). Off: stored with its weight, visibility
 // applied to the shading only (no measurable difference: Sponza, living room).
@@ -1825,8 +1841,48 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
     // A hidden pick is not kept: the pixel starts over.
     if GI_DROP_UNUSABLE && !visible {m=0.;}
     giData[slot+1u]=vec4(pack2x16float(pick.radiance.rg),pack2x16float(vec2(pick.radiance.b,min(m,GI_CAP))),bitcast<u32>(select(weight,0.,GI_VISIBILITY_REUSE && !visible)),bitcast<u32>(depth));
-    if weight<=0. || !visible {return;}
-    let eval=evaluatePbr(surface,hit,toSecondary/span);
+    if !visible {weight=0.;}
+    var toShade=toSecondary;var shadeSpan=span;
+    if GI_SHADE>0u && !disoccluded {
+        let own=min(m,GI_CAP);let ownPick=pick;let ownWeight=weight;
+        var shadeSum=select(0.,pick.score*weight*own,weight>0.);var shadeM=own;var shadeBorrowed=false;
+        let seenFrom=distance(prevCamera.eye,hit.p);
+        for(var k=0u;k<GI_SHADE;k+=1u) {
+            let angle=6.2831853*rngNextFloat(&rng);
+            let at=previous+GI_SHADE_RADIUS*sqrt(rngNextFloat(&rng))*vec2(cos(angle),sin(angle));
+            if at.x<0. || at.y<0. || at.x>=f32(frameData.x) || at.y>=f32(frameData.y) {continue;}
+            let q=vec2<u32>(at);
+            let other=giFinalSlot(parity^1u,q.y*frameData.x+q.x);
+            let a=giData[other];let b=giData[other+1u];
+            let rm=min(unpack2x16float(b.y).y,GI_CAP);
+            if rm<=0. {continue;}
+            // Where that pixel's surface point was (its distance along its pixel's ray).
+            let uv=(vec2<f32>(q)+vec2(0.5))/vec2<f32>(frameData.xy);
+            let source=prevCamera.eye+normalize(prevCamera.lowerLeftCorner+uv.x*prevCamera.horizontal+(1.-uv.y)*prevCamera.vertical-prevCamera.eye)*bitcast<f32>(b.w);
+            // The same surface: in this pixel's tangent plane.
+            if abs(dot(source-hit.p,hit.n))>0.02*seenFrom || abs(bitcast<f32>(b.w)-seenFrom)>0.1*seenFrom {continue;}
+            let secondary=bitcast<vec3<f32>>(a.xyz);let secondaryNormal=decodeOct(a.w);
+            let jacobian=giJacobian(secondary,secondaryNormal,source,hit.p);
+            if jacobian<=0. {continue;}
+            let radiance=vec3(unpack2x16float(b.x),unpack2x16float(b.y).x);
+            let score=giTarget(surface,hit,secondary,radiance);
+            let w=score*bitcast<f32>(b.z)*jacobian*rm;
+            shadeSum+=w;shadeM+=rm;
+            if w>0. && rngNextFloat(&rng)*shadeSum<w {pick=GiPick(secondary,secondaryNormal,radiance,score,true);shadeBorrowed=true;}
+        }
+        weight=select(0.,shadeSum/(shadeM*pick.score),pick.score>0. && shadeM>0.);
+        if shadeBorrowed && weight>0. {
+            toShade=pick.secondary-hit.p;shadeSpan=length(toShade);
+            // A neighbour's light this pixel cannot see: it shows its own sample instead.
+            // Black here would count the light the neighbours cannot see as missing too
+            // (5-7% darker overall with 3 neighbours; 3% with this).
+            if !(shadeSpan>1e-4 && shadeSpan<1e6 && weight<1e30) || occludedWithin(Ray(hit.p+hit.n*0.0001,toShade/shadeSpan),shadeSpan*0.999) {
+                pick=ownPick;weight=ownWeight;toShade=toSecondary;shadeSpan=span;
+            }
+        }
+    }
+    if weight<=0. {return;}
+    let eval=evaluatePbr(surface,hit,toShade/shadeSpan);
     let indirect=eval.rgb*pick.radiance*weight*select(1.,1./f32(max(samplingParams.numSamplesPerPixel,1u)),DENOISER_INPUT);
     let c=imageBuffer[pixel];
     imageBuffer[pixel]=array<f32,3>(c[0]+indirect.r,c[1]+indirect.g,c[2]+indirect.b);
