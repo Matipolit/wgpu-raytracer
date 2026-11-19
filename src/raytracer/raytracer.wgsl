@@ -140,11 +140,6 @@ override GI_SHADE: u32 = 3u;
 override GI_SHADE_RADIUS: f32 = 24.;
 override GI_SHADE_OWN_LIMIT: f32 = 3.;
 override GI_SHADE_NORMAL: f32 = 0.9;
-// Primary surfaces smoother than this roughness (RT_GLOSSY, 0: none) are path traced
-// plainly: every pixel traces its bounce and samples one light with MIS, no reservoirs.
-// A reservoir's sample is chosen without the BSDF's lobe (DI) or for an old view (GI),
-// so reflections on such surfaces come and go as the reservoirs change.
-override GLOSSY_PLAIN: f32 = 0.;
 // GI_VISIBILITY_REUSE: a borrowed winner that is occluded is stored with W = 0 (its M
 // still counts, diluting the next frame). Off: stored with its weight, visibility
 // applied to the shading only (no measurable difference: Sponza, living room).
@@ -753,14 +748,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                 let before = array(lastBsdfPdf,skyMisWeight,sunMisWeight,vertexSunShare);
                 let lampsCoveredBefore = lampsCovered;
                 vertexSunShare = sunShare;lampsCovered = false;
-                var reuse = bounce == 0u && sampleIndex == 0u && samplingParams.restir != 0u;
-                if reuse && GLOSSY_PLAIN > 0. {
-                    // Smooth surfaces take no part in the reuse (see GLOSSY_PLAIN).
-                    _ = pbrSurface(ray,hit);
-                    reuse = shadedRough >= GLOSSY_PLAIN;
-                    if RESTIR && !reuse {storeReservoir(reservoirSet(samplingParams.restir&1u,gbufferPixel),Reservoir());}
-                }
-                if RESTIR && reuse {
+                if RESTIR && bounce == 0u && sampleIndex == 0u && samplingParams.restir != 0u {
                     let surface = pbrSurface(ray,hit);
                     if sunOn {
                         let direction = sampleSun(rngState);
@@ -844,7 +832,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                     gbufferPending = false;
                     writeGbuffer(shadedBase, hit.t * length(ray.direction), hit.n, shadedRough, shadedMetal, meshPrevious, 1.);
                 }
-                if giActive && bounce == 0u && lastBsdfPdf < 1e7 && meshFloat(m+48u) <= 0. && (GI_NULL_SAMPLES || lastBsdfPdf > 0.) && shadedRough >= GLOSSY_PLAIN {
+                if giActive && bounce == 0u && lastBsdfPdf < 1e7 && meshFloat(m+48u) <= 0. && (GI_NULL_SAMPLES || lastBsdfPdf > 0.) {
                     giPrimary = hit.p;giPrimaryNormal = hit.n;
                     // Not this block's owner this frame: the bounce comes from reuse.
                     if !giOwner {giPrimaryOnly = true;break;}

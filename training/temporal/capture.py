@@ -7,7 +7,7 @@ High-quality set used for the final model:
         --spp 2048 --size 1280x720 --crop 192
 
 Runs `weekend-raytracer-wgpu --capture` per scene (see src/capture.rs) with the
-fastest tracer settings. Completed scenes (meta.json present) are skipped, so an
+fastest tracer settings (RT_BINARY: another build than target/release). Completed scenes (meta.json present) are skipped, so an
 interrupted capture resumes by rerunning the command.
 """
 import argparse
@@ -61,7 +61,7 @@ for index, name in enumerate(a.scenes.split(",")):
         continue
     start = time.time()
     subprocess.run(
-        [str(ROOT / "target/release/weekend-raytracer-wgpu"), "--model", scenes[name]["model"],
+        [os.environ.get("RT_BINARY", str(ROOT / "target/release/weekend-raytracer-wgpu")), "--model", scenes[name]["model"],
          "--camera", scenes[name]["camera"], "--capture", str(out), "--scale", str(SCALES[name]),
          "--sequences", str(a.sequences), "--frames", str(a.frames), "--reference-spp", str(a.spp),
          "--size", a.size, "--seed", str(a.seed_base + index), *(["--crop", str(a.crop)] if a.crop else []),
