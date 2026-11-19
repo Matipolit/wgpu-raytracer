@@ -673,6 +673,10 @@ impl Raytracer {
             ("RESTIR_BLOCKS", f64::from(restir_blocks())),
             ("GI_BLOCKS", f64::from(gi_blocks())),
             (
+                "CAPTURE_EMISSION",
+                f64::from(crate::has_flag("--capture-emission")),
+            ),
+            (
                 "SKY_LAST",
                 f64::from(std::env::var("RT_SKY_LAST").map_or(true, |v| v != "0")),
             ),
@@ -2089,6 +2093,36 @@ impl Raytracer {
     pub fn read_gbuffer(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
         let pixels = self.images.gbuffer.size() / 64;
         self.read_rows(device, queue, &self.images.gbuffer, 12, pixels)
+    }
+
+    /// Directly visible emission of the last dispatch (`--capture-emission`), 4 floats
+    /// per pixel (rgb, 0); with a trace region only its rows are filled.
+    pub fn read_emission(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<f32> {
+        let pixels = self.images.gbuffer.size() / 64;
+        let width = u64::from(self.latest_render_params.viewport_size.0);
+        let (first, rows) = self.trace_region.map_or((0, pixels / width), |r| {
+            (
+                u64::from(r.1),
+                u64::from(r.3).min(pixels / width - u64::from(r.1)),
+            )
+        });
+        let mut image = vec![0f32; (pixels * 4) as usize];
+        let from = (first * width * 4) as usize;
+        let part = read_buffer_range(
+            device,
+            queue,
+            &self.images.gbuffer,
+            pixels * 48 + from as u64 * 4,
+            rows * width * 16,
+        );
+        image[from..from + part.len()].copy_from_slice(&part);
+        image
+    }
+
+    /// The next frame's index: it seeds the random numbers and selects the shared
+    /// sub-pixel jitter (index mod 1024 of a Halton sequence).
+    pub fn set_frame_number(&mut self, frame: u32) {
+        self.frame_number = frame;
     }
 
     /// With a trace region, readbacks fetch only its rows (the rest of the returned

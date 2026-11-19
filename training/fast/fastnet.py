@@ -105,10 +105,12 @@ def gather(low, low_depth, low_kind, coords, origin, jitter, scale, depth, kind)
     return total / weight.clamp(min=1e-6), weight, nearest.sqrt()
 
 
-def step_b(head, x_low, low_guides, guides, coords, origin, jitter, scale, state, exposure):
+def step_b(head, x_low, low_guides, guides, coords, origin, jitter, scale, state, exposure, emission=None):
     """One output frame. x_low: stage A's demodulated output (B, 3, h, w); low_guides
     (B, 12, h, w); guides (B, 12, H, W) at output resolution; state: None or (history
-    rgb, depth, length); exposure (B, 1, 1, 1). Returns (image, state, valid)."""
+    rgb, depth, length); exposure (B, 1, 1, 1); emission: this frame's directly visible
+    emission at output resolution, accumulated with the rest. Returns (image, state,
+    valid)."""
     albedo = guides[:, A.ALBEDO]
     depth = guides[:, A.DIST : A.DIST + 1]
     kind = guides[:, A.KIND : A.KIND + 1]
@@ -116,7 +118,9 @@ def step_b(head, x_low, low_guides, guides, coords, origin, jitter, scale, state
     value, weight, nearest = gather(
         x_low, low_guides[:, A.DIST : A.DIST + 1], low_guides[:, A.KIND : A.KIND + 1], coords, origin, jitter, scale, depth, kind
     )
-    current = value * (albedo + EPS)
+    current = value * (albedo + A.EPS)
+    if emission is not None:
+        current = current + emission
     if state is None:
         history, valid, length = current, torch.zeros_like(depth), torch.zeros_like(depth)
     else:

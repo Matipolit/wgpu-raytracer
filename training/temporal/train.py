@@ -35,6 +35,15 @@ p.add_argument("--channels", type=int, default=16)
 p.add_argument("--dilations", default="1,2,4")
 p.add_argument("--half", action="store_true", help="3x3 convs at half resolution")
 p.add_argument("--init", help="start from these weights (same architecture)")
+# Second-generation options (model.py).
+p.add_argument("--edge", action="store_true", help="explicit edge stops in the kernels")
+p.add_argument("--length", action="store_true", help="history length input, running-mean default blend")
+p.add_argument("--feedback", default="filtered", choices=["filtered", "blend"], help="what becomes the history")
+p.add_argument("--hidden", type=int, default=0, help="hidden units of the per-pixel head")
+p.add_argument("--eps", type=float, default=0.01, help="demodulation floor")
+p.add_argument("--exposure", action="store_true", help="exposure-normalized loss and input features")
+p.add_argument("--max-steps", type=int, default=0)
+p.add_argument("--seed", type=int, default=0)
 p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 a = p.parse_args()
 torch.set_num_threads(a.threads)
@@ -43,12 +52,12 @@ import resource  # noqa: E402
 
 _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (_hard, _hard))
-torch.manual_seed(0)
-random.seed(0)
+torch.manual_seed(a.seed)
+random.seed(a.seed)
 out = pathlib.Path(a.out)
 out.mkdir(parents=True, exist_ok=True)
-M.configure(a.channels, [int(d) for d in a.dilations.split(",")], a.half)
-(out / "config.json").write_text(json.dumps(dict(channels=M.CHANNELS, dilations=list(M.DILATIONS), half=M.HALF)))
+M.configure(a.channels, [int(d) for d in a.dilations.split(",")], a.half, a.edge, a.length, a.feedback, a.hidden, a.eps)
+(out / "config.json").write_text(json.dumps(dict(M.settings(), exposure=a.exposure)))
 
 
 def load(scene_dir):
@@ -61,7 +70,8 @@ def load(scene_dir):
         # Frame files only: not the render-scale inputs (.lowN) or reference sidecars.
         files = sorted(f for f in seq.glob("frame_*.f16") if f.name.count(".") == 1)
         if len(files) == meta["frames"]:
-            seqs.append([np.memmap(f, dtype="<f2", mode="r", shape=(h, w, 18)) for f in files])
+            # 18 channels, or 21 with the directly visible emission (`--capture-emission`).
+            seqs.append([np.memmap(f, dtype="<f2", mode="r", shape=(h, w, f.stat().st_size // (h * w * 2))) for f in files])
     return seqs
 
 
@@ -80,7 +90,8 @@ print(f"train {len(train)} seqs, val {len(val)}, test ({a.holdout_scene}) {len(t
 
 
 def tensors(seq, window=None):
-    """(noisy, guides, ref) as (T, C, H, W) on the device; window = (y, x, size)."""
+    """(noisy, guides, ref, emission) as (T, C, H, W) on the device; window = (y, x,
+    size). Emission is zero for captures that keep it inside the noisy radiance."""
     if window:
         y, x, c = window
         frames = [np.ascontiguousarray(f[y : y + c, x : x + c]) for f in seq]
@@ -88,18 +99,29 @@ def tensors(seq, window=None):
         frames = [np.asarray(f) for f in seq]
     t = torch.from_numpy(np.stack(frames)).to(a.device).float().permute(0, 3, 1, 2)
     t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
-    return t[:, 0:3], t[:, 3:15], t[:, 15:18]
+    return t[:, 0:3], t[:, 3:15], t[:, 15:18], (t[:, 18:21] if t.shape[1] >= 21 else torch.zeros_like(t[:, 0:3]))
 
 
-def run_sequence(net, noisy, guides, ref, grad=True):
-    """noisy/guides/ref: (T, B, C, H, W). Returns loss and per-frame outputs."""
+def exposure_of(ref):
+    """0.18 / mean luminance of the first reference frame, per sequence (B, 1, 1, 1)."""
+    lum = 0.2126 * ref[0][:, 0] + 0.7152 * ref[0][:, 1] + 0.0722 * ref[0][:, 2]
+    return (0.18 / lum.mean((1, 2)).clamp(min=1e-6)).view(-1, 1, 1, 1)
+
+
+def run_sequence(net, noisy, guides, ref, emission, grad=True):
+    """noisy/guides/ref/emission: (T, B, C, H, W). Returns loss and per-frame outputs
+    (radiance with the emission added back)."""
     history = prev = None
     loss = 0.0
     prev_out = prev_ref = None
     outs = []
+    k = exposure_of(ref) if a.exposure else None
+    # The features see the exposure off by up to 2x either way while training.
+    seen = None if k is None else (k * 2 ** (2 * torch.rand_like(k) - 1) if grad else k)
     for t in range(noisy.shape[0]):
-        y, g, radiance, valid = M.step(net, noisy[t], guides[t], history, prev, t == 0)
-        tm, tr = M.tonemap(radiance), M.tonemap(ref[t])
+        y, g, radiance, valid = M.step(net, noisy[t], guides[t], history, prev, t == 0, seen)
+        radiance = radiance + emission[t]
+        tm, tr = M.tonemap(radiance if k is None else k * radiance), M.tonemap(ref[t] if k is None else k * ref[t])
         frame_loss = (tm - tr).abs().mean()
         if t > 0 and a.temporal_weight > 0:
             motion = guides[t][:, M.MOTION]
@@ -114,32 +136,35 @@ def run_sequence(net, noisy, guides, ref, grad=True):
 
 
 def batch():
-    noisy, guides, ref = [], [], []
+    noisy, guides, ref, emission = [], [], [], []
     for _ in range(a.batch):
         _, seq = random.choice(train)
         h, w = seq[0].shape[:2]
         y, x = random.randrange(h - a.crop + 1), random.randrange(w - a.crop + 1)
-        n, g, r = tensors(seq, (y, x, a.crop))
+        n, g, r, e = tensors(seq, (y, x, a.crop))
         g = g.clone()
         # Exposure augmentation: scale radiance (and sky "albedo", which is radiance).
-        s = math.exp(random.uniform(-1.0, 1.0))
+        # Not with --exposure: the loss and the features are normalized instead.
+        s = 1.0 if a.exposure else math.exp(random.uniform(-1.0, 1.0))
         sky = (g[:, M.KIND : M.KIND + 1] < 0.5).float()
         g[:, M.ALBEDO] = g[:, M.ALBEDO] * (1 + sky * (s - 1))
-        noisy.append(n * s), guides.append(g), ref.append(r * s)
-    return torch.stack(noisy, 1), torch.stack(guides, 1), torch.stack(ref, 1)
+        noisy.append(n * s), guides.append(g), ref.append(r * s), emission.append(e * s)
+    return torch.stack(noisy, 1), torch.stack(guides, 1), torch.stack(ref, 1), torch.stack(emission, 1)
 
 
 @torch.no_grad()
 def evaluate(net, sequences):
-    """Mean tonemapped L1 of denoised and raw 1-spp frames against references."""
+    """Mean tonemapped L1 of denoised and raw 1-spp frames against references, in the
+    space the loss uses (exposure-normalized with --exposure)."""
     ours = raw = 0.0
     frames = 0
     for _, seq in sequences:
-        n, g, r = tensors(seq)
-        _, outs = run_sequence(net, n.unsqueeze(1), g.unsqueeze(1), r.unsqueeze(1), grad=False)
+        n, g, r, e = tensors(seq)
+        _, outs = run_sequence(net, n.unsqueeze(1), g.unsqueeze(1), r.unsqueeze(1), e.unsqueeze(1), grad=False)
+        k = exposure_of(r.unsqueeze(1)) if a.exposure else 1.0
         for t, o in enumerate(outs):
-            ours += (M.tonemap(o) - M.tonemap(r[t : t + 1])).abs().mean().item()
-            raw += (M.tonemap(n[t : t + 1]) - M.tonemap(r[t : t + 1])).abs().mean().item()
+            ours += (M.tonemap(k * o) - M.tonemap(k * r[t : t + 1])).abs().mean().item()
+            raw += (M.tonemap(k * (n[t : t + 1] + e[t : t + 1])) - M.tonemap(k * r[t : t + 1])).abs().mean().item()
             frames += 1
     return ours / max(frames, 1), raw / max(frames, 1)
 
@@ -161,12 +186,13 @@ if checkpoint.exists():
     start -= state["elapsed"]
     print(f"resumed at step {step}", flush=True)
 running = 0.0
-while time.time() - start < budget:
-    progress = (time.time() - start) / budget
+while time.time() - start < budget and (a.max_steps == 0 or step < a.max_steps):
+    # The schedule follows the steps when their number is fixed, else the time budget.
+    progress = step / a.max_steps if a.max_steps else (time.time() - start) / budget
     for group in opt.param_groups:
         group["lr"] = a.lr * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
-    n, g, r = batch()
-    loss, _ = run_sequence(net, n, g, r)
+    n, g, r, e = batch()
+    loss, _ = run_sequence(net, n, g, r, e)
     opt.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)

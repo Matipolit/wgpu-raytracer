@@ -18,7 +18,10 @@ class Sequence:
         h, w = meta["height"], meta["width"]
         self.size = (h, w)
         frames = sorted(f for f in directory.glob("frame_*.f16") if f.name.count(".") == 1)
-        self.frames = [np.memmap(f, dtype="<f2", mode="r", shape=(h, w, 18)) for f in frames]
+        # 18 channels per pixel, or 21 with `--capture-emission` (emission last; the
+        # render-scale files then have 18 instead of 15).
+        channels = lambda f, n: f.stat().st_size // (n * 2)
+        self.frames = [np.memmap(f, dtype="<f2", mode="r", shape=(h, w, channels(f, h * w))) for f in frames]
         crop = json.loads((directory / "crop.json").read_text())
         self.origin = (crop["x"], crop["y"])
         low_info = json.loads((directory / "low.json").read_text())
@@ -28,7 +31,7 @@ class Sequence:
             files = [f.with_name(f.name.replace(".f16", f".low{i}.f16")) for f in frames]
             self.lows.append(
                 dict(
-                    frames=[np.memmap(f, dtype="<f2", mode="r", shape=(lh, lw, 15)) for f in files],
+                    frames=[np.memmap(f, dtype="<f2", mode="r", shape=(lh, lw, channels(f, lh * lw))) for f in files if f.exists()],
                     origin=tuple(info["origin"]),
                     jitter=[tuple(j) for j in info["jitter"]],
                     scale=(scale["scale_x"], scale["scale_y"]),
@@ -82,7 +85,7 @@ def split(scenes, holdout_scene):
     return train, val, test
 
 
-def tensors(seqs, scale_index, window, device, frames=None):
+def tensors(seqs, scale_index, window, device, frames=None, emission=False):
     """Batch of sequences at one scale. window = (oy, ox, crop) inside the stored output
     crop, or None for the whole crop. Returns (frames, coords, origin, scale): frames is a
     list of (low (B,15,h,w), guides (B,12,H,W), reference (B,3,H,W), jitter (B,2));
@@ -99,7 +102,14 @@ def tensors(seqs, scale_index, window, device, frames=None):
         hi = torch.nan_to_num(torch.from_numpy(hi).to(device).float().permute(0, 3, 1, 2), nan=0.0, posinf=0.0, neginf=0.0)
         lo = torch.nan_to_num(torch.from_numpy(lo).to(device).float().permute(0, 3, 1, 2), nan=0.0, posinf=0.0, neginf=0.0)
         jitter = torch.tensor([s.lows[scale_index]["jitter"][t] for s in seqs], device=device)
-        out.append((lo, hi[:, 3:15], hi[:, 15:18], jitter))
+        if emission:
+            # (low without its emission channels, guides, reference, jitter, low
+            # emission, output emission); zeros for captures without emission.
+            low_emission = lo[:, 15:18] if lo.shape[1] >= 18 else torch.zeros_like(lo[:, 0:3])
+            hi_emission = hi[:, 18:21] if hi.shape[1] >= 21 else torch.zeros_like(hi[:, 0:3])
+            out.append((lo[:, :15], hi[:, 3:15], hi[:, 15:18], jitter, low_emission, hi_emission))
+            continue
+        out.append((lo[:, :15], hi[:, 3:15], hi[:, 15:18], jitter))
     ys, xs = torch.meshgrid(torch.arange(ch, device=device), torch.arange(cw, device=device), indexing="ij")
     coords = torch.stack(
         [torch.stack((xs + s.origin[0] + ox + 0.5, ys + s.origin[1] + oy + 0.5)).float() for s in seqs]

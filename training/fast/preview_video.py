@@ -112,10 +112,10 @@ with tempfile.TemporaryDirectory() as tmp, torch.no_grad():
         jh, jg, image, _ = J.step(joint, lo, guides, coords, origin, jitter, scale, jh, jg, t == 0)
         images.append(image)
         A.configure(fast_config["channels"], fast_config["dilations"], True)
-        fa, fg, _, _ = A.step(fast.a, lo[:, 0:3], lo[:, 3:15], fa, fg, t == 0)
+        fa, fg, radiance, _ = A.step(fast.a, lo[:, 0:3], lo[:, 3:15], fa, fg, t == 0)
         if t == 0:
             seen = 0.18 / N.luminance(lo[:, 0:3]).mean().clamp(min=1e-6).view(1, 1, 1, 1)
-        image, fb, _ = N.step_b(fast.head, fa, lo[:, 3:15], guides, coords, origin, jitter, scale, fb, seen)
+        image, fb, _ = N.step_b(fast.head, radiance / (lo[:, 3:6] + A.EPS), lo[:, 3:15], guides, coords, origin, jitter, scale, fb, seen)
         images.append(image)
         frames = [x[0].permute(1, 2, 0).cpu().numpy() for x in images]
         lum = np.log(1e-4 + frames[3] @ np.array([0.2126, 0.7152, 0.0722], np.float32)).mean()

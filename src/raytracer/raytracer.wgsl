@@ -84,6 +84,9 @@ override LAMPS: bool = false;
 // directly visible emission removed and stored after the guides (gbuffer[3N + i]);
 // csTdEmission adds it back after denoising, so emitters are never filtered.
 override DENOISER_INPUT: bool = false;
+// Captures (`--capture-emission`): directly visible emission is also stored after the
+// guides, the radiance keeps it (the capture subtracts it from the 1-spp input).
+override CAPTURE_EMISSION: bool = false;
 // ReSTIR DI for lamps at the primary surface (compiled when the scene has lamps,
 // active when samplingParams.restir != 0): per-pixel reservoirs persist across
 // frames (temporal reuse along motion) and borrow from previous-frame neighbours
@@ -602,7 +605,10 @@ fn samplePixel(x: u32, y: u32, rngState: ptr<function, u32>) -> vec3<f32> {
         }
         var jitter=vec2(rngNextFloat(rngState),rngNextFloat(rngState));
         if CENTER_JITTER {jitter=vec2(0.5);}
-        if SHARED_JITTER {jitter=frameJitter(frameData.z);}
+        // One shared position per frame at 1 spp (the upscaler's input); dispatches of
+        // many samples (references) keep a random position per sample, so pixels are
+        // integrated over their whole area, not over one position per dispatch.
+        if SHARED_JITTER && numSamples == 1u {jitter=frameJitter(frameData.z);}
         if VIS_PRIMARY {jitter=primaryJitter();}
         if BLUE_NOISE_JITTER {
             let mask=unpack2x16unorm(meshData[meshData[14u]+(y%64u)*64u+(x%64u)]);
@@ -621,6 +627,7 @@ fn samplePixel(x: u32, y: u32, rngState: ptr<function, u32>) -> vec3<f32> {
         primaryEmission = vec3(0.);
         color += rayColor(primaryRay, rngState);
         if DENOISER_INPUT {color -= primaryEmission;emission += primaryEmission;}
+        else if CAPTURE_EMISSION {emission += primaryEmission;}
         if REFERENCE_GUIDES {guideAlbedo += gbuffer[gbufferPixel * 3u].xyz;guideNormal += gbuffer[gbufferPixel * 3u + 1u].xyz;}
     }
     if REFERENCE_GUIDES && numSamples > 0u {
@@ -632,6 +639,9 @@ fn samplePixel(x: u32, y: u32, rngState: ptr<function, u32>) -> vec3<f32> {
         let n = 1. / f32(numSamples);
         gbuffer[frameData.x * frameData.y * 3u + gbufferPixel] = vec4(emission * n, 0.);
         color *= n;
+    }
+    if CAPTURE_EMISSION && !DENOISER_INPUT && numSamples > 0u {
+        gbuffer[frameData.x * frameData.y * 3u + gbufferPixel] = vec4(emission / f32(numSamples), 0.);
     }
     if TRAVERSAL_STATS {return vec3(f32(statNodes),f32(statTriangles),f32(statRays));}
     return color;

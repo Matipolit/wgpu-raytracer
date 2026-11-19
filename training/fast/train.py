@@ -38,18 +38,25 @@ p.add_argument("--temporal-weight", type=float, default=0.5)
 p.add_argument("--holdout-scene", default="fireplace-room")
 p.add_argument("--eval-every", type=int, default=250)
 p.add_argument("--max-steps", type=int, default=0)
-p.add_argument("--init-a", help="stage A weights from a temporal denoiser run (best.pt, same channels)")
+p.add_argument("--init-a", help="stage A weights from a temporal denoiser run (best.pt, same configuration)")
+# Stage A's second-generation options (training/temporal/model.py).
+p.add_argument("--edge", action="store_true")
+p.add_argument("--length", action="store_true")
+p.add_argument("--feedback", default="filtered", choices=["filtered", "blend"])
+p.add_argument("--hidden", type=int, default=0)
+p.add_argument("--eps", type=float, default=0.01)
+p.add_argument("--seed", type=int, default=0)
 p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 a = p.parse_args()
 import resource  # noqa: E402
 
 resource.setrlimit(resource.RLIMIT_NOFILE, (resource.getrlimit(resource.RLIMIT_NOFILE)[1],) * 2)
-torch.manual_seed(0)
-random.seed(0)
+torch.manual_seed(a.seed)
+random.seed(a.seed)
 out = pathlib.Path(a.out)
 out.mkdir(parents=True, exist_ok=True)
-A.configure(a.channels, (1, 2, 4), True)
-config = dict(channels=a.channels, dilations=[1, 2, 4], half=True, head_features=N.FEATURES, head_hidden=N.HIDDEN)
+A.configure(a.channels, (1, 2, 4), True, a.edge, a.length, a.feedback, a.hidden, a.eps)
+config = dict(A.settings(), head_features=N.FEATURES, head_hidden=N.HIDDEN)
 (out / "config.json").write_text(json.dumps(config))
 
 train, val, test = [], [], []
@@ -75,12 +82,12 @@ optimizer = torch.optim.Adam(net.parameters(), lr=a.lr)
 def run(seqs, scale_index, window, frames=None, zero_head=False):
     """The sequence through both stages. Returns (loss, per-frame squared log error of
     the second half, for PSNR)."""
-    batch, coords, origin, scale = data.tensors(seqs, scale_index, window, a.device, frames)
+    batch, coords, origin, scale = data.tensors(seqs, scale_index, window, a.device, frames, emission=True)
     exposure = None
     history = prev = state = prev_out = prev_ref = None
     total, weights, errors = 0.0, 0.0, []
     head = (lambda f: torch.zeros(f.shape[0], 3, *f.shape[2:], device=f.device)) if zero_head else net.head
-    for t, (low, guides, reference, jitter) in enumerate(batch):
+    for t, (low, guides, reference, jitter, _, emission) in enumerate(batch):
         noisy, low_guides = low[:, 0:3], low[:, 3:15]
         if exposure is None:
             # As the renderer's auto exposure: from the image's mean luminance (the
@@ -88,9 +95,9 @@ def run(seqs, scale_index, window, frames=None, zero_head=False):
             # it off by up to 2x either way in training.
             exposure = 0.18 / N.luminance(reference).mean((1, 2, 3), keepdim=True).clamp(min=1e-6)
             seen = exposure * (2 ** (2 * torch.rand_like(exposure) - 1) if net.training else 1)
-        x, prev, _, _ = A.step(net.a, noisy, low_guides, history, prev, t == 0)
-        history = x
-        image, state, valid = N.step_b(head, x, low_guides, guides, coords, origin, jitter, scale, state, seen)
+        history, prev, radiance, _ = A.step(net.a, noisy, low_guides, history, prev, t == 0, seen)
+        x = radiance / (low_guides[:, A.ALBEDO] + A.EPS)
+        image, state, valid = N.step_b(head, x, low_guides, guides, coords, origin, jitter, scale, state, seen, emission)
         log_out, log_ref = torch.log1p(exposure * image), torch.log1p(exposure * reference.clamp(min=0))
         loss = (log_out - log_ref).abs().mean()
         if t > 0:
@@ -129,7 +136,7 @@ while time.time() - start < budget and (a.max_steps == 0 or step < a.max_steps):
     crop = min(a.crop, size[0], size[1])
     window = (random.randint(0, size[0] - crop), random.randint(0, size[1] - crop), crop)
     for g in optimizer.param_groups:
-        g["lr"] = a.lr * (1 - 0.9 * min(1.0, (time.time() - start) / budget))
+        g["lr"] = a.lr * (1 - 0.9 * min(1.0, step / a.max_steps if a.max_steps else (time.time() - start) / budget))
     loss, _ = run(seqs, random.randrange(len(seqs[0].lows)), window)
     if not torch.isfinite(loss):
         print(f"step {step}: non-finite loss, skipped", flush=True)

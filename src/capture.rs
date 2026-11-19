@@ -76,6 +76,14 @@ async fn capture() {
     let reference_groups: u32 = number("--reference-groups", 1);
     assert!(reference_groups >= 1 && reference_spp % reference_groups == 0);
     let warmup: u32 = number("--warmup", 0);
+    // `--capture-emission`: directly visible emission is stored in three more channels
+    // (after the reference at output size, after the guides at render scales) and
+    // taken out of the 1-spp input, as the renderer hands it to the denoisers.
+    let emission_capture = crate::has_flag("--capture-emission");
+    // 1-spp frames of the output-size tracer so far: its shared jitter follows this
+    // count (the reference's dispatches in between would leave every 33rd index of
+    // the sequence, whose vertical positions all fall in one third of the pixel).
+    let mut input_frames = 0u32;
     let seed: u64 = number("--seed", 1);
     let size = crate::argument_value("--size").unwrap_or_else(|| "320x200".into());
     let (w, h) = size.split_once('x').expect("--size WxH");
@@ -375,19 +383,33 @@ async fn capture() {
                 params.sampling.num_bounces = crate::selected_bounces();
                 params.sampling.restir = crate::has_flag("--restir");
                 tracer.set_render_params(&device, &queue, &params).unwrap();
+                let mut input = |tracer: &mut Raytracer| {
+                    tracer.reset_accumulation();
+                    tracer.set_frame_number(input_frames * 1025 + 1);
+                    input_frames += 1;
+                    render(&device, &queue, tracer, 1);
+                };
                 if frame == 0 {
                     // `--warmup N`: the sequence starts from a still camera whose reuse
                     // histories have settled, as in the running renderer (not from
                     // empty reservoirs, which are darker for the first frames).
                     for _ in 0..warmup {
-                        tracer.reset_accumulation();
-                        render(&device, &queue, &mut tracer, 1);
+                        input(&mut tracer);
                     }
-                    tracer.reset_accumulation();
                 }
-                render(&device, &queue, &mut tracer, 1);
-                let noisy = tracer.read_radiance(&device, &queue);
+                input(&mut tracer);
+                let mut noisy = tracer.read_radiance(&device, &queue);
                 let guides = tracer.read_gbuffer(&device, &queue);
+                let emitted = if emission_capture {
+                    tracer.read_emission(&device, &queue)
+                } else {
+                    Vec::new()
+                };
+                for (p, e) in emitted.chunks_exact(4).enumerate() {
+                    for c in 0..3 {
+                        noisy[p * 3 + c] -= e[c];
+                    }
+                }
                 if crate::has_flag("--temporal-model") {
                     // Parity checks: the renderer's denoised frame, f32 rgb.
                     let denoised = tracer.read_filtered(&device, &queue);
@@ -476,6 +498,7 @@ async fn capture() {
                         .iter()
                         .chain(&guides[p * 12..p * 12 + 12])
                         .chain(&reference[p * 3..p * 3 + 3])
+                        .chain(emitted.get(p * 4..p * 4 + 3).unwrap_or(&[]))
                     {
                         let v = if v.is_finite() {
                             v.clamp(-65000., 65000.)
@@ -512,8 +535,18 @@ async fn capture() {
                 }
                 render(&device, &queue, &mut low.tracer, 1);
                 low.jitters.push(low.tracer.last_frame_jitter());
-                let noisy = low.tracer.read_radiance(&device, &queue);
+                let mut noisy = low.tracer.read_radiance(&device, &queue);
                 let guides = low.tracer.read_gbuffer(&device, &queue);
+                let emitted = if emission_capture {
+                    low.tracer.read_emission(&device, &queue)
+                } else {
+                    Vec::new()
+                };
+                for (p, e) in emitted.chunks_exact(4).enumerate() {
+                    for c in 0..3 {
+                        noisy[p * 3 + c] -= e[c];
+                    }
+                }
                 let lw = low.params.viewport_size.0;
                 let (cw, ch) = low.crop;
                 let mut bytes = Vec::with_capacity((cw * ch) as usize * 15 * 2);
@@ -522,6 +555,7 @@ async fn capture() {
                     for v in noisy[p * 3..p * 3 + 3]
                         .iter()
                         .chain(&guides[p * 12..p * 12 + 12])
+                        .chain(emitted.get(p * 4..p * 4 + 3).unwrap_or(&[]))
                     {
                         let v = if v.is_finite() {
                             v.clamp(-65000., 65000.)

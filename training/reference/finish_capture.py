@@ -33,7 +33,9 @@ for meta_path in sorted(pathlib.Path(a.dir).rglob("meta.json")):
         means = torch.from_numpy(data[: groups * h * w * 3].reshape(groups, h, w, 3)).to(a.device)
         guides = torch.from_numpy(data[groups * h * w * 3 :].reshape(h, w, 6)).to(a.device)
         final, _, report = finish(means, guides)
-        pixels = np.memmap(frame, dtype=np.float16, mode="r+", shape=(h, w, 18))
+        # 18 channels, or 21 with `--capture-emission`; the reference is 15:18 in both.
+        channels = frame.stat().st_size // (h * w * 2)
+        pixels = np.memmap(frame, dtype=np.float16, mode="r+", shape=(h, w, channels))
         pixels[..., 15:18] = final.clamp(max=65000).cpu().numpy().astype(np.float16)
         pixels.flush()
         changed.append(report.get("changed_by_denoise", 0.0))
