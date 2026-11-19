@@ -85,6 +85,7 @@ def run(seqs, scale_index, window, frames=None, zero_head=False):
     batch, coords, origin, scale = data.tensors(seqs, scale_index, window, a.device, frames, emission=True)
     exposure = None
     history = prev = state = prev_out = prev_ref = None
+    referenced = False
     total, weights, errors = 0.0, 0.0, []
     head = (lambda f: torch.zeros(f.shape[0], 3, *f.shape[2:], device=f.device)) if zero_head else net.head
     for t, (low, guides, reference, jitter, _, emission) in enumerate(batch):
@@ -93,22 +94,25 @@ def run(seqs, scale_index, window, frames=None, zero_head=False):
             # As the renderer's auto exposure: from the image's mean luminance (the
             # reference stands in for the displayed image). The network's features see
             # it off by up to 2x either way in training.
-            exposure = 0.18 / N.luminance(reference).mean((1, 2, 3), keepdim=True).clamp(min=1e-6)
+            exposure = 0.18 / N.luminance(batch[-1][2]).mean((1, 2, 3), keepdim=True).clamp(min=1e-6)
             seen = exposure * (2 ** (2 * torch.rand_like(exposure) - 1) if net.training else 1)
         history, prev, radiance, _ = A.step(net.a, noisy, low_guides, history, prev, t == 0, seen)
         x = radiance / (low_guides[:, A.ALBEDO] + A.EPS)
         image, state, valid = N.step_b(head, x, low_guides, guides, coords, origin, jitter, scale, state, seen, emission)
         log_out, log_ref = torch.log1p(exposure * image), torch.log1p(exposure * reference.clamp(min=0))
         loss = (log_out - log_ref).abs().mean()
-        if t > 0:
+        missing = float(reference.abs().sum()) == 0.0
+        if t > 0 and not missing and referenced:
             motion = guides[:, A.MOTION]
             was_out, _ = A.warp(prev_out, motion)
             was_ref, _ = A.warp(prev_ref, motion)
             loss = loss + a.temporal_weight * (((log_out - was_out) - (log_ref - was_ref)).abs() * valid).mean()
-        prev_out, prev_ref = log_out, log_ref
-        weight = 0.0 if t == 0 else (0.5 if t < 4 else 1.0)
+        prev_out, prev_ref, referenced = log_out, log_ref, not missing
+        # Frames without a reference (their reference is all zero: captures with
+        # --reference-frames) only feed the histories.
+        weight = 0.0 if t == 0 or missing else (0.5 if t < 4 else 1.0)
         total, weights = total + weight * loss, weights + weight
-        if t >= len(batch) // 2:
+        if t >= len(batch) // 2 and not missing:
             errors.append(float(((log_out - log_ref) ** 2).mean().detach()))
     return total / max(weights, 1e-6), errors
 

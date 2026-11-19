@@ -60,11 +60,18 @@ M.configure(a.channels, [int(d) for d in a.dilations.split(",")], a.half, a.edge
 (out / "config.json").write_text(json.dumps(dict(M.settings(), exposure=a.exposure)))
 
 
+REFERENCES = 10**9
+
+
 def load(scene_dir):
     """Sequences as lists of memory-mapped frames (H, W, 18) f16: parallel training
     runs share one copy in the page cache and read only the crops they use."""
     meta = json.loads((scene_dir / "meta.json").read_text())
     h, w = meta["height"], meta["width"]
+    # Frames before the last `reference_frames` have no reference (they only warm the
+    # history up); all sequences of a run must agree.
+    global REFERENCES
+    REFERENCES = min(REFERENCES, meta.get("reference_frames", meta["frames"]))
     seqs = []
     for seq in sorted(scene_dir.glob("seq_*")):
         # Frame files only: not the render-scale inputs (.lowN) or reference sidecars.
@@ -103,8 +110,9 @@ def tensors(seq, window=None):
 
 
 def exposure_of(ref):
-    """0.18 / mean luminance of the first reference frame, per sequence (B, 1, 1, 1)."""
-    lum = 0.2126 * ref[0][:, 0] + 0.7152 * ref[0][:, 1] + 0.0722 * ref[0][:, 2]
+    """0.18 / mean luminance of the last reference frame (every sequence has that one),
+    per sequence (B, 1, 1, 1)."""
+    lum = 0.2126 * ref[-1][:, 0] + 0.7152 * ref[-1][:, 1] + 0.0722 * ref[-1][:, 2]
     return (0.18 / lum.mean((1, 2)).clamp(min=1e-6)).view(-1, 1, 1, 1)
 
 
@@ -123,16 +131,18 @@ def run_sequence(net, noisy, guides, ref, emission, grad=True):
         radiance = radiance + emission[t]
         tm, tr = M.tonemap(radiance if k is None else k * radiance), M.tonemap(ref[t] if k is None else k * ref[t])
         frame_loss = (tm - tr).abs().mean()
-        if t > 0 and a.temporal_weight > 0:
+        if t > max(0, noisy.shape[0] - REFERENCES) and a.temporal_weight > 0:
             motion = guides[t][:, M.MOTION]
             wo, _ = M.warp(prev_out, motion)
             wr, _ = M.warp(prev_ref, motion)
             frame_loss = frame_loss + a.temporal_weight * (((tm - wo) - (tr - wr)).abs() * valid).mean()
-        loss = loss + frame_loss * (0.5 if t == 0 else 1.0)
+        # Frames without a reference only feed the history; the cold first frame
+        # counts half.
+        loss = loss + frame_loss * (0.0 if t < noisy.shape[0] - REFERENCES else 0.5 if t == 0 else 1.0)
         history, prev = y, g
         prev_out, prev_ref = tm, tr
         outs.append(radiance.detach())
-    return loss / noisy.shape[0], outs
+    return loss / min(noisy.shape[0], REFERENCES), outs
 
 
 def batch():
@@ -163,6 +173,8 @@ def evaluate(net, sequences):
         _, outs = run_sequence(net, n.unsqueeze(1), g.unsqueeze(1), r.unsqueeze(1), e.unsqueeze(1), grad=False)
         k = exposure_of(r.unsqueeze(1)) if a.exposure else 1.0
         for t, o in enumerate(outs):
+            if t < len(outs) - REFERENCES:
+                continue
             ours += (M.tonemap(k * o) - M.tonemap(k * r[t : t + 1])).abs().mean().item()
             raw += (M.tonemap(k * (n[t : t + 1] + e[t : t + 1])) - M.tonemap(k * r[t : t + 1])).abs().mean().item()
             frames += 1

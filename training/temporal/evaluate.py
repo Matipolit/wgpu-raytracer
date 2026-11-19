@@ -37,7 +37,8 @@ torch.set_num_threads(4)
 config = pathlib.Path(a.weights).with_name("config.json")
 if config.exists():
     c = json.loads(config.read_text())
-    M.configure(c["channels"], c["dilations"], c.get("half", False))
+    M.configure(**c)
+EXPOSURE = config.exists() and c.get("exposure", False)
 net = M.Net().to(a.device)
 net.load_state_dict(torch.load(a.weights, map_location=a.device))
 net.eval()
@@ -79,7 +80,7 @@ for scene_dir in scenes:
     held = seqs if a.all or scene_dir.name == a.holdout_scene else seqs[-2:]
     stats = {m: dict(l1=0.0, mse=0.0, flicker=0.0, n=0, nf=0) for m in ("raw", "ema", "network")}
     for si, seq in enumerate(held):
-        frames = [torch.from_numpy(np.fromfile(f, "<f2").reshape(h, w, 18).transpose(2, 0, 1).astype(np.float32)).unsqueeze(0)
+        frames = [torch.from_numpy(np.fromfile(f, "<f2").reshape(h, w, -1).transpose(2, 0, 1).astype(np.float32)).unsqueeze(0)
                   for f in sorted(seq.glob("frame_*.f16")) if f.name.count(".") == 1]
         frames = [torch.nan_to_num(f, nan=0.0, posinf=0.0, neginf=0.0).to(a.device) for f in frames]
         state = {"ema": (None, None), "network": (None, None)}
@@ -88,14 +89,20 @@ for scene_dir in scenes:
         row = []
         for t, f in enumerate(frames):
             noisy, guides, ref = f[:, 0:3], f[:, 3:15], f[:, 15:18]
-            outs = {"raw": noisy}
+            # Captures with `--capture-emission` keep directly visible emission apart
+            # from the noisy radiance; every method gets it added back.
+            emission = f[:, 18:21] if f.shape[1] >= 21 else torch.zeros_like(noisy)
+            if t == 0:
+                last = frames[-1][:, 15:18]
+                seen = 0.18 / (0.2126 * last[:, 0] + 0.7152 * last[:, 1] + 0.0722 * last[:, 2]).mean().clamp(min=1e-6).view(1, 1, 1, 1) if EXPOSURE else None
+            outs = {"raw": noisy + emission}
             with torch.no_grad():
                 y, g, rad, valid = ema_step(noisy, guides, *state["ema"], t == 0)
                 state["ema"] = (y, g)
-                outs["ema"] = rad
-                y, g, rad, valid_net = M.step(net, noisy, guides, *state["network"], t == 0)
+                outs["ema"] = rad + emission
+                y, g, rad, valid_net = M.step(net, noisy, guides, *state["network"], t == 0, seen)
                 state["network"] = (y, g)
-                outs["network"] = rad
+                outs["network"] = rad + emission
             tr = tm(ref)
             for m, o in outs.items():
                 to = tm(o)

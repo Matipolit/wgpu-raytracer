@@ -76,6 +76,9 @@ async fn capture() {
     let reference_groups: u32 = number("--reference-groups", 1);
     assert!(reference_groups >= 1 && reference_spp % reference_groups == 0);
     let warmup: u32 = number("--warmup", 0);
+    // `--reference-frames N`: only a sequence's last N frames get a reference; the
+    // frames before let the networks' own histories settle (meta.json records N).
+    let reference_frames: u32 = number("--reference-frames", frames).min(frames);
     // `--capture-emission`: directly visible emission is stored in three more channels
     // (after the reference at output size, after the guides at render scales) and
     // taken out of the 1-spp input, as the renderer hands it to the denoisers.
@@ -420,7 +423,9 @@ async fn capture() {
                     .unwrap();
                 }
                 // Reference: same instant, same camera, many samples.
-                let reference = if crate::has_flag("--no-reference") {
+                let reference = if crate::has_flag("--no-reference")
+                    || frame + reference_frames < frames
+                {
                     vec![0.; noisy.len()]
                 } else {
                     // Many samples per dispatch: one dispatch per sample would wait for
@@ -631,7 +636,7 @@ async fn capture() {
     std::fs::write(
         output.join("meta.json"),
         format!(
-            "{{\"width\":{out_w},\"height\":{out_h},\"frame_width\":{width},\"frame_height\":{height},\"low\":[{}],\"frames\":{frames},\"sequences\":{sequences},\"reference_spp\":{reference_spp},\"scale\":{scale},\"channels\":[\"noisy_r\",\"noisy_g\",\"noisy_b\",\"albedo_r\",\"albedo_g\",\"albedo_b\",\"distance\",\"normal_x\",\"normal_y\",\"normal_z\",\"roughness\",\"motion_x\",\"motion_y\",\"metallic\",\"kind\",\"ref_r\",\"ref_g\",\"ref_b\"],\"low_channels\":\"noisy rgb + the 12 guides; frame_NN.lowI.f16 per scale I, crop origins and jitter in seq_*/low.json\"}}",
+            "{{\"width\":{out_w},\"height\":{out_h},\"frame_width\":{width},\"frame_height\":{height},\"low\":[{}],\"frames\":{frames},\"sequences\":{sequences},\"reference_spp\":{reference_spp},\"reference_frames\":{reference_frames},\"scale\":{scale},\"channels\":[\"noisy_r\",\"noisy_g\",\"noisy_b\",\"albedo_r\",\"albedo_g\",\"albedo_b\",\"distance\",\"normal_x\",\"normal_y\",\"normal_z\",\"roughness\",\"motion_x\",\"motion_y\",\"metallic\",\"kind\",\"ref_r\",\"ref_g\",\"ref_b\"],\"low_channels\":\"noisy rgb + the 12 guides; frame_NN.lowI.f16 per scale I, crop origins and jitter in seq_*/low.json\"}}",
             lows.iter()
                 .map(|l| format!(
                     "{{\"scale_x\":{},\"scale_y\":{},\"frame_width\":{},\"frame_height\":{},\"width\":{},\"height\":{}}}",
