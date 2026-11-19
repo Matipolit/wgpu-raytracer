@@ -33,21 +33,35 @@ FEATURES = 9
 # The head; `configure` changes these before building a FastNet (saved in config.json).
 HIDDEN = 8
 KERNEL = 1  # 3: the first layer sees the 3x3 neighbourhood
-SHARPEN = False  # a fourth output: sharpen or soften this frame's colour
+SHARPEN = False  # one more output: sharpen or soften this frame's colour
+GATHER = False  # two more outputs: towards a narrower or a wider gather of the samples
+CUBIC = False  # the history is resampled with Catmull-Rom instead of bilinear
+# exp(-k d^2) of the gather: the fixed pass, the narrow and the wide alternative.
+WIDTHS = (2.0, 8.0, 0.5)
 MAX_HISTORY = 64.0
 LUMA = (0.2126, 0.7152, 0.0722)
 
 
-def configure(hidden=8, kernel=1, sharpen=False):
-    global HIDDEN, KERNEL, SHARPEN
-    HIDDEN, KERNEL, SHARPEN = hidden, kernel, sharpen
+def configure(hidden=8, kernel=1, sharpen=False, gather=False, cubic=False):
+    global HIDDEN, KERNEL, SHARPEN, GATHER, CUBIC, FEATURES
+    HIDDEN, KERNEL, SHARPEN, GATHER, CUBIC = hidden, kernel, sharpen, gather, cubic
+    FEATURES = 9 + 2 * int(gather)
+
+
+def settings():
+    """The configuration, as saved in config.json."""
+    return dict(head_features=FEATURES, head_hidden=HIDDEN, head_kernel=KERNEL, head_sharpen=SHARPEN, head_gather=GATHER, cubic_history=CUBIC)
+
+
+def configure_from(c):
+    configure(c.get("head_hidden", 8), c.get("head_kernel", 1), c.get("head_sharpen", False), c.get("head_gather", False), c.get("cubic_history", False))
 
 
 class Head(nn.Module):
     def __init__(self):
         super().__init__()
         self.a = nn.Conv2d(FEATURES, HIDDEN, KERNEL, padding=KERNEL // 2, padding_mode="replicate")
-        self.b = nn.Conv2d(HIDDEN, 3 + int(SHARPEN), 1)
+        self.b = nn.Conv2d(HIDDEN, 3 + int(SHARPEN) + 2 * int(GATHER), 1)
         # Start as the non-learned pass.
         nn.init.zeros_(self.b.weight)
         nn.init.zeros_(self.b.bias)
@@ -77,13 +91,40 @@ def from_ycocg(c):
     return torch.cat((y + co - cg, y + cg, y - co - cg), 1)
 
 
-def gather(low, low_depth, low_kind, coords, origin, jitter, scale, depth, kind):
+def warp_cubic(image, motion):
+    """Catmull-Rom sample of `image` at pixel centre + motion, as 9 bilinear taps (the
+    form a shader uses); edge replication, not below zero."""
+    b, _, h, w = image.shape
+    ys, xs = torch.meshgrid(
+        torch.arange(h, dtype=image.dtype, device=image.device), torch.arange(w, dtype=image.dtype, device=image.device), indexing="ij"
+    )
+
+    def taps(p):
+        centre = torch.floor(p - 0.5) + 0.5
+        f = p - centre
+        w0 = f * (-0.5 + f * (1 - 0.5 * f))
+        w1 = 1 + f * f * (-2.5 + 1.5 * f)
+        w2 = f * (0.5 + f * (2 - 1.5 * f))
+        w3 = f * f * (-0.5 + 0.5 * f)
+        return (centre - 1, centre + w2 / (w1 + w2), centre + 2), (w0, w1 + w2, w3)
+
+    (px, wx), (py, wy) = taps(xs + 0.5 + motion[:, 0]), taps(ys + 0.5 + motion[:, 1])
+    total = torch.zeros_like(image)
+    for i in range(3):
+        for j in range(3):
+            grid = torch.stack((px[i] / w * 2 - 1, py[j] / h * 2 - 1), dim=-1)
+            total = total + (wx[i] * wy[j]).unsqueeze(1) * F.grid_sample(image, grid, mode="bilinear", padding_mode="border", align_corners=False)
+    return total.clamp(min=0)
+
+
+def gather(low, low_depth, low_kind, coords, origin, jitter, scale, depth, kind, widths=(2.0,)):
     """Stage A's samples near each output pixel, joint bilateral.
 
     low (B, C, h, w) with low_depth and low_kind (B, 1, h, w); coords (B, 2, H, W)
     absolute output-pixel centres; origin (B, 2) low crop origin in low pixels; jitter
     (B, 2); scale (B, 2) render / output per axis; depth, kind (B, 1, H, W).
-    Returns the weighted mean, the weight sum and the nearest sample's distance.
+    Returns the weighted means (one per width k of exp(-k d^2)), the first width's
+    weight sum and the nearest sample's distance.
     """
     b, c, h, w = low.shape
     H, W = coords.shape[-2:]  # noqa: N806
@@ -93,8 +134,8 @@ def gather(low, low_depth, low_kind, coords, origin, jitter, scale, depth, kind)
     qx, qy = coords[:, 0] * sx, coords[:, 1] * sy
     bx, by = torch.floor(qx - jx), torch.floor(qy - jy)
     stacked = torch.cat((low, low_depth, low_kind), 1).reshape(b, c + 2, h * w)
-    total = torch.zeros(b, c, H, W, device=low.device)
-    weight = torch.zeros(b, 1, H, W, device=low.device)
+    totals = [torch.zeros(b, c, H, W, device=low.device) for _ in widths]
+    weights = [torch.zeros(b, 1, H, W, device=low.device) for _ in widths]
     nearest = torch.full((b, 1, H, W), 1e9, device=low.device)
     for dy in (-1, 0, 1, 2):
         for dx in (-1, 0, 1, 2):
@@ -106,11 +147,13 @@ def gather(low, low_depth, low_kind, coords, origin, jitter, scale, depth, kind)
             tap = torch.gather(stacked, 2, index).view(b, c + 2, H, W)
             relative = (tap[:, c : c + 1] - depth) / (0.05 * depth + 1e-3)
             same = torch.where((tap[:, c + 1 : c + 2] - kind).abs() < 0.5, 1.0, 1e-4)
-            wgt = torch.exp(-2.0 * d2 - relative * relative) * same
-            total = total + wgt * tap[:, :c]
-            weight = weight + wgt
+            agree = torch.exp(-relative * relative) * same
+            for k, width in enumerate(widths):
+                wgt = torch.exp(-width * d2) * agree
+                totals[k] = totals[k] + wgt * tap[:, :c]
+                weights[k] = weights[k] + wgt
             nearest = torch.minimum(nearest, d2)
-    return total / weight.clamp(min=1e-6), weight, nearest.sqrt()
+    return [t / w.clamp(min=1e-6) for t, w in zip(totals, weights)], weights[0], nearest.sqrt()
 
 
 def step_b(head, x_low, low_guides, guides, coords, origin, jitter, scale, state, exposure, emission=None):
@@ -123,17 +166,24 @@ def step_b(head, x_low, low_guides, guides, coords, origin, jitter, scale, state
     depth = guides[:, A.DIST : A.DIST + 1]
     kind = guides[:, A.KIND : A.KIND + 1]
     motion = guides[:, A.MOTION]
-    value, weight, nearest = gather(
-        x_low, low_guides[:, A.DIST : A.DIST + 1], low_guides[:, A.KIND : A.KIND + 1], coords, origin, jitter, scale, depth, kind
+    values, weight, nearest = gather(
+        x_low,
+        low_guides[:, A.DIST : A.DIST + 1],
+        low_guides[:, A.KIND : A.KIND + 1],
+        coords,
+        origin,
+        jitter,
+        scale,
+        depth,
+        kind,
+        WIDTHS if GATHER else WIDTHS[:1],
     )
-    current = value * (albedo + A.EPS)
-    if emission is not None:
-        current = current + emission
+    current, *others = [v * (albedo + A.EPS) + (0 if emission is None else emission) for v in values]
     if state is None:
         history, valid, length = current, torch.zeros_like(depth), torch.zeros_like(depth)
     else:
         sampled, inside = A.warp(torch.cat(state, 1), motion)
-        history = sampled[:, 0:3]
+        history = warp_cubic(state[0], motion) if CUBIC else sampled[:, 0:3]
         valid = (inside & ((sampled[:, 3:4] - depth).abs() <= 0.1 * depth + 1e-3)).to(current.dtype)
         length = sampled[:, 4:5] * valid
         history = valid * history + (1 - valid) * current
@@ -145,6 +195,7 @@ def step_b(head, x_low, low_guides, guides, coords, origin, jitter, scale, state
     lc, lh = log(luminance(current)), log(luminance(history))
     features = torch.cat(
         (
+            *[log(luminance(o)) - lc for o in others],
             lc,
             lh * valid,
             (lc - lh).abs() * valid,
@@ -159,9 +210,15 @@ def step_b(head, x_low, low_guides, guides, coords, origin, jitter, scale, state
     )
     out = head(features)
     if out.shape[1] > 3:
-        # Away from (positive) or towards (negative) the 3x3 mean; 0 with a zero head.
-        amount = -1 + 2.5 * torch.sigmoid(out[:, 3:4] + math.log(0.4 / 0.6))
-        current = (current + amount * (current - from_ycocg(m1))).clamp(min=0)
+        extra = out[:, 3:]
+        if GATHER:
+            # Towards the narrow and the wide gather, -0.25 to 1 each; 0 with a zero head.
+            mix = -0.25 + 1.25 * torch.sigmoid(extra[:, -2:] + math.log(0.2 / 0.8))
+            current = (current + mix[:, 0:1] * (others[0] - current) + mix[:, 1:2] * (others[1] - current)).clamp(min=0)
+        if SHARPEN:
+            # Away from (positive) or towards (negative) the 3x3 mean; 0 with a zero head.
+            amount = -1 + 2.5 * torch.sigmoid(extra[:, 0:1] + math.log(0.4 / 0.6))
+            current = (current + amount * (current - from_ycocg(m1))).clamp(min=0)
     # Clip width in deviations, 0.5 to 4 (1.25 with a zero head).
     gamma = 0.5 + 3.5 * torch.sigmoid(out[:, 0:1] + math.log(0.75 / 2.75))
     clipped = from_ycocg(torch.maximum(torch.minimum(to_ycocg(history), m1 + gamma * sigma), m1 - gamma * sigma))
