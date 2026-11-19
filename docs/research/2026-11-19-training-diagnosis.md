@@ -154,6 +154,33 @@ capture available (v4 captures, 16 frames):
 - A lower bound: the 320-pixel capture loses history against the whole frame too, and
   32-frame sequences drift further than 16.
 
+## Window size and filter reach of the denoiser stage [measured]
+The "all four" denoiser on the v4 captures (PC, 6000 steps, about 205k pixels per step,
+one seed). Accuracy: the v4 evaluation set (whole 960x540 frames, 8 frames, mean of 9
+scenes). Calm: training/temporal/stability.py on the 300-frame video captures (no
+references): change from frame to frame per pixel, and "boil", the part of the
+lighting's change that 8x8 blocks share.
+
+| variant | PSNR | flicker | fireplace room (unseen) | change per pixel | boil |
+|---|---:|---:|---:|---:|---:|
+| window 96, batch 22 | 23.91 dB | 0.0781 | 21.60 dB | 0.0073 | 0.00388 |
+| window 160, batch 8 (3 levels) | 23.90 | 0.0790 | 21.72 | 0.0070 | 0.00379 |
+| window 320, batch 2 | 23.96 | 0.0780 | 21.83 | 0.0070 | 0.00378 |
+| 4 levels (dilations 1, 2, 4, 8) | 23.35 | | 19.50 | 0.0070 | 0.00369 |
+| 5 levels (1 to 16) | 22.63 | | 16.84 | 0.0071 | 0.00365 |
+| the v4 denoiser (first architecture, 200k steps) | | | | 0.0089 | 0.00389 |
+
+- Window size: no effect that one seed can show, on accuracy or on calm, although a
+  96-pixel window loses a third of its history. Whole frames are not worth their
+  reference cost. Untested: 32-frame sequences, where the loss is larger.
+- Filter reach: more levels are worse where the view is new (the unseen scene loses 2 dB
+  per level; the validation windows of trained scenes do not show it: L1 0.0156,
+  0.0153, 0.0155), and boil 3 to 4% lower is within what one seed can say. SVGF limits
+  its wide levels with a variance estimate; these kernels have none.
+- Boil is the same for the first and the new architecture (0.0039 and 0.0038), while
+  the change per pixel fell by 21%: the new options calm pixel noise, not the slow
+  blotches. Those come with the input (reuse noise correlated over frames).
+
 ## Not done
 - The new options are not in export.py or the renderer's shaders. The edge stops read
   depth, normal and albedo of every kernel tap: a runtime cost to measure.
