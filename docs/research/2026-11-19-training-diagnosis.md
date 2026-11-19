@@ -76,6 +76,24 @@ loss everywhere. Held-out sequences of the three trained scenes, evaluate.py (lo
   The second half of the table trained with the exposure taken from a sequence's last
   frame instead of its first (a mid-run code change); the evaluation is the same for all.
 
+## The joint network on the same data [measured]
+300 steps of the output-resolution stage on top of two of the denoisers above, each
+compared with the same denoiser followed by TAAU (training/fast/baseline.py):
+
+| denoiser stage | denoiser + TAAU | joint network | hold-out: denoiser + TAAU | hold-out: joint |
+|---|---:|---:|---:|---:|
+| base | 0.0237 / 25.02 dB | 0.0212 / 25.44 dB | 0.0283 / 21.62 dB | 0.0258 / 21.74 dB |
+| all four | 0.0212 / 25.70 dB | 0.0189 / 26.09 dB | 0.0256 / 22.05 dB | 0.0226 / 22.34 dB |
+
+- The joint network beats denoiser + TAAU by about 11% L1 and 0.4 dB in both rows.
+  The v4 models lost this comparison by 0.46 dB on the same data; those were trained
+  on captures with the repeated jitter and without separate emission.
+- The denoiser changes carry over: +0.65 dB for the joint network, +0.7 dB for TAAU.
+- The learned head still does nothing: with its output zeroed the PSNR is the same
+  (25.50 vs 25.44 dB, 26.10 vs 26.09 dB). The gain is the fixed part of the stage
+  (accumulation at output resolution), not anything learned in 300 steps.
+- One run each, 3 validation sequences.
+
 ## Not done
 - The new options are not in export.py or the renderer's shaders. The edge stops read
   depth, normal and albedo of every kernel tap: a runtime cost to measure.
