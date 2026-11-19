@@ -32,6 +32,7 @@ p.add_argument("--data", required=True)
 p.add_argument("--td", required=True)
 p.add_argument("--fast")
 p.add_argument("--holdout-scene", default="fireplace-room")
+p.add_argument("--all", action="store_true", help="every sequence counts (a separate evaluation set)")
 p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 a = p.parse_args()
 
@@ -42,7 +43,12 @@ def config(weights):
 
 val, test = [], []
 for seqs in data.load(a.data).values():
-    (test if seqs[0].scene == a.holdout_scene else val).extend(seqs if seqs[0].scene == a.holdout_scene else seqs[-1:])
+    if a.all:
+        val += seqs
+    elif seqs[0].scene == a.holdout_scene:
+        test += seqs
+    else:
+        val += seqs[-1:]
 
 
 @torch.no_grad()

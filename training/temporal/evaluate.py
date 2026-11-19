@@ -104,13 +104,16 @@ for scene_dir in scenes:
                 state["network"] = (y, g)
                 outs["network"] = rad + emission
             tr = tm(ref)
+            # Warm-up frames of `--reference-frames` captures have no reference.
+            if float(ref.abs().sum()) == 0.0:
+                continue
             for m, o in outs.items():
                 to = tm(o)
                 s = stats[m]
                 s["l1"] += (to - tr).abs().mean().item()
                 s["mse"] += ((to.clamp(0, 1) - tr.clamp(0, 1)) ** 2).mean().item()
                 s["n"] += 1
-                if t > 0:
+                if m in prev_out and prev_ref is not None:
                     motion = guides[:, M.MOTION]
                     wo, _ = M.warp(prev_out[m], motion)
                     wr, _ = M.warp(prev_ref, motion)

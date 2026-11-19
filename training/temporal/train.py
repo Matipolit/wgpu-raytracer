@@ -140,6 +140,9 @@ def run_sequence(net, noisy, guides, ref, emission, grad=True):
         # counts half.
         loss = loss + frame_loss * (0.0 if t < noisy.shape[0] - REFERENCES else 0.5 if t == 0 else 1.0)
         history, prev = y, g
+        if t < noisy.shape[0] - REFERENCES:
+            # Warm-up frames carry no loss: gradients start at the first reference.
+            history, prev = y.detach(), g.detach()
         prev_out, prev_ref = tm, tr
         outs.append(radiance.detach())
     return loss / min(noisy.shape[0], REFERENCES), outs

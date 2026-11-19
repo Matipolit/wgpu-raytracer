@@ -108,6 +108,9 @@ def run(seqs, scale_index, window, frames=None, zero_head=False):
             was_ref, _ = A.warp(prev_ref, motion)
             loss = loss + a.temporal_weight * (((log_out - was_out) - (log_ref - was_ref)).abs() * valid).mean()
         prev_out, prev_ref, referenced = log_out, log_ref, not missing
+        if missing:
+            # Warm-up frames carry no loss: gradients start at the first reference.
+            history, prev, state = history.detach(), prev.detach(), tuple(x.detach() for x in state)
         # Frames without a reference (their reference is all zero: captures with
         # --reference-frames) only feed the histories.
         weight = 0.0 if t == 0 or missing else (0.5 if t < 4 else 1.0)
