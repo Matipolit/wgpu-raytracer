@@ -46,6 +46,10 @@ p.add_argument("--feedback", default="filtered", choices=["filtered", "blend"])
 p.add_argument("--hidden", type=int, default=0)
 p.add_argument("--eps", type=float, default=0.01)
 p.add_argument("--seed", type=int, default=0)
+p.add_argument("--head-hidden", type=int, default=8)
+p.add_argument("--head-kernel", type=int, default=1, choices=[1, 3])
+p.add_argument("--head-sharpen", action="store_true")
+p.add_argument("--freeze-a", action="store_true", help="train only the output-resolution head")
 p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 a = p.parse_args()
 import resource  # noqa: E402
@@ -56,7 +60,8 @@ random.seed(a.seed)
 out = pathlib.Path(a.out)
 out.mkdir(parents=True, exist_ok=True)
 A.configure(a.channels, (1, 2, 4), True, a.edge, a.length, a.feedback, a.hidden, a.eps)
-config = dict(A.settings(), head_features=N.FEATURES, head_hidden=N.HIDDEN)
+N.configure(a.head_hidden, a.head_kernel, a.head_sharpen)
+config = dict(A.settings(), head_features=N.FEATURES, head_hidden=N.HIDDEN, head_kernel=N.KERNEL, head_sharpen=N.SHARPEN)
 (out / "config.json").write_text(json.dumps(config))
 
 train, val, test = [], [], []
@@ -76,7 +81,9 @@ groups = list(groups.values())
 net = N.FastNet().to(a.device)
 if a.init_a:
     net.a.load_state_dict(torch.load(a.init_a, map_location=a.device))
-optimizer = torch.optim.Adam(net.parameters(), lr=a.lr)
+if a.freeze_a:
+    net.a.requires_grad_(False)
+optimizer = torch.optim.Adam([q for q in net.parameters() if q.requires_grad], lr=a.lr)
 
 
 def run(seqs, scale_index, window, frames=None, zero_head=False):

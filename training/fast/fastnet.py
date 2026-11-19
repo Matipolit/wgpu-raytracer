@@ -30,16 +30,24 @@ import model as A  # noqa: E402  (the temporal denoiser)
 
 EPS = A.EPS
 FEATURES = 9
+# The head; `configure` changes these before building a FastNet (saved in config.json).
 HIDDEN = 8
+KERNEL = 1  # 3: the first layer sees the 3x3 neighbourhood
+SHARPEN = False  # a fourth output: sharpen or soften this frame's colour
 MAX_HISTORY = 64.0
 LUMA = (0.2126, 0.7152, 0.0722)
+
+
+def configure(hidden=8, kernel=1, sharpen=False):
+    global HIDDEN, KERNEL, SHARPEN
+    HIDDEN, KERNEL, SHARPEN = hidden, kernel, sharpen
 
 
 class Head(nn.Module):
     def __init__(self):
         super().__init__()
-        self.a = nn.Conv2d(FEATURES, HIDDEN, 1)
-        self.b = nn.Conv2d(HIDDEN, 3, 1)
+        self.a = nn.Conv2d(FEATURES, HIDDEN, KERNEL, padding=KERNEL // 2, padding_mode="replicate")
+        self.b = nn.Conv2d(HIDDEN, 3 + int(SHARPEN), 1)
         # Start as the non-learned pass.
         nn.init.zeros_(self.b.weight)
         nn.init.zeros_(self.b.bias)
@@ -150,6 +158,10 @@ def step_b(head, x_low, low_guides, guides, coords, origin, jitter, scale, state
         1,
     )
     out = head(features)
+    if out.shape[1] > 3:
+        # Away from (positive) or towards (negative) the 3x3 mean; 0 with a zero head.
+        amount = -1 + 2.5 * torch.sigmoid(out[:, 3:4] + math.log(0.4 / 0.6))
+        current = (current + amount * (current - from_ycocg(m1))).clamp(min=0)
     # Clip width in deviations, 0.5 to 4 (1.25 with a zero head).
     gamma = 0.5 + 3.5 * torch.sigmoid(out[:, 0:1] + math.log(0.75 / 2.75))
     clipped = from_ycocg(torch.maximum(torch.minimum(to_ycocg(history), m1 + gamma * sigma), m1 - gamma * sigma))

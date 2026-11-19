@@ -55,6 +55,7 @@ for seqs in data.load(a.data).values():
 def evaluate(seqs, weights, fast):
     c = config(weights)
     A.configure(**c)
+    N.configure(c.get("head_hidden", 8), c.get("head_kernel", 1), c.get("head_sharpen", False))
     net = (N.FastNet() if fast else A.Net()).to(a.device)
     net.load_state_dict(torch.load(weights, map_location=a.device))
     net.eval()

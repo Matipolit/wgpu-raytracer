@@ -98,7 +98,7 @@ td td3-half16 $HRS --channels 16 --edge --length --feedback blend --eps 0.05 --e
 (
     sleep $(python3 -c "print(int($HALF * 3600))")
     cp $R/$P-td3-half16/best.pt $R/$P-td3-half16/half-time.pt
-    $PY training/fast/train.py --data $TRAIN --out $R/$P-fast --hours $HALF --channels 16 --edge --length --feedback blend --eps 0.05 \
+    $PY training/fast/train.py --data $TRAIN --out $R/$P-fast --hours $HALF --channels 16 --edge --length --feedback blend --eps 0.05 --head-sharpen \
         --init-a $R/$P-td3-half16/half-time.pt > $R/$P-fast.log 2>&1
 ) &
 wait

@@ -94,6 +94,31 @@ compared with the same denoiser followed by TAAU (training/fast/baseline.py):
   (accumulation at output resolution), not anything learned in 300 steps.
 - One run each, 3 validation sequences.
 
+## What limits the output stage's head [measured]
+The denoiser stage frozen ("all four" above), only the head trained, 1500 steps
+(`train.py --freeze-a`), against the same stage with a zero head (26.10 dB):
+
+| head | weights | validation L1 / PSNR | hold-out L1 / PSNR |
+|---|---:|---:|---:|
+| zero (the fixed pass) | 0 | 0.0190 / 26.10 dB | 0.0226 / 22.34 dB |
+| 8 hidden units, per pixel (v4, v5) | 107 | 0.0190 / 26.06 | 0.0226 / 22.33 |
+| 32 hidden units, 3x3 view | 2723 | 26.00 dB | 22.28 dB |
+| 8 hidden units + sharpen output | 116 | 0.0187 / 26.25 | 0.0225 / 22.50 |
+| 32 hidden units, 3x3 view + sharpen output | 2756 | 0.0186 / 26.27 | 0.0225 / 22.49 |
+
+- Size is not the limit: 25 times the weights and a 3x3 view change nothing, with or
+  without the extra output. All four runs were at their final value by step 250.
+- What the head may change is: its three controls (clip width, blend weight, trust in
+  the history) are worth nothing on this data (+0.24 to +0.32 dB in the v4 run).
+  One more control, an amount that moves this frame's colour away from or towards its
+  3x3 mean, is worth +0.15 dB.
+- The head sharpens: the amount is above 0.1 on 82% of pixels (median 0.23) and
+  below -0.1 on 12%. The fixed pass is too soft, as the v4 videos looked.
+- The gain is small next to the denoiser stage's (+0.65 dB). Controls that reach
+  further are untested: learned weights for the gathered samples, the denoiser's
+  features as inputs, a sharper resampling of the history.
+- One seed, 3 validation sequences. `--head-sharpen` is on in scripts/overnight_v5.sh.
+
 ## Not done
 - The new options are not in export.py or the renderer's shaders. The edge stops read
   depth, normal and albedo of every kernel tap: a runtime cost to measure.
