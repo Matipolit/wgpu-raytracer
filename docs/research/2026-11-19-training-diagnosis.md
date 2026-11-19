@@ -114,10 +114,45 @@ The denoiser stage frozen ("all four" above), only the head trained, 1500 steps
   3x3 mean, is worth +0.15 dB.
 - The head sharpens: the amount is above 0.1 on 82% of pixels (median 0.23) and
   below -0.1 on 12%. The fixed pass is too soft, as the v4 videos looked.
-- The gain is small next to the denoiser stage's (+0.65 dB). Controls that reach
-  further are untested: learned weights for the gathered samples, the denoiser's
-  features as inputs, a sharper resampling of the history.
+- The gain is small next to the denoiser stage's (+0.65 dB).
 - One seed, 3 validation sequences. `--head-sharpen` is on in scripts/overnight_v5.sh.
+
+More controls, on the PC (same data, crop 128, batch 4, two seeds, mean PSNR):
+
+| head | validation | hold-out |
+|---|---:|---:|
+| zero (the fixed pass) | 26.10 dB | 22.34 dB |
+| three controls | 26.07 | 22.36 |
+| + gather width (`--head-gather`: towards exp(-8 d^2) or exp(-0.5 d^2)) | 26.08 | 22.34 |
+| + Catmull-Rom history (`--cubic-history`) | 26.01 | 22.33 |
+| + sharpen | 26.27 | 22.52 |
+| + gather width + sharpen | 26.29 | 22.51 |
+| + Catmull-Rom history + sharpen | 26.22 | 22.53 |
+| all three | 26.24 | 22.52 |
+
+- Seeds differ by 0.02 to 0.05 dB. Only the sharpen output helps; a narrower gather
+  and a sharper history resampling do not, so the softness is not made in the output
+  stage: the denoiser stage hands over lighting that is too smooth.
+- PSNR over 16 frames says little about sharpness in motion; Catmull-Rom is not ruled
+  out for that, only shown to be worth nothing here.
+
+## Training windows lose history at their edges [measured]
+A pixel whose reprojection falls outside the training window starts a new history; the
+renderer would have kept it. training/temporal/window_history.py: history length at the
+last frame inside a centred window, against the same pixels with the whole 320-pixel
+capture available (v4 captures, 16 frames):
+
+| window | 720p | 1080p | 4K | laptop-small (160-pixel captures) |
+|---|---:|---:|---:|---:|
+| 96 | 30% lost | 38% | 34% | 20% |
+| 128 | 25% | 31% | 28% | 11% |
+| 192 | 17% | 22% | 19% | |
+| 256 | 10% | 12% | 11% | |
+
+- The denoiser trained on 128-pixel windows (train.py's default; the v4 and v5 scripts
+  did not set it), the joint network on 192.
+- A lower bound: the 320-pixel capture loses history against the whole frame too, and
+  32-frame sequences drift further than 16.
 
 ## Not done
 - The new options are not in export.py or the renderer's shaders. The edge stops read
