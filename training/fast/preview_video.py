@@ -13,6 +13,7 @@ the renderer's upscaler) brings them to output resolution. One exposure for all 
 """
 import argparse
 import importlib.util
+import resource
 import json
 import pathlib
 import subprocess
@@ -23,6 +24,8 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
+# One descriptor per memory-mapped frame: lift the soft limit to the hard one.
+resource.setrlimit(resource.RLIMIT_NOFILE, (resource.getrlimit(resource.RLIMIT_NOFILE)[1],) * 2)
 here = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(here))
 sys.path.insert(0, str(here.parent / "upscale"))
