@@ -12,7 +12,9 @@ alone (radiance / albedo), averaged with its sign over 8x8 blocks before the abs
 value, so pixel noise and resampled texture cancel and what moves together stays.
 "slow" is the same block measure against the lighting's running mean along the motion
 (1/16 per frame) instead of the previous frame: it also counts blotches that drift over
-many frames, which change too little per frame to show in "boil".
+many frames, which change too little per frame to show in "boil". "typical" is the
+median block of "slow" over the frame: a few restless surfaces (a mirror, a moving
+object's trail) can carry most of the mean.
 The exposure is 0.18 / the mean luminance of the first frames' input.
 """
 import argparse
@@ -47,7 +49,7 @@ def luminance(x):
     return 0.2126 * x[:, 0:1] + 0.7152 * x[:, 1:2] + 0.0722 * x[:, 2:3]
 
 
-totals = np.zeros(5)
+totals = np.zeros(6)
 scenes = sorted(d for d in pathlib.Path(a.data).iterdir() if (d / "meta.json").exists())
 with torch.no_grad():
     for scene in scenes:
@@ -61,7 +63,7 @@ with torch.no_grad():
 
         k = 0.18 / torch.stack([luminance(load(f)[:, 0:3]).mean() for f in files[:8]]).mean().clamp(min=1e-6).view(1, 1, 1, 1)
         history = prev = was_raw = was_out = was_light = mean_light = where = None
-        sums, count = np.zeros(5), 0
+        sums, count = np.zeros(6), 0
         for t, f in enumerate(files):
             frame = load(f)
             noisy, guides = frame[:, 0:3], frame[:, 3:15]
@@ -80,7 +82,7 @@ with torch.no_grad():
                 slow = (F.avg_pool2d(slow, 8) / F.avg_pool2d(valid, 8).clamp(min=0.25)).abs()
                 where = slow if where is None else where + slow
                 slow = float(slow.mean())
-                sums += (change(raw, was_raw), change(out, was_out), gradient, boil, slow)
+                sums += (change(raw, was_raw), change(out, was_out), gradient, boil, slow, 0)
                 count += 1
             if t > 0:
                 mean_light = torch.where(valid > 0, torch.lerp(M.warp(mean_light, guides[:, M.MOTION])[0], light, 1 / 16), light)
@@ -88,6 +90,8 @@ with torch.no_grad():
                 mean_light = light
             was_raw, was_out, was_light = raw, out, light
         sums /= max(count, 1)
+        if where is not None:
+            sums[5] = float((where / count).median())
         if a.maps and where is not None:
             from PIL import Image
             pathlib.Path(a.maps).mkdir(parents=True, exist_ok=True)
@@ -97,5 +101,5 @@ with torch.no_grad():
             m = np.pad(m, ((0, shown.shape[0] - m.shape[0]), (0, shown.shape[1] - m.shape[1]), (0, 0)))
             Image.fromarray((np.concatenate([shown, m], 1) * 255).astype(np.uint8)).save(pathlib.Path(a.maps) / f"{scene.name}.png")
         totals += sums / len(scenes)
-        print(f"{scene.name:16} input {sums[0]:.4f}  network {sums[1]:.4f}  gradient {sums[2]:.4f}  boil {sums[3]:.5f}  slow {sums[4]:.5f}", flush=True)
-print(f"{'mean':16} input {totals[0]:.4f}  network {totals[1]:.4f}  gradient {totals[2]:.4f}  boil {totals[3]:.5f}  slow {totals[4]:.5f}")
+        print(f"{scene.name:16} input {sums[0]:.4f}  network {sums[1]:.4f}  gradient {sums[2]:.4f}  boil {sums[3]:.5f}  slow {sums[4]:.5f}  typical {sums[5]:.5f}", flush=True)
+print(f"{'mean':16} input {totals[0]:.4f}  network {totals[1]:.4f}  gradient {totals[2]:.4f}  boil {totals[3]:.5f}  slow {totals[4]:.5f}  typical {totals[5]:.5f}")

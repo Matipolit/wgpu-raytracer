@@ -170,6 +170,9 @@ pub struct Raytracer {
     frame_number: u32,
     /// ReSTIR frames rendered (the reservoir ping-pong; see `SamplingParams::restir`).
     restir_frames: u32,
+    /// Frames since the view or the scene last changed (1 = the first frame of a new
+    /// view); raytracer.wgsl `SamplingParams::still`.
+    still_frames: u32,
     /// GPU time of the most recently measured trace pass (ms; 0 before the first).
     pub last_trace_ms: f64,
 }
@@ -731,6 +734,22 @@ impl Raytracer {
                 std::env::var("RT_GI_SHADE").map_or(3., |v| v.parse().unwrap()),
             ),
             (
+                "GLOSSY_PLAIN",
+                std::env::var("RT_GLOSSY").map_or(0., |v| v.parse().unwrap()),
+            ),
+            (
+                "GI_STILL_GROWTH",
+                f64::from(std::env::var("RT_GI_STILL").map_or(true, |v| v != "0")),
+            ),
+            (
+                "GI_SHADE_NORMAL",
+                std::env::var("RT_GI_SHADE_NORMAL").map_or(0.9, |v| v.parse().unwrap()),
+            ),
+            (
+                "GI_SHADE_OWN_LIMIT",
+                std::env::var("RT_GI_SHADE_OWN_LIMIT").map_or(3., |v| v.parse().unwrap()),
+            ),
+            (
                 "GI_SHADE_RADIUS",
                 std::env::var("RT_GI_SHADE_RADIUS").map_or(24., |v| v.parse().unwrap()),
             ),
@@ -1205,6 +1224,7 @@ impl Raytracer {
             render_progress,
             frame_number,
             restir_frames: 0,
+            still_frames: 0,
             last_trace_ms: 0.,
         };
         tracer.output_guides_group = tracer
@@ -2037,6 +2057,7 @@ impl Raytracer {
     /// Move the scene's spheres; their previous positions feed motion vectors.
     /// Restarts accumulation, as the image content changed.
     pub fn set_spheres(&mut self, queue: &wgpu::Queue, spheres: &[Sphere]) {
+        self.still_frames = 0;
         queue.write_buffer(&self.sphere_buffer, 0, bytemuck::cast_slice(spheres));
         queue.write_buffer(
             self.sphere_prev_buffer.handle(),
@@ -2054,6 +2075,7 @@ impl Raytracer {
     /// uniform scale); the previous call's transforms feed motion vectors. Restarts
     /// accumulation, as the image content changed.
     pub fn set_objects(&mut self, queue: &wgpu::Queue, transforms: &[glm::Mat4]) {
+        self.still_frames = 0;
         assert_eq!(
             transforms.len(),
             self.object_bounds.len(),
@@ -2094,6 +2116,7 @@ impl Raytracer {
     /// Forget the ReSTIR DI/GI history (reservoirs and GI samples), e.g. when a capture
     /// starts a new sequence or trace region: stale samples would otherwise be reused.
     pub fn clear_history(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.still_frames = 0;
         let mut encoder = device.create_command_encoder(&Default::default());
         encoder.clear_buffer(&self.images.reservoirs, 0, None);
         encoder.clear_buffer(&self.images.gi, 0, None);
@@ -2216,6 +2239,8 @@ impl Raytracer {
         if self.latest_render_params.sampling.restir {
             self.restir_frames = self.restir_frames.wrapping_add(1).max(1);
             gpu_sampling_params.restir = self.restir_frames;
+            self.still_frames = self.still_frames.saturating_add(1);
+            gpu_sampling_params.still = self.still_frames;
         }
         {
             queue.write_buffer(
@@ -2299,9 +2324,10 @@ impl Raytracer {
         let mut previous = self.latest_render_params;
         previous.exposure = render_params.exposure;
         previous.auto_exposure = render_params.auto_exposure;
-        if let Some(temporal) = &mut self.temporal {
-            // Exposure alone does not restart the still-view convergence.
-            if previous != *render_params || output_size != self.output_size {
+        // Exposure alone does not restart the still-view convergence.
+        if previous != *render_params || output_size != self.output_size {
+            self.still_frames = 0;
+            if let Some(temporal) = &mut self.temporal {
                 temporal.moved();
             }
         }
@@ -3189,7 +3215,8 @@ impl RenderProgress {
                 denoising_sigma_color: sampling_params.denoising_sigma_color,
                 trace_origin: 0,
                 restir: 0,
-                _pad: [0; 3],
+                still: 0,
+                _pad: [0; 2],
             }
         }
         // Progressive render
@@ -3205,7 +3232,8 @@ impl RenderProgress {
                 denoising_sigma_color: sampling_params.denoising_sigma_color,
                 trace_origin: 0,
                 restir: 0,
-                _pad: [0; 3],
+                still: 0,
+                _pad: [0; 2],
             }
         }
         // Completed render
@@ -3220,7 +3248,8 @@ impl RenderProgress {
                 denoising_sigma_color: sampling_params.denoising_sigma_color,
                 trace_origin: 0,
                 restir: 0,
-                _pad: [0; 3],
+                still: 0,
+                _pad: [0; 2],
             }
         }
     }
@@ -3457,7 +3486,9 @@ struct GpuSamplingParams {
     trace_origin: u32,
     /// 0: no ReSTIR; else the ReSTIR frame count (its low bit picks the reservoir copy).
     restir: u32,
-    _pad: [u32; 3],
+    /// Frames the view has been still (ReSTIR frames; `Raytracer::still_frames`).
+    still: u32,
+    _pad: [u32; 2],
 }
 
 #[repr(C)]

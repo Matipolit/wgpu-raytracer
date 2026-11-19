@@ -114,23 +114,37 @@ override GI_SPATIAL: u32 = 4u;
 // 1e9: always, as before).
 override GI_SPATIAL_BELOW: f32 = 8.;
 const GI_RADIUS = 24.;
-// History length cap (M), in samples (RT_GI_CAP).
+// History length cap (M), in samples (RT_GI_CAP), while the view moves. While it is
+// still the cap grows with the samples traced since it stopped (giCap), so a pixel's
+// estimate keeps improving instead of forgetting all but its last 20 samples: the
+// still-view average (temporal.rs) converges instead of keeping its grain.
 override GI_CAP: f32 = 20.;
+override GI_STILL_GROWTH: bool = true;
 // Shading reuse (RT_GI_SHADE neighbours, 0: off). A pixel's reservoir keeps a sample for
 // about 4 x GI_CAP frames, and a bright one for seconds (its weight decays by 20/21 per
 // new sample), so the 1-spp frames repeat their error: in the living room a pixel's
 // noise is 88% the same one frame later and 62% the same 16 frames later, and a
 // 64-frame average looks like one frame. The denoiser turns those standing bright
-// pixels into blobs that crawl as the reservoirs change. With this, what a pixel shows
-// is resampled each frame from its own reservoir and those of GI_SHADE random pixels
-// within GI_SHADE_RADIUS on the same surface (last frame's, around where the pixel
-// was), with a visibility ray when a neighbour's sample wins. The stored history is
-// not touched (fed back, the pooled weights grow without bound). Living room, error
-// left after averaging 16 frames: per pixel -38%, per 8x8 block -34%; overall
-// brightness -3% (light a pixel sees and its neighbours do not is under-counted).
-// Steam Deck: +13-15% frame time.
+// pixels into blobs that crawl as the reservoirs change, and the still-view average
+// (temporal.rs) keeps them as speckles. With this, what a pixel shows is resampled
+// each frame from the reservoirs of GI_SHADE random pixels within GI_SHADE_RADIUS on
+// the same surface (last frame's, around where the pixel was; same tangent plane and
+// a normal within GI_SHADE_NORMAL), not from its own, with a visibility ray. Its own
+// sample is shown only when no neighbour qualifies or the neighbours' pick is hidden.
+// The stored history is not touched (fed back, the pooled weights grow without
+// bound). Living room / day Bistro, still camera: error left in the mean of 16 frames
+// per pixel -62% / -48%, frame-to-frame correlation 0.88 / 0.49 -> 0.05 / 0.03;
+// brightness of a long average -2.6% / -1.5% (light a pixel sees and its neighbours
+// do not is under-counted; without the normal test -5%).
 override GI_SHADE: u32 = 3u;
 override GI_SHADE_RADIUS: f32 = 24.;
+override GI_SHADE_OWN_LIMIT: f32 = 3.;
+override GI_SHADE_NORMAL: f32 = 0.9;
+// Primary surfaces smoother than this roughness (RT_GLOSSY, 0: none) are path traced
+// plainly: every pixel traces its bounce and samples one light with MIS, no reservoirs.
+// A reservoir's sample is chosen without the BSDF's lobe (DI) or for an old view (GI),
+// so reflections on such surfaces come and go as the reservoirs change.
+override GLOSSY_PLAIN: f32 = 0.;
 // GI_VISIBILITY_REUSE: a borrowed winner that is occluded is stored with W = 0 (its M
 // still counts, diluting the next frame). Off: stored with its weight, visibility
 // applied to the shading only (no measurable difference: Sponza, living room).
@@ -739,7 +753,14 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                 let before = array(lastBsdfPdf,skyMisWeight,sunMisWeight,vertexSunShare);
                 let lampsCoveredBefore = lampsCovered;
                 vertexSunShare = sunShare;lampsCovered = false;
-                if RESTIR && bounce == 0u && sampleIndex == 0u && samplingParams.restir != 0u {
+                var reuse = bounce == 0u && sampleIndex == 0u && samplingParams.restir != 0u;
+                if reuse && GLOSSY_PLAIN > 0. {
+                    // Smooth surfaces take no part in the reuse (see GLOSSY_PLAIN).
+                    _ = pbrSurface(ray,hit);
+                    reuse = shadedRough >= GLOSSY_PLAIN;
+                    if RESTIR && !reuse {storeReservoir(reservoirSet(samplingParams.restir&1u,gbufferPixel),Reservoir());}
+                }
+                if RESTIR && reuse {
                     let surface = pbrSurface(ray,hit);
                     if sunOn {
                         let direction = sampleSun(rngState);
@@ -823,7 +844,7 @@ fn rayColor(primaryRay: Ray, rngState: ptr<function, u32>) -> vec3<f32> {
                     gbufferPending = false;
                     writeGbuffer(shadedBase, hit.t * length(ray.direction), hit.n, shadedRough, shadedMetal, meshPrevious, 1.);
                 }
-                if giActive && bounce == 0u && lastBsdfPdf < 1e7 && meshFloat(m+48u) <= 0. && (GI_NULL_SAMPLES || lastBsdfPdf > 0.) {
+                if giActive && bounce == 0u && lastBsdfPdf < 1e7 && meshFloat(m+48u) <= 0. && (GI_NULL_SAMPLES || lastBsdfPdf > 0.) && shadedRough >= GLOSSY_PLAIN {
                     giPrimary = hit.p;giPrimaryNormal = hit.n;
                     // Not this block's owner this frame: the bounce comes from reuse.
                     if !giOwner {giPrimaryOnly = true;break;}
@@ -1163,7 +1184,8 @@ struct SamplingParams {
     traceOrigin: u32,
     // Nonzero: real-time frames reuse lamp samples (RESTIR).
     restir: u32,
-    pad0: u32,
+    // Frames since the view or the scene last changed (1: the first of a new view).
+    still: u32,
     pad1: u32,
     pad2: u32,
 }
@@ -1743,6 +1765,10 @@ fn giJacobian(secondary: vec3<f32>, secondaryNormal: vec3<f32>, source: vec3<f32
     let j=(cosTo*dot(a,a))/max(cosFrom*dot(b,b),1e-12);
     return select(j,0.,j>10. || j<0.1);
 }
+fn giCap() -> f32 {
+    if !GI_STILL_GROWTH {return GI_CAP;}
+    return GI_CAP+f32(max(samplingParams.still,1u)-1u)*select(1.,0.25,GI_BLOCKS);
+}
 @compute @workgroup_size(8, 8)
 fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
     // Traversal with the workgroup-memory stack indexes its slots by lane (64 lanes).
@@ -1777,7 +1803,7 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
     if previous.x>=0. && previous.y>=0. && previous.x<f32(frameData.x) && previous.y<f32(frameData.y) {
         let slot=giFinalSlot(parity^1u,u32(previous.y)*frameData.x+u32(previous.x));
         let a=giData[slot];let b=giData[slot+1u];
-        let rm=min(unpack2x16float(b.y).y,GI_CAP);
+        let rm=min(unpack2x16float(b.y).y,giCap());
         let seenFrom=distance(prevCamera.eye,own.primary);
         // The same surface was on screen last frame (whatever became of its history).
         disoccluded=abs(bitcast<f32>(b.w)-seenFrom)>0.1*seenFrom;
@@ -1840,44 +1866,55 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
     giData[slot]=vec4(bitcast<vec3<u32>>(pick.secondary),pack2x16snorm(encodeOct(pick.secondaryNormal)));
     // A hidden pick is not kept: the pixel starts over.
     if GI_DROP_UNUSABLE && !visible {m=0.;}
-    giData[slot+1u]=vec4(pack2x16float(pick.radiance.rg),pack2x16float(vec2(pick.radiance.b,min(m,GI_CAP))),bitcast<u32>(select(weight,0.,GI_VISIBILITY_REUSE && !visible)),bitcast<u32>(depth));
+    giData[slot+1u]=vec4(pack2x16float(pick.radiance.rg),pack2x16float(vec2(pick.radiance.b,min(m,giCap()))),bitcast<u32>(select(weight,0.,GI_VISIBILITY_REUSE && !visible)),bitcast<u32>(depth));
     if !visible {weight=0.;}
     var toShade=toSecondary;var shadeSpan=span;
     if GI_SHADE>0u && !disoccluded {
-        let own=min(m,GI_CAP);let ownPick=pick;let ownWeight=weight;
-        var shadeSum=select(0.,pick.score*weight*own,weight>0.);var shadeM=own;var shadeBorrowed=false;
+        let ownPick=pick;let ownWeight=weight;
+        var shadeSum=0.;var shadeM=0.;var found=0u;
         let seenFrom=distance(prevCamera.eye,hit.p);
-        for(var k=0u;k<GI_SHADE;k+=1u) {
+        // Up to three times as many tries as neighbours wanted, the later ones closer:
+        // on detailed geometry and narrow surfaces most pixels at the full radius are
+        // other surfaces, and a pixel left with its own sample keeps its speckle.
+        for(var k=0u;k<3u*GI_SHADE && found<GI_SHADE;k+=1u) {
             let angle=6.2831853*rngNextFloat(&rng);
-            let at=previous+GI_SHADE_RADIUS*sqrt(rngNextFloat(&rng))*vec2(cos(angle),sin(angle));
+            let reach=GI_SHADE_RADIUS*select(1.,select(0.4,0.15,k>=2u*GI_SHADE),k>=GI_SHADE);
+            let at=previous+max(reach*sqrt(rngNextFloat(&rng)),1.5)*vec2(cos(angle),sin(angle));
             if at.x<0. || at.y<0. || at.x>=f32(frameData.x) || at.y>=f32(frameData.y) {continue;}
             let q=vec2<u32>(at);
             let other=giFinalSlot(parity^1u,q.y*frameData.x+q.x);
             let a=giData[other];let b=giData[other+1u];
-            let rm=min(unpack2x16float(b.y).y,GI_CAP);
+            let rm=min(unpack2x16float(b.y).y,giCap());
             if rm<=0. {continue;}
             // Where that pixel's surface point was (its distance along its pixel's ray).
             let uv=(vec2<f32>(q)+vec2(0.5))/vec2<f32>(frameData.xy);
             let source=prevCamera.eye+normalize(prevCamera.lowerLeftCorner+uv.x*prevCamera.horizontal+(1.-uv.y)*prevCamera.vertical-prevCamera.eye)*bitcast<f32>(b.w);
-            // The same surface: in this pixel's tangent plane.
+            // The same surface: in this pixel's tangent plane, facing the same way (the
+            // normal of the pixel that far from this one in the current frame).
             if abs(dot(source-hit.p,hit.n))>0.02*seenFrom || abs(bitcast<f32>(b.w)-seenFrom)>0.1*seenFrom {continue;}
+            let facing=vec2<i32>(here+at-previous);
+            if any(facing<vec2(0)) || any(facing>=vec2<i32>(frameData.xy)) || dot(gbuffer[(u32(facing.y)*frameData.x+u32(facing.x))*3u+1u].xyz,hit.n)<GI_SHADE_NORMAL {continue;}
             let secondary=bitcast<vec3<f32>>(a.xyz);let secondaryNormal=decodeOct(a.w);
             let jacobian=giJacobian(secondary,secondaryNormal,source,hit.p);
             if jacobian<=0. {continue;}
             let radiance=vec3(unpack2x16float(b.x),unpack2x16float(b.y).x);
             let score=giTarget(surface,hit,secondary,radiance);
             let w=score*bitcast<f32>(b.z)*jacobian*rm;
-            shadeSum+=w;shadeM+=rm;
-            if w>0. && rngNextFloat(&rng)*shadeSum<w {pick=GiPick(secondary,secondaryNormal,radiance,score,true);shadeBorrowed=true;}
+            shadeSum+=w;shadeM+=rm;found+=1u;
+            if w>0. && rngNextFloat(&rng)*shadeSum<w {pick=GiPick(secondary,secondaryNormal,radiance,score,true);}
         }
-        weight=select(0.,shadeSum/(shadeM*pick.score),pick.score>0. && shadeM>0.);
-        if shadeBorrowed && weight>0. {
+        // With no usable neighbour the pixel shows its own sample, as without this.
+        if shadeM>0. {
+            weight=select(0.,shadeSum/(shadeM*pick.score),shadeSum>0.);
             toShade=pick.secondary-hit.p;shadeSpan=length(toShade);
-            // A neighbour's light this pixel cannot see: it shows its own sample instead.
-            // Black here would count the light the neighbours cannot see as missing too
-            // (5-7% darker overall with 3 neighbours; 3% with this).
-            if !(shadeSpan>1e-4 && shadeSpan<1e6 && weight<1e30) || occludedWithin(Ray(hit.p+hit.n*0.0001,toShade/shadeSpan),shadeSpan*0.999) {
-                pick=ownPick;weight=ownWeight;toShade=toSecondary;shadeSpan=span;
+            if weight>0. && (!(shadeSpan>1e-4 && shadeSpan<1e6 && weight<1e30) || occludedWithin(Ray(hit.p+hit.n*0.0001,toShade/shadeSpan),shadeSpan*0.999)) {
+                // A neighbour's light this pixel cannot see: its own sample instead
+                // (black would count the light the neighbours cannot see as missing
+                // too: 5-7% darker overall), but no brighter than GI_SHADE_OWN_LIMIT
+                // times what the neighbours found, so a standing bright sample does
+                // not come back through this door.
+                pick=ownPick;toShade=toSecondary;shadeSpan=span;
+                weight=min(ownWeight,GI_SHADE_OWN_LIMIT*shadeSum/(shadeM*max(ownPick.score,1e-30)));
             }
         }
     }
