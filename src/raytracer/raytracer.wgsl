@@ -120,6 +120,8 @@ const GI_RADIUS = 24.;
 // still-view average (temporal.rs) converges instead of keeping its grain.
 override GI_CAP: f32 = 20.;
 override GI_STILL_GROWTH: bool = true;
+// Pixels per frame above which a pixel counts as moving (RT_GI_MOVING, 0: never).
+override GI_MOVING: f32 = 0.25;
 // Shading reuse (RT_GI_SHADE neighbours, 0: off). A pixel's reservoir keeps a sample for
 // about 4 x GI_CAP frames, and a bright one for seconds (its weight decays by 20/21 per
 // new sample), so the 1-spp frames repeat their error: in the living room a pixel's
@@ -1798,9 +1800,19 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
         if rm>0. && !disoccluded {
             let secondary=bitcast<vec3<f32>>(a.xyz);let radiance=vec3(unpack2x16float(b.x),unpack2x16float(b.y).x);
             let score=giTarget(surface,hit,secondary,radiance);
-            let w=score*bitcast<f32>(b.z)*rm;
-            sum+=w;m+=rm;
-            if w>0. && rngNextFloat(&rng)*sum<w {pick=GiPick(secondary,decodeOct(a.w),radiance,score,true);pickTemporal=true;}
+            let stored=bitcast<f32>(b.z);
+            // A sample that carries light, but none to this point (the pixel moved over
+            // the surface, or its jittered position landed on another texel of a
+            // normal map, and the sample is now below its horizon), is unusable here
+            // and dropped. Kept with weight 0, its whole history counts as samples
+            // that found nothing and the weight can never come back: after 120 frames
+            // of a turning camera Sponza was 23% darker than without reuse, day Bistro
+            // 11%, the living room 9% (with this and `moved` below: 5%, 2%, 6%).
+            if !(GI_DROP_UNUSABLE && stored>0. && score<=0.) {
+                let w=score*stored*rm;
+                sum+=w;m+=rm;
+                if w>0. && rngNextFloat(&rng)*sum<w {pick=GiPick(secondary,decodeOct(a.w),radiance,score,true);pickTemporal=true;}
+            }
         }
     }
     // Spatial: this frame's samples of nearby pixels on a similar surface.
@@ -1808,7 +1820,13 @@ fn csRestirGi(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invoc
     let depth=distance(camera.eye,own.primary);
     // Neighbours only while the pixel's own history is short (after a disocclusion):
     // with a long history they add nothing measurable, and each costs a scattered read.
-    let neighbours=select(0u,GI_SPATIAL,m<GI_SPATIAL_BELOW);
+    // Also while the pixel moves over the surface (by more than GI_MOVING pixels a
+    // frame): every step to another point loses the light that point sees and the
+    // sample's first owner could not sample, and only fresh samples bring it back.
+    // (The G-buffer's motion is measured from this frame's sample position, so the
+    // sub-pixel jitter does not count as movement.)
+    let moved=GI_MOVING>0. && !disoccluded && length(g2.xy)>GI_MOVING;
+    let neighbours=select(0u,GI_SPATIAL,m<GI_SPATIAL_BELOW || moved);
     // A newly visible pixel without a sample of its own this frame looks at the pixels
     // that hold this frame's samples, one per 2x2 block with GI_BLOCKS, starting with
     // its own block's. Random pixels hold a sample one time in four, which left such

@@ -16,7 +16,8 @@ struct DetailParams {
     alphaMin: f32,
     // Variance clipping width in standard deviations.
     gamma: f32,
-    pad1: u32,
+    // The denoiser's demodulation floor (its TD_EPS), so both demodulate alike.
+    eps: f32,
     pad2: u32,
 }
 @group(0) @binding(0) var<uniform> params: DetailParams;
@@ -29,7 +30,6 @@ struct DetailParams {
 @group(0) @binding(6) var<storage, read_write> output: array<array<f32, 3>>;
 @group(0) @binding(7) var<storage, read_write> current: array<vec2<u32>>;
 
-const EPS = 0.01;
 const MAX_HISTORY = 64.;
 
 fn renderIndex(r: vec2<i32>) -> u32 {
@@ -68,7 +68,13 @@ fn csDetailCurrent(@builtin(global_invocation_id) id: vec3<u32>) {
     let kind = outGuides[i * 3u + 2u].w;
     // Joint-bilateral: samples of another kind (sky vs surface) or depth barely count,
     // so demodulated values do not cross edges (a sky "albedo" holds sky radiance).
+    // Directly visible emission (the guides' fourth vec4, written when a temporal
+    // denoiser runs) is not albedo times light: it is gathered as it is. Demodulated
+    // with the rest, a lamp's edge pixel would be scaled by the ratio of the two
+    // albedos across the edge (a window frame beside a window: up to 90 times).
+    let emission = params.renderSize.x * params.renderSize.y * 3u;
     var sum = vec3(0.);
+    var emitted = vec3(0.);
     var weight = 0.;
     for (var dy = -1; dy <= 2; dy += 1) {
         for (var dx = -1; dx <= 2; dx += 1) {
@@ -79,12 +85,14 @@ fn csDetailCurrent(@builtin(global_invocation_id) id: vec3<u32>) {
             let relative = (lo0.w - depth) / (0.05 * depth + 1e-3);
             let same = select(1e-4, 1., abs(lowGuides[ri * 3u + 2u].w - kind) < 0.5);
             let w = exp(-2. * dot(d, d)) * same * exp(-relative * relative);
-            let c = vec3(image[ri][0], image[ri][1], image[ri][2]);
-            sum += w * c / (lo0.xyz + vec3(EPS));
+            let e = lowGuides[emission + ri].xyz;
+            let c = max(vec3(image[ri][0], image[ri][1], image[ri][2]) - e, vec3(0.));
+            sum += w * c / (lo0.xyz + vec3(params.eps));
+            emitted += w * e;
             weight += w;
         }
     }
-    current[i] = packRgb(sum / max(weight, 1e-6) * (albedo + vec3(EPS)));
+    current[i] = packRgb((sum * (albedo + vec3(params.eps)) + emitted) / max(weight, 1e-6));
 }
 
 @compute @workgroup_size(8, 8)

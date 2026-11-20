@@ -12,8 +12,8 @@ Per frame (see `step`):
 
 The WGSL inference in export.py implements exactly these operations.
 
-Second-generation options (`configure`; all off is the model above, which the renderer
-runs; export.py does not know them yet):
+Second-generation options (`configure`; all off is the model above; export.py generates
+all of them except `hidden`):
   edge      explicit edge stops in the kernel logits: a neighbour loses weight with
             its relative depth difference, normal difference and albedo difference
             (learned scales per level), so kernels stop at edges by construction

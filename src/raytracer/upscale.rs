@@ -13,7 +13,8 @@ use wgpu::util::DeviceExt;
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
-    // The joint network reads the first 32 bytes (JnParams).
+    // The joint network reads the first 32 bytes (JnParams). `pad[0]`: detail mode's
+    // demodulation floor (f32 bits).
     render_size: [u32; 2],
     output_size: [u32; 2],
     jitter: [f32; 2],
@@ -22,6 +23,17 @@ struct Params {
     alpha_min: f32,
     alpha_max: f32,
     pad: [u32; 2],
+}
+
+/// `TD_EPS` of the `--temporal-model` (0.01 without one, or for a model that predates it).
+fn denoiser_eps() -> f32 {
+    crate::argument_value("--temporal-model")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|source| {
+            let rest = source.split("const TD_EPS = ").nth(1)?;
+            rest.split(';').next()?.trim().parse().ok()
+        })
+        .unwrap_or(0.01)
 }
 
 /// The render scale from `--render-scale` (1 = no upscaling).
@@ -152,6 +164,8 @@ pub struct Upscaler {
     render_size: (u32, u32),
     parity: usize,
     history_valid: bool,
+    /// The temporal denoiser's demodulation floor (detail mode demodulates with it).
+    eps: f32,
     /// Denoised input: clamp history to the neighbourhood and blend faster (TAAU).
     denoised: bool,
 }
@@ -317,6 +331,7 @@ impl Upscaler {
             render_size,
             parity: 0,
             history_valid: false,
+            eps: denoiser_eps(),
             denoised,
         }
     }
@@ -528,7 +543,7 @@ impl Upscaler {
             clamp_history: u32::from(self.denoised),
             alpha_min,
             alpha_max,
-            pad: [0; 2],
+            pad: [self.eps.to_bits(), 0],
         };
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
         queue.write_buffer(

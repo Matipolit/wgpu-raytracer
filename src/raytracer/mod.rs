@@ -734,6 +734,10 @@ impl Raytracer {
                 std::env::var("RT_GI_SHADE").map_or(3., |v| v.parse().unwrap()),
             ),
             (
+                "GI_MOVING",
+                std::env::var("RT_GI_MOVING").map_or(0.25, |v| v.parse().unwrap()),
+            ),
+            (
                 "GI_STILL_GROWTH",
                 f64::from(std::env::var("RT_GI_STILL").map_or(true, |v| v != "0")),
             ),

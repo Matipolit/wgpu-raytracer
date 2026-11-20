@@ -44,6 +44,11 @@ else:
 assert M.HIDDEN == 0, "the head's hidden layer is not exported"
 G = M.CHANNELS // 4  # vec4 groups of hidden channels
 state = torch.load(sys.argv[1], map_location="cpu")
+if any(k.startswith("a.") for k in state):
+    # A joint network (training/fast): its stage A is a temporal denoiser, always with
+    # exposure-normalized features; `--detail-upscale` is its output stage's fixed pass.
+    state = {k[2:]: v for k, v in state.items() if k.startswith("a.")}
+    EXPOSURE = True
 net = M.Net()
 net.load_state_dict(state)
 w1, b1 = net.c1.weight.detach(), net.c1.bias.detach()

@@ -50,6 +50,9 @@ pub struct Settings {
     pub size: (u32, u32),
     pub fullscreen: bool,
     pub render_scale: f32,
+    /// The detail upscaler instead of TAAU (with a render scale below 1 and a temporal
+    /// denoiser): textures and edges from full-resolution guides.
+    pub detail: bool,
     pub denoiser: Denoiser,
     pub bounces: u32,
     /// ReSTIR GI (reused bounce lighting; real-time denoised modes).
@@ -70,6 +73,7 @@ impl Default for Settings {
             size: (1280, 720),
             fullscreen: false,
             render_scale: 0.67,
+            detail: false,
             denoiser: Denoiser::Neural("td2-half24".to_owned()),
             bounces: 2,
             gi: true,
@@ -175,6 +179,9 @@ impl Settings {
         push("--fastest", None);
         if self.render_scale < 1. {
             push("--render-scale", Some(format!("{}", self.render_scale)));
+            if self.detail && matches!(self.denoiser, Denoiser::Neural(_)) {
+                push("--detail-upscale", None);
+            }
         }
         match &self.denoiser {
             Denoiser::Off => push("--no-denoise", None),
@@ -224,7 +231,8 @@ impl Settings {
             Denoiser::Joint(stem) => format!("joint:{stem}"),
         };
         format!(
-            "scene={}\npreset={}\nsize={}x{}\nfullscreen={}\nrender_scale={}\ndenoiser={denoiser}\n\
+            "scene={}\npreset={}\nsize={}x{}\nfullscreen={}\nrender_scale={}\ndetail={}\n\
+             denoiser={denoiser}\n\
              bounces={}\ngi={}\nmax_samples={}\nhw_rt={}\nauto_tune={}\ntextures={:?}\n\
              sun_elevation={}\nsun_azimuth={}\n",
             self.scene,
@@ -233,6 +241,7 @@ impl Settings {
             self.size.1,
             self.fullscreen,
             self.render_scale,
+            self.detail,
             self.bounces,
             self.gi,
             self.max_samples,
@@ -277,6 +286,7 @@ impl Settings {
                         s.render_scale = v;
                     }
                 }
+                "detail" => s.detail = value.parse().unwrap_or(s.detail),
                 "denoiser" => match value {
                     "off" => s.denoiser = Denoiser::Off,
                     "spatial" => s.denoiser = Denoiser::Spatial,
@@ -845,6 +855,15 @@ fn graphics(
             }
         });
     ui.end_row();
+    ui.label("Detail upscaling");
+    ui.add_enabled(
+        settings.render_scale < 1. && matches!(settings.denoiser, Denoiser::Neural(_)),
+        egui::Checkbox::new(
+            &mut settings.detail,
+            "sharper textures and edges, about a fifth slower",
+        ),
+    );
+    ui.end_row();
     ui.label("Denoiser");
     egui::ComboBox::from_id_salt("denoiser")
         .selected_text(settings.denoiser.label())
@@ -990,6 +1009,7 @@ mod tests {
             size: (1920, 1080),
             fullscreen: true,
             render_scale: 0.67,
+            detail: true,
             denoiser: Denoiser::Neural("td2-half24".to_owned()),
             bounces: 4,
             gi: false,
@@ -1001,6 +1021,20 @@ mod tests {
             sun_azimuth: 135.,
         };
         assert_eq!(Settings::parse(&settings.serialize()), settings);
+    }
+
+    #[test]
+    fn detail_upscaling_needs_a_render_scale_and_a_temporal_denoiser() {
+        let has = |s: &Settings| s.args(&[]).iter().any(|a| a == "--detail-upscale");
+        let mut settings = Settings::default();
+        assert!(!has(&settings));
+        settings.detail = true;
+        assert!(has(&settings));
+        settings.render_scale = 1.;
+        assert!(!has(&settings));
+        settings.render_scale = 0.5;
+        settings.denoiser = Denoiser::Joint("jn-small".to_owned());
+        assert!(!has(&settings));
     }
 
     #[test]
