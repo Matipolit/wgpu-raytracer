@@ -32,7 +32,9 @@ a = p.parse_args()
 config = pathlib.Path(a.weights).with_name("config.json")
 if config.exists():
     c = json.loads(config.read_text())
-    M.configure(c["channels"], c["dilations"], c.get("half", False))
+    M.configure(**c)
+else:
+    c = {}
 net = M.Net().to(a.device)
 net.load_state_dict(torch.load(a.weights, map_location=a.device))
 net.eval()
@@ -53,14 +55,19 @@ def display(x, exposure):
 
 
 pathlib.Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-files = sorted(seq.glob("frame_*.f16"))
+files = sorted(f for f in seq.glob("frame_*.f16") if f.name.count(".") == 1)
 history = prev = None
 log_lum = None
+# Exposure-normalized models: 0.18 / the mean luminance of the first frames' input.
+k = None
+if c.get("exposure"):
+    first = np.stack([np.nan_to_num(np.fromfile(f, "<f2").reshape(h, w, -1)[..., 0:3].astype(np.float32)) for f in files[:8]])
+    k = 0.18 / max(float((first @ np.array([0.2126, 0.7152, 0.0722], np.float32)).mean()), 1e-6)
 with tempfile.TemporaryDirectory() as tmp, torch.no_grad():
     for t, f in enumerate(files):
-        x = np.nan_to_num(np.fromfile(f, "<f2").reshape(h, w, 18).astype(np.float32))
+        x = np.nan_to_num(np.fromfile(f, "<f2").reshape(h, w, -1).astype(np.float32))
         frame = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(a.device)
-        y, g, rad, _ = M.step(net, frame[:, 0:3], frame[:, 3:15], history, prev, t == 0)
+        y, g, rad, _ = M.step(net, frame[:, 0:3], frame[:, 3:15], history, prev, t == 0, k)
         history, prev = y, g
         out = rad[0].permute(1, 2, 0).cpu().numpy()
         lum = np.log(1e-4 + out @ np.array([0.2126, 0.7152, 0.0722], np.float32)).mean()
