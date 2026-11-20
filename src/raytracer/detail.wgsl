@@ -31,6 +31,7 @@ struct DetailParams {
 @group(0) @binding(7) var<storage, read_write> current: array<vec2<u32>>;
 
 const MAX_HISTORY = 64.;
+const DETAIL_RATIO = 3.;
 
 fn renderIndex(r: vec2<i32>) -> u32 {
     let c = clamp(r, vec2(0), vec2<i32>(params.renderSize) - vec2(1));
@@ -87,12 +88,17 @@ fn csDetailCurrent(@builtin(global_invocation_id) id: vec3<u32>) {
             let w = exp(-2. * dot(d, d)) * same * exp(-relative * relative);
             let e = lowGuides[emission + ri].xyz;
             let c = max(vec3(image[ri][0], image[ri][1], image[ri][2]) - e, vec3(0.));
-            sum += w * c / (lo0.xyz + vec3(params.eps));
+            // Light seen through glass or in a mirror is not albedo times light either,
+            // and nothing marks it: the change of albedo from the sample to this pixel
+            // is limited to DETAIL_RATIO either way (a dark pane beside a bright frame
+            // was scaled 19 times: night Bistro 19% too bright).
+            let ratio = clamp((albedo + vec3(params.eps)) / (lo0.xyz + vec3(params.eps)), vec3(1. / DETAIL_RATIO), vec3(DETAIL_RATIO));
+            sum += w * c * ratio;
             emitted += w * e;
             weight += w;
         }
     }
-    current[i] = packRgb((sum * (albedo + vec3(params.eps)) + emitted) / max(weight, 1e-6));
+    current[i] = packRgb((sum + emitted) / max(weight, 1e-6));
 }
 
 @compute @workgroup_size(8, 8)
