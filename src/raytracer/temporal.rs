@@ -17,6 +17,10 @@ pub fn kernels(source: &str) -> Vec<String> {
     if source.contains("fn csTdEmission") {
         names.push("csTdEmission".to_owned());
     }
+    // Models with exposure-normalized features measure the frame they just produced.
+    if source.contains("fn csTdExposure") {
+        names.push("csTdExposure".to_owned());
+    }
     names
 }
 
@@ -75,6 +79,8 @@ pub struct TemporalDenoiser {
     conv_pixels: u32,
     /// Pool and conv kernels run on a half-resolution grid.
     half: bool,
+    /// The last kernel is csTdExposure.
+    exposure: bool,
 }
 
 /// `--temporal-model FILE.wgsl`, or its f16 variant `FILE.f16.wgsl` (export.py --f16:
@@ -225,6 +231,7 @@ impl TemporalDenoiser {
             hidden,
             conv_pixels,
             half,
+            exposure: source.contains("fn csTdExposure"),
         }
     }
 
@@ -341,6 +348,11 @@ impl TemporalDenoiser {
             };
             let per_thread = if conv { self.conv_pixels } else { 1 };
             pass.set_pipeline(pipeline);
+            if self.exposure && index + 1 == self.pipelines.len() {
+                // csTdExposure: one workgroup reduces the whole frame.
+                pass.dispatch_workgroups(1, 1, 1);
+                continue;
+            }
             pass.dispatch_workgroups(grid.0.div_ceil(8 * per_thread), grid.1.div_ceil(8), 1);
         }
     }

@@ -14,6 +14,13 @@ Kernels, in dispatch order, all 8x8 workgroups over pixels:
   csTdFilter0/1/2  head rows for each à-trous level; the last writes history,
                    guides for the next frame and the display radiance.
 Weights are WGSL literals; every multiply-add is vectorized over 4 outputs.
+
+The model's options (config.json next to the weights; model.py) change the generated
+code: `edge` adds the edge stops to the kernel logits (two guide reads per neighbour),
+`length` carries the history length in the history's fourth component, `feedback`
+"blend" keeps the blend instead of the filtered result, `eps` sets TD_EPS, and
+`exposure` scales the radiance features by 0.18 / the mean luminance of the last
+displayed frame (csTdExposure). The head's hidden layer is not supported.
 """
 import sys
 
@@ -30,7 +37,11 @@ sys.argv = [a for a in sys.argv if a != "--f16"]
 config = pathlib.Path(sys.argv[1]).with_name("config.json")
 if config.exists():
     c = json.loads(config.read_text())
-    M.configure(c["channels"], c["dilations"], c.get("half", False))
+    M.configure(**c)
+    EXPOSURE = bool(c.get("exposure", False))
+else:
+    EXPOSURE = False
+assert M.HIDDEN == 0, "the head's hidden layer is not exported"
 G = M.CHANNELS // 4  # vec4 groups of hidden channels
 state = torch.load(sys.argv[1], map_location="cpu")
 net = M.Net()
@@ -38,6 +49,8 @@ net.load_state_dict(state)
 w1, b1 = net.c1.weight.detach(), net.c1.bias.detach()
 w2, b2 = net.c2.weight.detach(), net.c2.bias.detach()
 wh, bh = net.head.weight.detach()[:, :, 0, 0], net.head.bias.detach()
+# Edge stops per level (depth, normal, albedo), as the model applies them.
+STOPS = torch.nn.functional.softplus(net.edge.detach()).tolist() if M.EDGE else []
 
 
 def f(x):
@@ -177,21 +190,42 @@ def head_row(row):
 def filter_kernel(level):
     d = M.DILATIONS[level]
     last = level == len(M.DILATIONS) - 1
+    # The filtered result is the history unless the blend already wrote it (csTdBlend).
+    keep = "" if M.FEEDBACK == "blend" else (
+        "    tdHistory[i] = tdPack(vec4(x, min(tdUnpack(tdWarp[i].zw).w + 1., TD_MAX_LENGTH)));\n" if M.LENGTH
+        else "    tdHistory[i] = tdPack(vec4(x, 0.));\n")
+    centre = "c0" if M.EDGE else "gbuffer[i * 3u]"
     tail = (
-        """    tdHistory[i] = tdPack(vec4(x, 0.));
-    let g0 = gbuffer[i * 3u];
-    let radiance = x * (g0.xyz + vec3(TD_EPS));
+        keep + f"""    let radiance = x * ({centre}.xyz + vec3(TD_EPS));
     tdOutput[i] = array<f32, 3>(radiance.r, radiance.g, radiance.b);"""
         if last
         else f"    tdX[{(level + 1) % 2}u * n + i] = tdPack(vec4(x, 0.));"
     )
-    logits = "\n".join(f"    let l{k} = {head_row(1 + 9 * level + k)};" for k in range(9))
+    if M.EDGE:
+        # Edge stops: a neighbour's logit drops with its relative depth difference, its
+        # normal difference and its albedo difference from the centre (model.py).
+        sd, sn, sa = STOPS[level]
+        rows = ["    let c0 = gbuffer[i * 3u]; let c1 = gbuffer[i * 3u + 1u].xyz;"]
+        for k in range(9):
+            if k == 4:
+                rows.append(f"    let l{k} = {head_row(1 + 9 * level + k)};")
+                continue
+            rows.append(f"    let t{k} = tdTap(id.xy, {(k % 3 - 1) * d}, {(k // 3 - 1) * d}); let j{k} = t{k} * 3u;")
+            rows.append(f"    let n{k} = gbuffer[j{k}];")
+            rows.append(
+                f"    let l{k} = {head_row(1 + 9 * level + k)} - ({f(sd)} * abs(n{k}.w - c0.w) / (c0.w + 1e-3)"
+                f" + {f(sn)} * (1. - clamp(dot(gbuffer[j{k} + 1u].xyz, c1), 0., 1.))"
+                f" + {f(sa / 3)} * dot(abs(n{k}.xyz - c0.xyz), vec3(1.)));")
+        logits = "\n".join(rows)
+    else:
+        logits = "\n".join(f"    let l{k} = {head_row(1 + 9 * level + k)};" for k in range(9))
     m = "l0"
     for k in range(1, 9):
         m = f"max({m}, l{k})"
     exps = "\n".join(f"    let e{k} = exp(l{k} - m);" for k in range(9))
     taps = " + ".join(
-        f"e{k} * tdUnpack(tdX[{level % 2}u * n + tdTap(id.xy, {(k % 3 - 1) * d}, {(k // 3 - 1) * d})]).xyz" for k in range(9))
+        f"e{k} * tdUnpack(tdX[{level % 2}u * n + " + (f"t{k}" if M.EDGE and k != 4 else f"tdTap(id.xy, {(k % 3 - 1) * d}, {(k // 3 - 1) * d})") + "]).xyz"
+        for k in range(9))
     return f"""@compute @workgroup_size(8, 8)
 fn csTdFilter{level}(@builtin(global_invocation_id) id: vec3<u32>) {{
     if id.x >= frameData.x || id.y >= frameData.y {{ return; }}
@@ -206,12 +240,56 @@ fn csTdFilter{level}(@builtin(global_invocation_id) id: vec3<u32>) {{
 }}"""
 
 
+# Exposure-normalized features: 0.18 / the mean luminance of the last displayed frame
+# (raytracer.wgsl csExposure; training used the reference's mean and jittered it 2x).
+SCALE = (
+    "    let shown = bitcast<f32>(tdHistory[frameData.x * frameData.y].x);\n"
+    "    let scale = select(1., 0.18 / max(shown, 1e-6), shown > 0.);\n" if EXPOSURE
+    else "    let scale = 1.;\n")
+# The mean luminance of the frame just displayed, over a 64x64 grid of pixels, kept in
+# the unused second half of the history buffer for the next frame's features. One
+# workgroup; runs last (after the emission is added back).
+EXPOSURE_KERNEL = """
+var<workgroup> tdMeans: array<f32, 256>;
+@compute @workgroup_size(256)
+fn csTdExposure(@builtin(local_invocation_index) lane: u32) {
+    let columns = min(frameData.x, 64u);
+    let rows = min(frameData.y, 64u);
+    var sum = 0.;
+    for (var i = lane; i < columns * rows; i += 256u) {
+        let x = min((i % columns) * frameData.x / columns, frameData.x - 1u);
+        let y = min((i / columns) * frameData.y / rows, frameData.y - 1u);
+        let c = tdOutput[frameData.x * y + x];
+        sum += dot(vec3(c[0], c[1], c[2]), vec3(0.2126, 0.7152, 0.0722));
+    }
+    tdMeans[lane] = sum;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride >>= 1u) {
+        if lane < stride { tdMeans[lane] += tdMeans[lane + stride]; }
+        workgroupBarrier();
+    }
+    if lane == 0u {
+        tdHistory[frameData.x * frameData.y] = vec2(bitcast<u32>(tdMeans[0] / f32(columns * rows)), 0u);
+    }
+}
+""" if EXPOSURE else ""
+# The blend weight: with `length` the running mean N / (N + 1) corrected by the head.
+BLEND = (
+    f"""    let mean = clamp(current.w / (current.w + 1.), 1e-3, 1. - 1e-3);
+    let alpha = warp.w / (1. + exp(-(log(mean / (1. - mean)) + {head_row(0)})));""" if M.LENGTH
+    else f"    let alpha = warp.w / (1. + exp(-({head_row(0)})));")
+KEEP_BLEND = "" if M.FEEDBACK != "blend" else (
+    "    tdHistory[i] = tdPack(vec4(blend, min(current.w + 1., TD_MAX_LENGTH)));\n" if M.LENGTH
+    else "    tdHistory[i] = tdPack(vec4(blend, 0.));\n")
+
+
 def make_source(half):
     return f"""// Generated by training/temporal/export.py from {sys.argv[1]}; do not edit.
 {F16_HEADER if half else ""}const TD_EPS = {f(M.EPS)};
 const TD_CHANNELS = {M.CHANNELS}u;
 const TD_CONV_PIXELS = {P}u;
 const TD_HALF = {1 if M.HALF else 0}u;
+const TD_MAX_LENGTH = {f(M.MAX_LENGTH)};
 struct TdParams {{ historyValid: u32, parity: u32, pad1: u32, pad2: u32 }}
 @group(5) @binding(0) var<storage, read_write> tdHistory: array<vec2<u32>>;
 // Guides of two frames (ping-pong by tdParams.parity): distance (f32) and
@@ -241,7 +319,7 @@ fn tdTap(p: vec2<u32>, dx: i32, dy: i32) -> u32 {{
 
 // Bilinear fetch of history (rgb) and guides at a continuous position; texels
 // outside the image contribute zero (grid_sample, zeros padding).
-struct TdSample {{ history: vec3<f32>, dist: f32, kind: f32, normal: vec3<f32> }}
+struct TdSample {{ history: vec4<f32>, dist: f32, kind: f32, normal: vec3<f32> }}
 fn tdPackGuides(dist: f32, normal: vec3<f32>, kind: f32) -> vec2<u32> {{
     let q = vec3<u32>(vec3<i32>(round(clamp(normal, vec3(-1.), vec3(1.)) * 511.))) & vec3(1023u);
     return vec2(bitcast<u32>(dist), q.x | (q.y << 10u) | (q.z << 20u) | (u32(kind + 0.5) << 30u));
@@ -254,7 +332,7 @@ fn tdBilinear(pos: vec2<f32>) -> TdSample {{
     let c = pos - vec2(0.5);
     let base = vec2<i32>(floor(c));
     let f = c - floor(c);
-    var s = TdSample(vec3(0.), 0., 0., vec3(0.));
+    var s = TdSample(vec4(0.), 0., 0., vec3(0.));
     let prev = (1u - tdParams.parity) * frameData.x * frameData.y;
     {{
         let q = base + vec2(0, 0);
@@ -262,7 +340,7 @@ fn tdBilinear(pos: vec2<f32>) -> TdSample {{
             let w = (1. - f.x) * (1. - f.y);
             let i = u32(q.y) * frameData.x + u32(q.x);
             let g = tdPrevGuides[prev + i];
-            s.history += w * tdUnpack(tdHistory[i]).xyz;
+            s.history += w * tdUnpack(tdHistory[i]);
             s.dist += w * bitcast<f32>(g.x);
             s.kind += w * f32(g.y >> 30u);
             s.normal += w * tdNormal(g.y);
@@ -274,7 +352,7 @@ fn tdBilinear(pos: vec2<f32>) -> TdSample {{
             let w = f.x * (1. - f.y);
             let i = u32(q.y) * frameData.x + u32(q.x);
             let g = tdPrevGuides[prev + i];
-            s.history += w * tdUnpack(tdHistory[i]).xyz;
+            s.history += w * tdUnpack(tdHistory[i]);
             s.dist += w * bitcast<f32>(g.x);
             s.kind += w * f32(g.y >> 30u);
             s.normal += w * tdNormal(g.y);
@@ -286,7 +364,7 @@ fn tdBilinear(pos: vec2<f32>) -> TdSample {{
             let w = (1. - f.x) * f.y;
             let i = u32(q.y) * frameData.x + u32(q.x);
             let g = tdPrevGuides[prev + i];
-            s.history += w * tdUnpack(tdHistory[i]).xyz;
+            s.history += w * tdUnpack(tdHistory[i]);
             s.dist += w * bitcast<f32>(g.x);
             s.kind += w * f32(g.y >> 30u);
             s.normal += w * tdNormal(g.y);
@@ -298,7 +376,7 @@ fn tdBilinear(pos: vec2<f32>) -> TdSample {{
             let w = f.x * f.y;
             let i = u32(q.y) * frameData.x + u32(q.x);
             let g = tdPrevGuides[prev + i];
-            s.history += w * tdUnpack(tdHistory[i]).xyz;
+            s.history += w * tdUnpack(tdHistory[i]);
             s.dist += w * bitcast<f32>(g.x);
             s.kind += w * f32(g.y >> 30u);
             s.normal += w * tdNormal(g.y);
@@ -317,23 +395,25 @@ fn csTdFeatures(@builtin(global_invocation_id) id: vec3<u32>) {{
     let demod = noisy / (albedo + vec3(TD_EPS));
     var warped = vec3(0.);
     var valid = 0.;
+    var length = 0.;
     if tdParams.historyValid != 0u {{
         let pos = vec2<f32>(id.xy) + vec2(0.5) + g2.xy;
         let s = tdBilinear(pos);
         let inside = pos.x >= 0.5 && pos.x <= f32(frameData.x) - 0.5 && pos.y >= 0.5 && pos.y <= f32(frameData.y) - 0.5;
         let agree = abs(s.dist - dist) <= 0.1 * dist + 1e-3 && dot(s.normal, normal) >= 0.8 && abs(s.kind - kind) < 0.5;
-        warped = s.history;
+        warped = s.history.xyz;
         valid = select(0., 1., inside && agree);
+        length = s.history.w * valid;
     }}
-    tdWarp[i] = vec4(tdPack(vec4(warped, valid)), tdPack(vec4(demod, 0.)));
+    tdWarp[i] = vec4(tdPack(vec4(warped, valid)), tdPack(vec4(demod, length)));
     tdPrevGuides[tdParams.parity * frameData.x * frameData.y + i] = tdPackGuides(dist, normal, kind);
-    let a = log1p3(max(demod, vec3(0.)));
-    let b = log1p3(max(warped, vec3(0.))) * valid;
+{SCALE}    let a = log1p3(scale * max(demod, vec3(0.)));
+    let b = log1p3(scale * max(warped, vec3(0.))) * valid;
     let al = clamp(albedo, vec3(0.), vec3(4.));
     tdFeatures[i * 4u] = tdPack(vec4(a, b.x));
     tdFeatures[i * 4u + 1u] = tdPack(vec4(b.yz, valid, al.x));
     tdFeatures[i * 4u + 2u] = tdPack(vec4(al.yz, normal.xy));
-    tdFeatures[i * 4u + 3u] = tdPack(vec4(normal.z, rough, log(1. + max(dist, 0.)), 0.));
+    tdFeatures[i * 4u + 3u] = tdPack(vec4(normal.z, rough, log(1. + max(dist, 0.)), {'length / TD_MAX_LENGTH' if M.LENGTH else '0.'}));
 }}
 fn log1p3(x: vec3<f32>) -> vec3<f32> {{ return log(vec3(1.) + x); }}
 
@@ -375,14 +455,16 @@ fn csTdBlend(@builtin(global_invocation_id) id: vec3<u32>) {{
     let i = frameData.x * id.y + id.x;
     let packed = tdWarp[i];
     let warp = tdUnpack(packed.xy);
-    let demod = tdUnpack(packed.zw).xyz;
+    let current = tdUnpack(packed.zw);
+    let demod = current.xyz;
 {head_load()}
-    let alpha = warp.w / (1. + exp(-({head_row(0)})));
-    tdX[i] = tdPack(vec4(alpha * warp.xyz + (1. - alpha) * demod, 0.));
-}}
+{BLEND}
+    let blend = alpha * warp.xyz + (1. - alpha) * demod;
+    tdX[i] = tdPack(vec4(blend, 0.));
+{KEEP_BLEND}}}
 
 {chr(10).join(filter_kernel(l) for l in range(len(M.DILATIONS)))}
-"""
+{EXPOSURE_KERNEL}"""
 
 
 # `enable f16;` must open the shader module: the renderer moves this line there.
